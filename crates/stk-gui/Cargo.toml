@@ -4,7 +4,7 @@ description = "Desktop application for SSH Tunnel Keeper"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
-version = "0.1.0"
+version = "0.1.1"
 
 [features]
 default = []

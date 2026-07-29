@@ -9,7 +9,6 @@ use std::{
     collections::HashSet,
     env,
     fs::{self, File},
-    io::BufReader,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
@@ -357,8 +356,8 @@ fn load_ssh_config(upstream: &SshHostConfig) -> anyhow::Result<LoadedSshConfig> 
     let path = configured_path
         .map(|path| expand_tilde(Path::new(path)))
         .unwrap_or_else(|| default_ssh_dir().join("config"));
-    let file = match File::open(&path) {
-        Ok(file) => file,
+    match File::open(&path) {
+        Ok(_) => {}
         Err(error) if configured_path.is_none() && error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(LoadedSshConfig {
                 config: SshConfig::default(),
@@ -371,9 +370,11 @@ fn load_ssh_config(upstream: &SshHostConfig) -> anyhow::Result<LoadedSshConfig> 
         }
     };
     reject_match_directives(&path)?;
+    let source = connection_ssh_config_source(&path)?;
+    let mut reader = source.as_bytes();
     let rules = ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS;
     let config = SshConfig::default()
-        .parse(&mut BufReader::new(file), rules)
+        .parse(&mut reader, rules)
         .with_context(|| format!("failed to parse SSH config {}", path.display()))?;
     Ok(LoadedSshConfig {
         config,
@@ -625,6 +626,108 @@ fn parse_ssh_bool(arguments: &str) -> anyhow::Result<bool> {
         "no" | "false" | "off" | "0" => Ok(false),
         _ => bail!("expected yes or no"),
     }
+}
+
+fn connection_ssh_config_source(path: &Path) -> anyhow::Result<String> {
+    // ssh2-config 0.7.1 treats RemoteForward as a bare port. STK parses all
+    // forwarding directives separately, so omit them from connection parsing.
+    let mut source = String::new();
+    append_connection_ssh_config(path, &mut source, &mut Vec::new(), None)?;
+    Ok(source)
+}
+
+fn append_connection_ssh_config(
+    path: &Path,
+    source: &mut String,
+    include_stack: &mut Vec<PathBuf>,
+    inherited_host: Option<&str>,
+) -> anyhow::Result<()> {
+    if include_stack.len() >= MAX_INCLUDE_DEPTH {
+        bail!("SSH Include nesting exceeds {MAX_INCLUDE_DEPTH} files");
+    }
+    let identity = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if include_stack.contains(&identity) {
+        include_stack.push(identity);
+        bail!(
+            "SSH Include cycle detected: {}",
+            include_stack
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" -> ")
+        );
+    }
+    include_stack.push(identity);
+
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to inspect SSH config {}", path.display()))?;
+    let mut current_host = inherited_host.map(str::to_string);
+    for (line_index, original_line) in contents.lines().enumerate() {
+        let cleaned = strip_config_comment(original_line);
+        let line = cleaned.trim();
+        let Some((directive, arguments)) = split_config_directive(line) else {
+            source.push_str(original_line);
+            source.push('\n');
+            continue;
+        };
+
+        if directive.eq_ignore_ascii_case("host") {
+            current_host = Some(original_line.to_string());
+        }
+
+        if directive.eq_ignore_ascii_case("include") {
+            let patterns = split_config_arguments(arguments);
+            if patterns.is_empty() {
+                bail!(
+                    "invalid Include directive in SSH config {}:{}: missing path",
+                    path.display(),
+                    line_index + 1
+                );
+            }
+            for pattern in patterns {
+                let pattern = expand_include_path(&pattern);
+                let display_pattern = pattern.to_string_lossy();
+                let mut included_paths = glob(&display_pattern)
+                    .with_context(|| format!("invalid SSH Include pattern {display_pattern}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .with_context(|| {
+                        format!("failed to resolve SSH Include pattern {display_pattern}")
+                    })?;
+                included_paths.sort();
+                for included_path in included_paths {
+                    append_connection_ssh_config(
+                        &included_path,
+                        source,
+                        include_stack,
+                        current_host.as_deref(),
+                    )?;
+                    match &current_host {
+                        Some(host) => source.push_str(host),
+                        None => source.push_str("Host *"),
+                    }
+                    source.push('\n');
+                }
+            }
+            continue;
+        }
+
+        if is_forwarding_directive(directive) {
+            source.push('\n');
+            continue;
+        }
+
+        source.push_str(original_line);
+        source.push('\n');
+    }
+    include_stack.pop();
+    Ok(())
+}
+
+fn is_forwarding_directive(directive: &str) -> bool {
+    directive.eq_ignore_ascii_case("dynamicforward")
+        || directive.eq_ignore_ascii_case("localforward")
+        || directive.eq_ignore_ascii_case("remoteforward")
+        || directive.eq_ignore_ascii_case("clearallforwardings")
 }
 
 fn merge_ssh_config_forwards(host: &mut ResolvedHostConfig, forwards: Vec<ParsedSshForward>) {
@@ -1294,6 +1397,67 @@ mod tests {
             plan.target.known_hosts_paths,
             vec![directory.join("known_hosts")]
         );
+    }
+
+    #[test]
+    fn connection_options_ignore_forwarding_directives() {
+        let directory = temp_dir("connection-forwarding");
+        let included_path = directory.join("forwards.conf");
+        fs::write(
+            &included_path,
+            "Host target\n  DynamicForward 7990\n  LocalForward 2222 localhost:22\n  RemoteForward 7990\n  RemoteForward 3126 localhost:3126\n",
+        )
+        .unwrap();
+        let config_path = directory.join("config");
+        fs::write(
+            &config_path,
+            format!(
+                "Include {}\nHost unrelated\n  RemoteForward 7890 localhost:7890\nHost target\n  HostName target.internal\n  User alice\n  Port 2222\n",
+                included_path.display()
+            ),
+        )
+        .unwrap();
+
+        let plan = resolve_ssh_plan(
+            &upstream_with_path("target", config_path.to_string_lossy().into_owned()),
+            &pool(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.target.host, "target.internal");
+        assert_eq!(plan.target.username, "alice");
+        assert_eq!(plan.target.port, 2222);
+    }
+
+    #[test]
+    fn included_host_scope_does_not_leak_into_the_parent_config() {
+        let directory = temp_dir("include-scope");
+        let included_path = directory.join("included.conf");
+        fs::write(&included_path, "Host other\n  HostName other.internal\n").unwrap();
+        let config_path = directory.join("config");
+        fs::write(
+            &config_path,
+            format!(
+                "Host target\n  User alice\n  Include {}\n  Port 2222\n",
+                included_path.display()
+            ),
+        )
+        .unwrap();
+
+        let target = resolve_ssh_plan(
+            &upstream_with_path("target", config_path.to_string_lossy().into_owned()),
+            &pool(),
+        )
+        .unwrap();
+        let other = resolve_ssh_plan(
+            &upstream_with_path("other", config_path.to_string_lossy().into_owned()),
+            &pool(),
+        )
+        .unwrap();
+
+        assert_eq!(target.target.port, 2222);
+        assert_eq!(other.target.host, "other.internal");
+        assert_eq!(other.target.port, DEFAULT_SSH_PORT);
     }
 
     #[test]
