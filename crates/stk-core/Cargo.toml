@@ -1,0 +1,29 @@
+[package]
+name = "stk-core"
+description = "Core runtime for SSH Tunnel Keeper"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+glob.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+notify.workspace = true
+russh.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+socket2.workspace = true
+ssh2-config.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

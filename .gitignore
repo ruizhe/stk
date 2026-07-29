@@ -1,0 +1,34 @@
+target/
+dist/
+test-results/
+coverage/
+/.dioxus/
+.DS_Store
+*.log
+*.profraw
+lcov.info
+
+# Local editor and workspace state.
+.idea/
+.vscode/
+.fleet/
+*.swp
+*.swo
+*~
+
+# Local environment and signing material.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+
+# Locally generated macOS distribution images.
+*.dmg
+*.dmg.sha256
+
+# Local runtime configuration; publish files under examples/ instead.
+/basic.yaml

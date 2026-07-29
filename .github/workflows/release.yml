@@ -1,0 +1,391 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to release, for example v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: 1
+  RUST_VERSION: 1.95.0
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      bundle-version: ${{ steps.version.outputs.bundle-version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Validate tag and package versions
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?)$ ]]; then
+            echo "Release tag must look like v1.2.3 or v1.2.3-rc.1: $tag" >&2
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          bundle_version="${version%%-*}"
+
+          root_version="$(
+            cargo metadata --format-version 1 --no-deps --locked |
+              jq -r '.packages[] | select(.name == "stk-cli") | .version'
+          )"
+          gui_version="$(
+            cargo metadata \
+              --manifest-path crates/stk-gui/Cargo.toml \
+              --format-version 1 \
+              --no-deps \
+              --locked |
+              jq -r '.packages[] | select(.name == "stk-gui") | .version'
+          )"
+          plist_version="$(
+            awk '
+              /<key>CFBundleShortVersionString<\/key>/ {
+                getline
+                gsub(/^[[:space:]]*<string>|<\/string>[[:space:]]*$/, "")
+                print
+                exit
+              }
+            ' crates/stk-gui/macos/Info.plist
+          )"
+
+          for candidate in "$root_version" "$gui_version"; do
+            if [[ "$candidate" != "$version" ]]; then
+              echo "Tag $tag does not match project versions:" >&2
+              echo "  workspace: $root_version" >&2
+              echo "  GUI:       $gui_version" >&2
+              exit 1
+            fi
+          done
+          if [[ "$plist_version" != "$bundle_version" ]]; then
+            echo "Tag $tag does not match the macOS bundle version:" >&2
+            echo "  expected:  $bundle_version" >&2
+            echo "  Info.plist:$plist_version" >&2
+            exit 1
+          fi
+
+          prerelease=false
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "bundle-version=$bundle_version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  linux:
+    name: Package Linux x86_64
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Install Linux GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            crates/stk-gui -> crates/stk-gui/target
+          shared-key: linux-release
+
+      - name: Build CLI
+        run: cargo build --release -p stk-cli --locked
+
+      - name: Build GUI
+        run: >-
+          cargo build
+          --manifest-path crates/stk-gui/Cargo.toml
+          --features desktop
+          --release
+          --locked
+
+      - name: Create release archive
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          package="ssh-tunnel-keeper-v${VERSION}-linux-x86_64"
+          stage="dist/${package}"
+          mkdir -p "$stage/examples" "$stage/packaging/systemd"
+
+          install -m 755 target/release/stk "$stage/stk"
+          install -m 755 crates/stk-gui/target/release/stk-gui "$stage/stk-gui"
+          install -m 644 README.md README.zh-CN.md LICENSE-MIT LICENSE-APACHE "$stage/"
+          install -m 644 examples/basic.yaml examples/basic.json examples/basic.toml "$stage/examples/"
+          install -m 644 examples/ssh-native.yaml examples/ssh-native.json examples/ssh-native.toml "$stage/examples/"
+          install -m 644 packaging/systemd/stk.service "$stage/packaging/systemd/stk.service"
+
+          tar -C dist -czf "dist/${package}.tar.gz" "$package"
+          cd dist
+          sha256sum "${package}.tar.gz" > "${package}.tar.gz.sha256"
+
+      - name: Upload Linux archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    name: Package Windows x86_64
+    needs: validate
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            crates/stk-gui -> crates/stk-gui/target
+          shared-key: windows-release
+
+      - name: Build CLI
+        run: cargo build --release -p stk-cli --locked
+
+      - name: Build GUI
+        run: >-
+          cargo build
+          --manifest-path crates/stk-gui/Cargo.toml
+          --features desktop
+          --release
+          --locked
+
+      - name: Create release archive
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = "ssh-tunnel-keeper-v$env:VERSION-windows-x86_64"
+          $stage = Join-Path "dist" $package
+          $examples = Join-Path $stage "examples"
+
+          New-Item -ItemType Directory -Force -Path $examples | Out-Null
+          Copy-Item "target/release/stk.exe" (Join-Path $stage "stk.exe")
+          Copy-Item "crates/stk-gui/target/release/stk-gui.exe" (Join-Path $stage "stk-gui.exe")
+          Copy-Item "README.md", "README.zh-CN.md", "LICENSE-MIT", "LICENSE-APACHE" $stage
+          Copy-Item "examples/basic.yaml", "examples/basic.json", "examples/basic.toml" $examples
+          Copy-Item "examples/ssh-native.yaml", "examples/ssh-native.json", "examples/ssh-native.toml" $examples
+
+          $archive = Join-Path "dist" "$package.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $archive -CompressionLevel Optimal
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          "$hash  $package.zip" | Set-Content -Path "$archive.sha256" -Encoding ascii
+
+      - name: Upload Windows archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: Package macOS universal
+    needs: validate
+    runs-on: macos-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            crates/stk-gui -> crates/stk-gui/target
+          shared-key: macos-universal-release
+
+      - name: Build universal CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p stk-cli --target aarch64-apple-darwin --locked
+          cargo build --release -p stk-cli --target x86_64-apple-darwin --locked
+
+      - name: Build universal GUI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build \
+            --manifest-path crates/stk-gui/Cargo.toml \
+            --features desktop \
+            --release \
+            --target aarch64-apple-darwin \
+            --locked
+          cargo build \
+            --manifest-path crates/stk-gui/Cargo.toml \
+            --features desktop \
+            --release \
+            --target x86_64-apple-darwin \
+            --locked
+
+      - name: Create release archive
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          BUNDLE_VERSION: ${{ needs.validate.outputs.bundle-version }}
+        run: |
+          set -euo pipefail
+
+          package="ssh-tunnel-keeper-v${VERSION}-macos-universal"
+          stage="dist/${package}"
+          app="$stage/SSH Tunnel Keeper.app"
+          contents="$app/Contents"
+
+          mkdir -p "$contents/MacOS" "$contents/Resources" "$stage/examples"
+
+          lipo -create \
+            target/aarch64-apple-darwin/release/stk \
+            target/x86_64-apple-darwin/release/stk \
+            -output "$stage/stk"
+          lipo -create \
+            crates/stk-gui/target/aarch64-apple-darwin/release/stk-gui \
+            crates/stk-gui/target/x86_64-apple-darwin/release/stk-gui \
+            -output "$contents/MacOS/stk-gui"
+          chmod 755 "$stage/stk" "$contents/MacOS/stk-gui"
+
+          cp crates/stk-gui/macos/Info.plist "$contents/Info.plist"
+          cp crates/stk-gui/macos/AppIcon.icns "$contents/Resources/AppIcon.icns"
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleShortVersionString $BUNDLE_VERSION" \
+            "$contents/Info.plist"
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" \
+            "$contents/Info.plist"
+
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict "$app"
+
+          cp README.md README.zh-CN.md LICENSE-MIT LICENSE-APACHE "$stage/"
+          cp examples/basic.yaml examples/basic.json examples/basic.toml "$stage/examples/"
+          cp examples/ssh-native.yaml examples/ssh-native.json examples/ssh-native.toml "$stage/examples/"
+
+          ditto -c -k --sequesterRsrc --keepParent "$stage" "dist/${package}.zip"
+          ./scripts/create-macos-dmg.sh "$app" "dist/${package}.dmg"
+          cd dist
+          shasum -a 256 "${package}.zip" > "${package}.zip.sha256"
+          shasum -a 256 "${package}.dmg" > "${package}.dmg.sha256"
+
+      - name: Upload macOS archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: |
+            dist/*.zip
+            dist/*.dmg
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - validate
+      - linux
+      - windows
+      - macos
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          name: SSH Tunnel Keeper ${{ needs.validate.outputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ needs.validate.outputs.prerelease }}
+          fail_on_unmatched_files: true
+          files: dist/*

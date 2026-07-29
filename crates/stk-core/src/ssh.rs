@@ -1,0 +1,3232 @@
+use crate::{
+    config::{
+        ProbeConfig, ProxyProtocol, SshAuthConfig, SshHostConfig, SshPoolConfig,
+        SshRemoteForwardConfig,
+    },
+    engine::{ProxySessionContext, handle_proxy_session},
+    health::{HealthStatus, LoadBalancer, SshHostState},
+    outbound::{BoxedProxyStream, DialContext, LocalTcpDialer, OutboundDialer, TargetAddr},
+    ssh_config::{
+        ResolvedHostKeyPolicy, ResolvedSshEndpoint, ResolvedSshPlan, expand_proxy_command,
+        resolve_ssh_plan,
+    },
+    stats::{self, elapsed_ms, next_connection_id},
+};
+use anyhow::{Context, bail};
+use async_trait::async_trait;
+use russh::{
+    Channel, ChannelOpenFailure, Disconnect,
+    client::{self, DisconnectReason},
+    keys::{
+        self,
+        agent::{AgentIdentity, client::AgentClient, client::AgentStream},
+        key::PrivateKeyWithHashAlg,
+    },
+};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    pin::Pin,
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    task::{Context as TaskContext, Poll},
+    time::{Duration, Instant},
+};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf, copy_bidirectional},
+    net::TcpStream,
+    process::{Child, ChildStdin, ChildStdout, Command},
+    sync::{RwLock, mpsc},
+    task::{AbortHandle, JoinSet},
+    time::{MissedTickBehavior, interval, sleep, timeout},
+};
+use tracing::{Instrument, debug, info, info_span, warn};
+
+#[cfg(test)]
+use crate::inbound::SOCKS5_REPLY_SUCCEEDED;
+#[cfg(test)]
+use tokio::net::TcpListener;
+
+type NativeSshHandle = client::Handle<NativeSshHandler>;
+type DynamicAgent = AgentClient<Box<dyn AgentStream + Send + Unpin>>;
+
+trait SshTransport: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> SshTransport for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+type BoxedSshTransport = Box<dyn SshTransport>;
+
+#[derive(Debug, Clone)]
+struct SshNodeState {
+    status: HealthStatus,
+    rtt_millis: Option<u64>,
+    restart_count: u64,
+    last_error: Option<String>,
+}
+
+impl Default for SshNodeState {
+    fn default() -> Self {
+        Self {
+            status: HealthStatus::Unknown,
+            rtt_millis: None,
+            restart_count: 0,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SshSessionStatus {
+    Connecting,
+    Healthy,
+    Suspect,
+    Draining,
+    Offline,
+}
+
+#[derive(Debug, Clone)]
+struct SshSessionState {
+    status: SshSessionStatus,
+    rtt_millis: Option<u64>,
+    startup_ms: Option<f64>,
+    last_error: Option<String>,
+    drain_started: Option<Instant>,
+}
+
+impl Default for SshSessionState {
+    fn default() -> Self {
+        Self {
+            status: SshSessionStatus::Connecting,
+            rtt_millis: None,
+            startup_ms: None,
+            last_error: None,
+            drain_started: None,
+        }
+    }
+}
+
+struct ManagedSshSession {
+    id: u64,
+    state: Arc<RwLock<SshSessionState>>,
+    handle: Arc<RwLock<Option<Arc<NativeSshHandle>>>>,
+    in_flight: Arc<AtomicUsize>,
+    retire_requested: AtomicBool,
+}
+
+impl ManagedSshSession {
+    async fn current_handle(&self) -> Option<Arc<NativeSshHandle>> {
+        self.handle.read().await.clone()
+    }
+
+    fn has_capacity(&self, maximum: usize) -> bool {
+        self.in_flight.load(Ordering::Relaxed) < maximum
+    }
+}
+
+struct NativeSshNode {
+    name: String,
+    state: Arc<RwLock<SshNodeState>>,
+    sessions: Arc<RwLock<Vec<Arc<ManagedSshSession>>>>,
+    remote_owner: Arc<RwLock<Option<u64>>>,
+    channel_open_timeout: Duration,
+    max_channels_per_session: usize,
+}
+
+impl NativeSshNode {
+    async fn open_channel(
+        &self,
+        target: &TargetAddr,
+        originator_address: String,
+        originator_port: u32,
+    ) -> anyhow::Result<(u64, CountedStream<russh::ChannelStream<client::Msg>>)> {
+        let (host, port) = target_host_port(target);
+        let sessions = self.sessions.read().await.clone();
+        let mut preferred = Vec::new();
+        let mut fallback = Vec::new();
+        for session in sessions {
+            if !session.has_capacity(self.max_channels_per_session) {
+                continue;
+            }
+            let state = session.state.read().await;
+            let score = state
+                .rtt_millis
+                .unwrap_or(u64::MAX / 4)
+                .saturating_mul(session.in_flight.load(Ordering::Relaxed) as u64 + 1);
+            match state.status {
+                SshSessionStatus::Healthy if !session.retire_requested.load(Ordering::Relaxed) => {
+                    preferred.push((score, Arc::clone(&session)));
+                }
+                SshSessionStatus::Healthy | SshSessionStatus::Suspect => {
+                    fallback.push((score, Arc::clone(&session)));
+                }
+                SshSessionStatus::Connecting
+                | SshSessionStatus::Draining
+                | SshSessionStatus::Offline => {}
+            }
+        }
+        preferred.sort_by_key(|(score, _)| *score);
+        fallback.sort_by_key(|(score, _)| *score);
+        preferred.extend(fallback);
+
+        let mut last_error = None;
+        for (_, session) in preferred {
+            let Some(reservation) = reserve_in_flight(
+                &session.in_flight,
+                self.max_channels_per_session,
+                session.id,
+            ) else {
+                continue;
+            };
+            let Some(handle) = session.current_handle().await else {
+                continue;
+            };
+            let started = Instant::now();
+            let result = timeout(
+                self.channel_open_timeout,
+                handle.channel_open_direct_tcpip(
+                    host.clone(),
+                    port,
+                    originator_address.clone(),
+                    originator_port,
+                ),
+            )
+            .await;
+            match result {
+                Ok(Ok(channel)) => {
+                    let channel_open_ms = elapsed_ms(started);
+                    stats::record_ssh_session_channel_open(session.id, channel_open_ms);
+                    let sample = channel_open_ms.round() as u64;
+                    let mut state = session.state.write().await;
+                    state.rtt_millis = Some(ewma_rtt(state.rtt_millis, sample));
+                    state.last_error = None;
+                    debug!(
+                        ssh_host = %self.name,
+                        ssh_session_id = session.id,
+                        target = %target,
+                        ssh_channel_open_ms = channel_open_ms,
+                        "native SSH channel established"
+                    );
+                    return Ok((session.id, reservation.into_stream(channel.into_stream())));
+                }
+                Ok(Err(error)) => {
+                    let error = format!("failed to open SSH channel: {error}");
+                    session.state.write().await.last_error = Some(error.clone());
+                    stats::record_ssh_session_channel_error(session.id, &error);
+                    warn!(
+                        ssh_host = %self.name,
+                        ssh_session_id = session.id,
+                        target = %target,
+                        %error,
+                        "SSH channel open failed"
+                    );
+                    last_error = Some(error);
+                }
+                Err(_) => {
+                    let error = format!(
+                        "timed out opening SSH channel after {} ms",
+                        self.channel_open_timeout.as_millis()
+                    );
+                    session.state.write().await.last_error = Some(error.clone());
+                    stats::record_ssh_session_channel_error(session.id, &error);
+                    warn!(
+                        ssh_host = %self.name,
+                        ssh_session_id = session.id,
+                        target = %target,
+                        timeout_ms = self.channel_open_timeout.as_millis(),
+                        "SSH channel open timed out"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        bail!(
+            "SSH host {} has no available session{}",
+            self.name,
+            last_error
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default()
+        )
+    }
+
+    async fn has_available_session(&self) -> bool {
+        let sessions = self.sessions.read().await.clone();
+        for session in sessions {
+            if !session.has_capacity(self.max_channels_per_session) {
+                continue;
+            }
+            let state = session.state.read().await;
+            if matches!(
+                state.status,
+                SshSessionStatus::Healthy | SshSessionStatus::Suspect
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn in_flight(&self) -> usize {
+        self.sessions
+            .read()
+            .await
+            .iter()
+            .map(|session| session.in_flight.load(Ordering::Relaxed))
+            .sum()
+    }
+}
+
+pub(crate) struct SshPoolDialer {
+    name: String,
+    nodes: Vec<Arc<NativeSshNode>>,
+    balancer: LoadBalancer,
+    tasks: Vec<AbortHandle>,
+}
+
+impl SshPoolDialer {
+    pub(crate) fn start(
+        name: impl Into<String>,
+        pool: SshPoolConfig,
+        probe: ProbeConfig,
+    ) -> anyhow::Result<Self> {
+        let name = name.into();
+        let plans = pool
+            .hosts
+            .iter()
+            .map(|upstream| resolve_ssh_plan(upstream, &pool).map(Arc::new))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut nodes = Vec::with_capacity(pool.hosts.len());
+        let mut tasks = Vec::new();
+
+        for (upstream, plan) in pool.hosts.iter().zip(plans) {
+            stats::register_host(stats::HostRegistration {
+                name: upstream.name.clone(),
+                ssh_alias: plan.target.alias.clone(),
+                address: format_ssh_address(&plan.target.host, plan.target.port),
+                min_sessions: pool.min_sessions_per_host,
+                max_sessions: pool.max_sessions_per_host,
+            });
+            let state = Arc::new(RwLock::new(SshNodeState::default()));
+            let node = Arc::new(NativeSshNode {
+                name: upstream.name.clone(),
+                state: Arc::clone(&state),
+                sessions: Arc::new(RwLock::new(Vec::new())),
+                remote_owner: Arc::new(RwLock::new(None)),
+                channel_open_timeout: plan.target.connect_timeout,
+                max_channels_per_session: pool.max_channels_per_session,
+            });
+            nodes.push(Arc::clone(&node));
+
+            info!(
+                host_name = %name,
+                ssh_alias = %plan.target.alias,
+                ssh_address = %plan.target.host,
+                ssh_port = plan.target.port,
+                proxy_jump_count = plan.jumps.len(),
+                ssh_config_path = ?plan.config_path,
+                "resolved SSH host configuration"
+            );
+
+            let manager_name = name.clone();
+            let manager_upstream = upstream.clone();
+            let manager_pool = pool.clone();
+            let manager_plan = Arc::clone(&plan);
+            let manager_node = Arc::clone(&node);
+            let span = info_span!(
+                "ssh_session_pool",
+                host_name = %manager_name
+            );
+            let task = tokio::spawn(
+                manage_ssh_sessions(
+                    manager_name,
+                    manager_upstream,
+                    manager_pool,
+                    manager_plan,
+                    probe,
+                    manager_node,
+                )
+                .instrument(span),
+            );
+            tasks.push(task.abort_handle());
+        }
+
+        Ok(Self {
+            name,
+            nodes,
+            balancer: LoadBalancer::new(pool.policy),
+            tasks,
+        })
+    }
+
+    async fn snapshots(&self, excluded: &HashSet<String>) -> Vec<SshHostState> {
+        let mut snapshots = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            let state = node.state.read().await;
+            let status = match state.status {
+                HealthStatus::Unknown => HealthStatus::Offline,
+                status => status,
+            };
+            snapshots.push(SshHostState {
+                name: node.name.clone(),
+                enabled: !excluded.contains(&node.name) && node.has_available_session().await,
+                status,
+                rtt_millis: state.rtt_millis,
+                in_flight: node.in_flight().await,
+            });
+        }
+        snapshots
+    }
+
+    fn node(&self, name: &str) -> Option<&Arc<NativeSshNode>> {
+        self.nodes.iter().find(|node| node.name == name)
+    }
+}
+
+impl Drop for SshPoolDialer {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+#[async_trait]
+impl OutboundDialer for SshPoolDialer {
+    async fn dial(&self, context: DialContext) -> anyhow::Result<BoxedProxyStream> {
+        let mut excluded = HashSet::new();
+        let mut last_error = None;
+
+        while excluded.len() < self.nodes.len() {
+            let snapshots = self.snapshots(&excluded).await;
+            let Some(selected) = self.balancer.select(&snapshots) else {
+                break;
+            };
+            let selected_name = selected.name.clone();
+            let Some(node) = self.node(&selected_name) else {
+                break;
+            };
+            let started = Instant::now();
+            match node
+                .open_channel(&context.target, "127.0.0.1".to_string(), 0)
+                .await
+            {
+                Ok((session_id, stream)) => {
+                    let dial_ms = elapsed_ms(started);
+                    let mut state = node.state.write().await;
+                    state.status = HealthStatus::Healthy;
+                    state.rtt_millis = Some(dial_ms.round() as u64);
+                    state.last_error = None;
+                    debug!(
+                        host_name = %self.name,
+                        target = %context.target,
+                        ssh_channel_open_ms = dial_ms,
+                        "native SSH dynamic channel established"
+                    );
+                    if let Some(connection_id) = context.connection_id {
+                        stats::associate_connection_session(connection_id, session_id);
+                    }
+                    return Ok(Box::new(stream));
+                }
+                Err(error) => {
+                    let error_text = format!("{error:#}");
+                    let mut state = node.state.write().await;
+                    state.status = HealthStatus::Degraded;
+                    state.last_error = Some(error_text.clone());
+                    last_error = Some(error_text);
+                    excluded.insert(selected_name);
+                }
+            }
+        }
+
+        bail!(
+            "SSH host {} has no healthy session for dynamic forwarding{}",
+            self.name,
+            last_error
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default()
+        )
+    }
+}
+
+trait LogTaskResult: Sized {
+    fn map_err_log(self, message: &'static str) -> impl std::future::Future<Output = ()> + Send;
+}
+
+impl<F> LogTaskResult for F
+where
+    F: std::future::Future<Output = anyhow::Result<()>> + Send,
+{
+    async fn map_err_log(self, message: &'static str) {
+        if let Err(error) = self.await {
+            stats::record_error();
+            warn!(%error, "{message}");
+        }
+    }
+}
+
+#[derive(Clone)]
+enum RemoteForwardRoute {
+    Tcp {
+        name: String,
+        tunnel_id: String,
+        local_host: String,
+        local_port: u16,
+    },
+    Dynamic {
+        name: String,
+        tunnel_id: String,
+        protocol: ProxyProtocol,
+    },
+}
+
+struct NativeSshHandler {
+    upstream: String,
+    session_id: u64,
+    host: String,
+    port: u16,
+    host_key_policy: ResolvedHostKeyPolicy,
+    host_key_name: String,
+    known_hosts_paths: Vec<PathBuf>,
+    remote_forwards: Arc<HashMap<u32, RemoteForwardRoute>>,
+    in_flight: Arc<AtomicUsize>,
+    disconnect_tx: mpsc::UnboundedSender<String>,
+}
+
+impl client::Handler for NativeSshHandler {
+    type Error = anyhow::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &russh::keys::ssh_key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        let mut accepted = self.host_key_policy == ResolvedHostKeyPolicy::InsecureAcceptAny;
+        if !accepted {
+            for path in &self.known_hosts_paths {
+                if keys::check_known_hosts_path(
+                    &self.host_key_name,
+                    self.port,
+                    server_public_key,
+                    path,
+                )? {
+                    accepted = true;
+                    break;
+                }
+            }
+        }
+        if !accepted && self.host_key_policy == ResolvedHostKeyPolicy::AcceptNew {
+            let path = self
+                .known_hosts_paths
+                .first()
+                .context("SSH accept-new requires a known_hosts path")?;
+            keys::known_hosts::learn_known_hosts_path(
+                &self.host_key_name,
+                self.port,
+                server_public_key,
+                path,
+            )?;
+            accepted = true;
+            info!(
+                ssh_host = %self.upstream,
+                host = %self.host_key_name,
+                port = self.port,
+                known_hosts_path = %path.display(),
+                "recorded new SSH server key"
+            );
+        };
+        if !accepted {
+            warn!(
+                ssh_host = %self.upstream,
+                host = %self.host,
+                port = self.port,
+                "SSH server key is not present in known_hosts"
+            );
+        }
+        Ok(accepted)
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let Some(route) = self.remote_forwards.get(&connected_port).cloned() else {
+            warn!(
+                ssh_host = %self.upstream,
+                %connected_address,
+                connected_port,
+                "rejected unconfigured SSH remote forward channel"
+            );
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        };
+
+        let connection_id = next_connection_id();
+        let active_channel = ActiveChannelGuard::new(Arc::clone(&self.in_flight), self.session_id);
+        let upstream = self.upstream.clone();
+        let session_id = self.session_id;
+        let connected_address = connected_address.to_string();
+        let originator_address = originator_address.to_string();
+        let span = info_span!(
+            "proxy_connection",
+            connection_id,
+            ssh_forward = "remote",
+            ssh_host = %upstream,
+            ssh_session_id = session_id,
+            %connected_address,
+            connected_port,
+            %originator_address,
+            originator_port
+        );
+        tokio::spawn(
+            async move {
+                let _active_channel = active_channel;
+                match route {
+                    RemoteForwardRoute::Tcp {
+                        name,
+                        tunnel_id,
+                        local_host,
+                        local_port,
+                    } => {
+                        handle_remote_tcp_forward(
+                            RemoteTcpForwardContext {
+                                connection_id,
+                                upstream,
+                                session_id,
+                                peer_address: format!("{}:{}", originator_address, originator_port),
+                                forward: name,
+                                tunnel_id,
+                                local_host,
+                                local_port,
+                            },
+                            channel,
+                            reply,
+                        )
+                        .await
+                    }
+                    RemoteForwardRoute::Dynamic {
+                        name,
+                        tunnel_id,
+                        protocol,
+                    } => {
+                        reply.accept().await;
+                        let peer_addr = remote_peer_addr(&originator_address, originator_port);
+                        serve_remote_proxy(
+                            RemoteProxyContext {
+                                upstream,
+                                session_id,
+                                connection_id,
+                                forward: name,
+                                tunnel_id,
+                                protocol,
+                                peer_addr,
+                            },
+                            channel.into_stream(),
+                        )
+                        .await
+                    }
+                }
+            }
+            .map_err_log("SSH remote forward session failed")
+            .instrument(span),
+        );
+        Ok(())
+    }
+
+    async fn disconnected(
+        &mut self,
+        reason: DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        let _ = self.disconnect_tx.send(format!("{reason:?}"));
+        Ok(())
+    }
+}
+
+struct RemoteTcpForwardContext {
+    connection_id: u64,
+    upstream: String,
+    session_id: u64,
+    peer_address: String,
+    forward: String,
+    tunnel_id: String,
+    local_host: String,
+    local_port: u16,
+}
+
+async fn handle_remote_tcp_forward(
+    context: RemoteTcpForwardContext,
+    channel: Channel<client::Msg>,
+    reply: client::ChannelOpenHandle,
+) -> anyhow::Result<()> {
+    let target = TargetAddr::from_host_port(context.local_host, context.local_port);
+    let _connection = stats::LocalConnectionGuard::start(stats::ConnectionRegistration {
+        id: context.connection_id,
+        host_name: context.upstream.clone(),
+        tunnel_id: context.tunnel_id.clone(),
+        peer_address: context.peer_address.clone(),
+        target: Some(target.to_string()),
+        protocol: Some("TCP".to_string()),
+        session_id: Some(context.session_id),
+    });
+    let started = Instant::now();
+    let local_stream = LocalTcpDialer
+        .dial(DialContext {
+            host_name: format!("ssh-remote/{}/{}", context.upstream, context.forward),
+            target: target.clone(),
+            connection_id: Some(context.connection_id),
+        })
+        .await;
+    let mut local_stream = match local_stream {
+        Ok(stream) => {
+            reply.accept().await;
+            stream
+        }
+        Err(error) => {
+            stats::record_connection_error(context.connection_id, &format!("{error:#}"), true);
+            reply.reject(ChannelOpenFailure::ConnectFailed).await;
+            stats::record_tunnel_error(
+                &context.upstream,
+                &context.tunnel_id,
+                &format!("{error:#}"),
+            );
+            return Err(error).context("failed to connect SSH remote forward local target");
+        }
+    };
+    stats::mark_connection_active(context.connection_id);
+    let connect_ms = elapsed_ms(started);
+    let mut ssh_stream = channel.into_stream();
+    let relay_started = Instant::now();
+    let recorder = stats::tunnel_and_session_transfer_recorder(
+        &context.upstream,
+        &context.tunnel_id,
+        context.session_id,
+        context.connection_id,
+    );
+    let mut timed_ssh_stream =
+        stats::TimedIo::with_transfer_recorder(&mut ssh_stream, relay_started, recorder);
+    let (remote_to_local_bytes, local_to_remote_bytes) =
+        match copy_bidirectional(&mut timed_ssh_stream, &mut local_stream).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                stats::record_connection_error(context.connection_id, &error.to_string(), true);
+                stats::record_tunnel_error(
+                    &context.upstream,
+                    &context.tunnel_id,
+                    &error.to_string(),
+                );
+                return Err(error.into());
+            }
+        };
+    debug!(
+        forward = %context.forward,
+        target = %target,
+        connect_ms,
+        relay_duration_ms = elapsed_ms(relay_started),
+        remote_to_local_bytes,
+        local_to_remote_bytes,
+        session_total_ms = elapsed_ms(started),
+        "SSH fixed remote forward session finished"
+    );
+    Ok(())
+}
+
+struct RemoteProxyContext {
+    upstream: String,
+    session_id: u64,
+    connection_id: u64,
+    forward: String,
+    tunnel_id: String,
+    protocol: ProxyProtocol,
+    peer_addr: SocketAddr,
+}
+
+async fn serve_remote_proxy<S>(context: RemoteProxyContext, remote_stream: S) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let connection = Arc::new(stats::LocalConnectionGuard::start(
+        stats::ConnectionRegistration {
+            id: context.connection_id,
+            host_name: context.upstream.clone(),
+            tunnel_id: context.tunnel_id.clone(),
+            peer_address: context.peer_addr.to_string(),
+            target: None,
+            protocol: Some(super::engine::proxy_protocol_name(context.protocol).to_string()),
+            session_id: Some(context.session_id),
+        },
+    ));
+    let session_recorder = stats::session_transfer_recorder(context.session_id);
+    let remote_stream =
+        stats::TimedIo::with_transfer_recorder(remote_stream, Instant::now(), session_recorder);
+    let result = handle_proxy_session(
+        remote_stream,
+        context.protocol,
+        ProxySessionContext {
+            local_forward_name: context.forward,
+            peer_addr: context.peer_addr,
+            host_name: format!("remote/{}", context.upstream),
+            stats_host_name: context.upstream.clone(),
+            tunnel_id: context.tunnel_id.clone(),
+            connection_id: context.connection_id,
+            connection_started: Instant::now(),
+            _connection_lifetime: Some(Arc::clone(&connection)),
+        },
+        Arc::new(LocalTcpDialer),
+    )
+    .await;
+    if let Err(error) = &result {
+        stats::record_connection_error(context.connection_id, &format!("{error:#}"), true);
+        stats::record_tunnel_error(&context.upstream, &context.tunnel_id, &format!("{error:#}"));
+    }
+    result
+}
+
+fn remote_peer_addr(address: &str, port: u32) -> SocketAddr {
+    let ip = address
+        .trim_matches(['[', ']'])
+        .parse()
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    SocketAddr::new(ip, u16::try_from(port).unwrap_or(0))
+}
+
+struct ProxyCommandStream {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    stderr_task: AbortHandle,
+}
+
+impl ProxyCommandStream {
+    fn spawn(endpoint: &ResolvedSshEndpoint) -> anyhow::Result<Self> {
+        let command = endpoint
+            .proxy_command
+            .as_deref()
+            .context("missing SSH ProxyCommand")?;
+        let expanded = expand_proxy_command(command, endpoint);
+        let mut process = proxy_command_process(&expanded);
+        process
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = process.spawn().with_context(|| {
+            format!(
+                "failed to start ProxyCommand for SSH host {}",
+                endpoint.alias
+            )
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("ProxyCommand stdin was not available")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("ProxyCommand stdout was not available")?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .context("ProxyCommand stderr was not available")?;
+        let alias = endpoint.alias.clone();
+        let stderr_task = tokio::spawn(async move {
+            let mut buffer = vec![0_u8; 4096];
+            loop {
+                match stderr.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(length) => debug!(
+                        ssh_alias = %alias,
+                        stderr = %String::from_utf8_lossy(&buffer[..length]).trim(),
+                        "SSH ProxyCommand stderr"
+                    ),
+                    Err(error) => {
+                        debug!(ssh_alias = %alias, %error, "failed to read ProxyCommand stderr");
+                        break;
+                    }
+                }
+            }
+        })
+        .abort_handle();
+        debug!(
+            ssh_alias = %endpoint.alias,
+            "started SSH ProxyCommand"
+        );
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+            stderr_task,
+        })
+    }
+}
+
+impl AsyncRead for ProxyCommandStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stdout).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for ProxyCommandStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stdin).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stdin).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stdin).poll_shutdown(context)
+    }
+}
+
+impl Drop for ProxyCommandStream {
+    fn drop(&mut self) {
+        self.stderr_task.abort();
+        let _ = self.child.start_kill();
+    }
+}
+
+#[cfg(unix)]
+fn proxy_command_process(command: &str) -> Command {
+    let mut process = Command::new("/bin/sh");
+    process.arg("-c").arg(command);
+    process
+}
+
+#[cfg(windows)]
+fn proxy_command_process(command: &str) -> Command {
+    let mut process = Command::new("cmd");
+    process.arg("/C").arg(command);
+    process
+}
+
+struct EstablishedSession {
+    handle: Arc<NativeSshHandle>,
+    _transport_chain: Vec<Arc<NativeSshHandle>>,
+    disconnect_rx: mpsc::UnboundedReceiver<String>,
+    startup_ms: f64,
+}
+
+struct SessionExit {
+    id: u64,
+    reached_healthy: bool,
+    retired: bool,
+    error: String,
+}
+
+async fn manage_ssh_sessions(
+    outbound: String,
+    upstream: SshHostConfig,
+    pool: SshPoolConfig,
+    plan: Arc<ResolvedSshPlan>,
+    probe: ProbeConfig,
+    node: Arc<NativeSshNode>,
+) {
+    let initial_backoff = Duration::from_millis(pool.restart_initial_millis);
+    let max_backoff = Duration::from_secs(pool.restart_max_secs);
+    let spawn_cooldown = Duration::from_millis(pool.session_spawn_cooldown_millis);
+    let drain_timeout = Duration::from_secs(pool.session_drain_timeout_secs);
+    let mut backoff = initial_backoff;
+    let mut next_spawn_at = Instant::now();
+    let mut next_owner_attempt = Instant::now();
+    let mut tasks = JoinSet::new();
+    let mut ticker = interval(Duration::from_millis(100));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    for _ in 0..pool.min_sessions_per_host {
+        let session_id = stats::next_ssh_session_id();
+        spawn_managed_session(
+            &mut tasks, session_id, &outbound, &upstream, &plan, probe, &node,
+        )
+        .await;
+    }
+
+    loop {
+        tokio::select! {
+            joined = tasks.join_next(), if !tasks.is_empty() => {
+                match joined {
+                    Some(Ok(exit)) => {
+                        node.sessions.write().await.retain(|session| session.id != exit.id);
+                        let mut owner = node.remote_owner.write().await;
+                        if *owner == Some(exit.id) {
+                            *owner = None;
+                            mark_remote_tunnels_starting(&upstream);
+                            next_owner_attempt = Instant::now();
+                        }
+                        drop(owner);
+                        if !exit.retired {
+                            let mut state = node.state.write().await;
+                            state.restart_count = state.restart_count.saturating_add(1);
+                            state.last_error = Some(exit.error.clone());
+                        }
+                        if exit.reached_healthy {
+                            backoff = initial_backoff;
+                            next_spawn_at = Instant::now() + spawn_cooldown;
+                        } else {
+                            next_spawn_at = Instant::now() + backoff;
+                            backoff = next_backoff(backoff, max_backoff);
+                        }
+                        warn!(
+                            host_name = %outbound,
+                            ssh_session_id = exit.id,
+                            retired = exit.retired,
+                            %exit.error,
+                            "native SSH session left the pool"
+                        );
+                    }
+                    Some(Err(error)) => {
+                        warn!(%error, "SSH session task failed");
+                        next_spawn_at = Instant::now() + backoff;
+                        backoff = next_backoff(backoff, max_backoff);
+                    }
+                    None => {}
+                }
+            }
+            _ = ticker.tick() => {
+                refresh_node_state(&node).await;
+
+                if Instant::now() >= next_owner_attempt
+                    && let Err(error) = ensure_remote_owner(
+                        &node,
+                        &upstream,
+                        plan.target.connect_timeout,
+                    ).await
+                {
+                    debug!(
+                        host_name = %outbound,
+                        %error,
+                        "SSH remote forward owner handover is not ready"
+                    );
+                    next_owner_attempt = Instant::now() + spawn_cooldown;
+                }
+
+                let sessions = node.sessions.read().await.clone();
+                let mut active_count = 0_usize;
+                let mut healthy_non_retiring = 0_usize;
+                let mut connecting_non_retiring = 0_usize;
+                let mut retirement_pending = false;
+                for session in &sessions {
+                    let state = session.state.read().await;
+                    if state.status != SshSessionStatus::Offline {
+                        active_count += 1;
+                    }
+                    if state.status == SshSessionStatus::Healthy
+                        && !session.retire_requested.load(Ordering::Relaxed)
+                    {
+                        healthy_non_retiring += 1;
+                    }
+                    if state.status == SshSessionStatus::Connecting
+                        && !session.retire_requested.load(Ordering::Relaxed)
+                    {
+                        connecting_non_retiring += 1;
+                    }
+                    retirement_pending |= session.retire_requested.load(Ordering::Relaxed);
+                }
+
+                let needs_minimum = active_count < pool.min_sessions_per_host;
+                let needs_replacement = retirement_pending
+                    && healthy_non_retiring < pool.min_sessions_per_host
+                    && active_count < pool.max_sessions_per_host;
+                if (needs_minimum || needs_replacement) && Instant::now() >= next_spawn_at {
+                    let session_id = stats::next_ssh_session_id();
+                    spawn_managed_session(
+                        &mut tasks,
+                        session_id,
+                        &outbound,
+                        &upstream,
+                        &plan,
+                        probe,
+                        &node,
+                    )
+                    .await;
+                    next_spawn_at = Instant::now() + spawn_cooldown;
+                }
+
+                let forced_turnover = retirement_pending
+                    && active_count >= pool.max_sessions_per_host
+                    && healthy_non_retiring < pool.min_sessions_per_host
+                    && connecting_non_retiring == 0;
+                drain_replaced_sessions(
+                    &node,
+                    if forced_turnover {
+                        0
+                    } else {
+                        pool.min_sessions_per_host
+                    },
+                    drain_timeout,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+async fn spawn_managed_session(
+    tasks: &mut JoinSet<SessionExit>,
+    session_id: u64,
+    outbound: &str,
+    upstream: &SshHostConfig,
+    plan: &Arc<ResolvedSshPlan>,
+    probe: ProbeConfig,
+    node: &Arc<NativeSshNode>,
+) {
+    stats::register_ssh_session(stats::SshSessionRegistration {
+        id: session_id,
+        host_name: outbound.to_string(),
+        ssh_alias: plan.target.alias.clone(),
+        address: format_ssh_address(&plan.target.host, plan.target.port),
+    });
+    let session = Arc::new(ManagedSshSession {
+        id: session_id,
+        state: Arc::new(RwLock::new(SshSessionState::default())),
+        handle: Arc::new(RwLock::new(None)),
+        in_flight: Arc::new(AtomicUsize::new(0)),
+        retire_requested: AtomicBool::new(false),
+    });
+    node.sessions.write().await.push(Arc::clone(&session));
+    let outbound = outbound.to_string();
+    let upstream = upstream.clone();
+    let plan = Arc::clone(plan);
+    let span = info_span!(
+        "ssh_session",
+        host_name = %outbound,
+        ssh_session_id = session_id
+    );
+    info!(
+        host_name = %outbound,
+        ssh_session_id = session_id,
+        "starting native SSH session for pool capacity"
+    );
+    tasks.spawn(run_managed_session(outbound, upstream, plan, probe, session).instrument(span));
+}
+
+async fn run_managed_session(
+    outbound: String,
+    upstream: SshHostConfig,
+    plan: Arc<ResolvedSshPlan>,
+    probe: ProbeConfig,
+    session: Arc<ManagedSshSession>,
+) -> SessionExit {
+    let _session_metric = stats::SshSessionGuard::start(session.id);
+    let mut reached_healthy = false;
+    let error = match establish_session(&upstream, &plan, &session).await {
+        Ok(mut established) => {
+            reached_healthy = true;
+            {
+                *session.handle.write().await = Some(Arc::clone(&established.handle));
+                let mut state = session.state.write().await;
+                state.status = SshSessionStatus::Healthy;
+                state.rtt_millis = Some(established.startup_ms.round() as u64);
+                state.startup_ms = Some(established.startup_ms);
+                state.last_error = None;
+            }
+            sync_session_runtime_stats(&session, false).await;
+            info!(
+                host_name = %outbound,
+                ssh_session_id = session.id,
+                ssh_alias = %plan.target.alias,
+                host = %plan.target.host,
+                port = plan.target.port,
+                startup_ms = established.startup_ms,
+                "native SSH session joined the pool"
+            );
+            monitor_session(
+                &established.handle,
+                &mut established.disconnect_rx,
+                &session,
+                probe,
+            )
+            .await
+        }
+        Err(error) => format!("{error:#}"),
+    };
+    *session.handle.write().await = None;
+    {
+        let mut state = session.state.write().await;
+        state.status = SshSessionStatus::Offline;
+        state.last_error = Some(error.clone());
+    }
+    sync_session_runtime_stats(&session, false).await;
+    if !session.retire_requested.load(Ordering::Relaxed) {
+        stats::record_host_error(&outbound, &error);
+    }
+    SessionExit {
+        id: session.id,
+        reached_healthy,
+        retired: session.retire_requested.load(Ordering::Relaxed),
+        error,
+    }
+}
+
+async fn establish_session(
+    upstream: &SshHostConfig,
+    plan: &ResolvedSshPlan,
+    session: &Arc<ManagedSshSession>,
+) -> anyhow::Result<EstablishedSession> {
+    let started = Instant::now();
+    let remote_forwards = Arc::new(build_remote_routes(upstream));
+    let (handle, disconnect_rx, transport_chain) = if plan.jumps.is_empty() {
+        let transport = open_initial_transport(&plan.target).await?;
+        let (handle, disconnect_rx) = connect_ssh_endpoint(
+            &upstream.name,
+            session.id,
+            &plan.target,
+            transport,
+            remote_forwards,
+            Arc::clone(&session.in_flight),
+        )
+        .await?;
+        (handle, disconnect_rx, Vec::new())
+    } else {
+        let first = plan.jumps.first().context("SSH ProxyJump chain is empty")?;
+        let transport = open_initial_transport(first).await?;
+        let (first_handle, _) = connect_ssh_endpoint(
+            &upstream.name,
+            session.id,
+            first,
+            transport,
+            Arc::new(HashMap::new()),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await?;
+        let mut transport_chain = vec![first_handle];
+
+        for endpoint in plan.jumps.iter().skip(1) {
+            let transport = open_jump_transport(
+                transport_chain
+                    .last()
+                    .expect("the SSH jump transport chain has a first handle"),
+                endpoint,
+            )
+            .await?;
+            let (handle, _) = connect_ssh_endpoint(
+                &upstream.name,
+                session.id,
+                endpoint,
+                transport,
+                Arc::new(HashMap::new()),
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await?;
+            transport_chain.push(handle);
+        }
+
+        let target_transport = open_jump_transport(
+            transport_chain
+                .last()
+                .expect("the SSH jump transport chain has a handle"),
+            &plan.target,
+        )
+        .await?;
+        let (handle, disconnect_rx) = connect_ssh_endpoint(
+            &upstream.name,
+            session.id,
+            &plan.target,
+            target_transport,
+            remote_forwards,
+            Arc::clone(&session.in_flight),
+        )
+        .await?;
+        (handle, disconnect_rx, transport_chain)
+    };
+
+    Ok(EstablishedSession {
+        handle,
+        _transport_chain: transport_chain,
+        disconnect_rx,
+        startup_ms: elapsed_ms(started),
+    })
+}
+
+async fn open_initial_transport(
+    endpoint: &ResolvedSshEndpoint,
+) -> anyhow::Result<BoxedSshTransport> {
+    if endpoint.proxy_command.is_some() {
+        return Ok(Box::new(ProxyCommandStream::spawn(endpoint)?));
+    }
+    let stream = timeout(
+        endpoint.connect_timeout,
+        TcpStream::connect((endpoint.host.as_str(), endpoint.port)),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "timed out opening TCP transport for SSH host {} at {}:{}",
+            endpoint.alias, endpoint.host, endpoint.port
+        )
+    })??;
+    stream.set_nodelay(true)?;
+    socket2::SockRef::from(&stream).set_keepalive(endpoint.tcp_keep_alive)?;
+    Ok(Box::new(stream))
+}
+
+async fn open_jump_transport(
+    previous: &Arc<NativeSshHandle>,
+    endpoint: &ResolvedSshEndpoint,
+) -> anyhow::Result<BoxedSshTransport> {
+    if endpoint.proxy_command.is_some() {
+        bail!(
+            "SSH ProxyCommand for host {} cannot replace an active ProxyJump transport",
+            endpoint.alias
+        );
+    }
+    let channel = timeout(
+        endpoint.connect_timeout,
+        previous.channel_open_direct_tcpip(
+            endpoint.host.clone(),
+            u32::from(endpoint.port),
+            "127.0.0.1",
+            0,
+        ),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "timed out opening ProxyJump channel to {}:{}",
+            endpoint.host, endpoint.port
+        )
+    })??;
+    Ok(Box::new(channel.into_stream()))
+}
+
+async fn connect_ssh_endpoint(
+    upstream: &str,
+    session_id: u64,
+    endpoint: &ResolvedSshEndpoint,
+    transport: BoxedSshTransport,
+    remote_forwards: Arc<HashMap<u32, RemoteForwardRoute>>,
+    in_flight: Arc<AtomicUsize>,
+) -> anyhow::Result<(Arc<NativeSshHandle>, mpsc::UnboundedReceiver<String>)> {
+    let config = Arc::new(client::Config {
+        nodelay: true,
+        keepalive_interval: Some(endpoint.keep_alive),
+        keepalive_max: endpoint.keep_alive_max,
+        ..Default::default()
+    });
+    let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel();
+    let handler = NativeSshHandler {
+        upstream: upstream.to_string(),
+        session_id,
+        host: endpoint.host.clone(),
+        port: endpoint.port,
+        host_key_policy: endpoint.host_key_policy,
+        host_key_name: endpoint.host_key_name.clone(),
+        known_hosts_paths: endpoint.known_hosts_paths.clone(),
+        remote_forwards,
+        in_flight,
+        disconnect_tx,
+    };
+    let mut handle = timeout(
+        endpoint.connect_timeout,
+        client::connect_stream(config, transport, handler),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "timed out negotiating SSH host {} at {}:{}",
+            endpoint.alias, endpoint.host, endpoint.port
+        )
+    })??;
+    timeout(
+        endpoint.connect_timeout,
+        authenticate(&mut handle, endpoint),
+    )
+    .await
+    .with_context(|| format!("timed out authenticating SSH host {}", endpoint.alias))??;
+    Ok((Arc::new(handle), disconnect_rx))
+}
+
+async fn authenticate(
+    handle: &mut NativeSshHandle,
+    endpoint: &ResolvedSshEndpoint,
+) -> anyhow::Result<()> {
+    let success = match &endpoint.auth.explicit {
+        Some(SshAuthConfig::Agent) => {
+            authenticate_with_agent(handle, &endpoint.username, &endpoint.alias).await?
+        }
+        Some(SshAuthConfig::PrivateKey {
+            path,
+            passphrase_env,
+        }) => {
+            let passphrase = passphrase_env
+                .as_ref()
+                .map(|name| env::var(name).with_context(|| format!("missing environment {name}")))
+                .transpose()?;
+            let key = keys::load_secret_key(expand_tilde(path), passphrase.as_deref())?;
+            let hash = handle.best_supported_rsa_hash().await?.flatten();
+            handle
+                .authenticate_publickey(
+                    endpoint.username.clone(),
+                    PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+                )
+                .await?
+                .success()
+        }
+        Some(SshAuthConfig::Password { password_env }) => {
+            let password = env::var(password_env)
+                .with_context(|| format!("missing environment {password_env}"))?;
+            handle
+                .authenticate_password(endpoint.username.clone(), password)
+                .await?
+                .success()
+        }
+        None => authenticate_from_ssh_config(handle, endpoint).await?,
+    };
+    if !success {
+        bail!("SSH authentication failed for host {}", endpoint.alias);
+    }
+    Ok(())
+}
+
+async fn authenticate_from_ssh_config(
+    handle: &mut NativeSshHandle,
+    endpoint: &ResolvedSshEndpoint,
+) -> anyhow::Result<bool> {
+    let hash = handle.best_supported_rsa_hash().await?.flatten();
+    for path in &endpoint.auth.identity_files {
+        let key = match keys::load_secret_key(path, None) {
+            Ok(key) => key,
+            Err(error) => {
+                debug!(
+                    ssh_alias = %endpoint.alias,
+                    identity_file = %path.display(),
+                    %error,
+                    "could not load SSH config identity file"
+                );
+                continue;
+            }
+        };
+        match handle
+            .authenticate_publickey(
+                endpoint.username.clone(),
+                PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+            )
+            .await
+        {
+            Ok(result) if result.success() => return Ok(true),
+            Ok(_) => debug!(
+                ssh_alias = %endpoint.alias,
+                identity_file = %path.display(),
+                "SSH server rejected identity file"
+            ),
+            Err(error) => debug!(
+                ssh_alias = %endpoint.alias,
+                identity_file = %path.display(),
+                %error,
+                "SSH identity authentication attempt failed"
+            ),
+        }
+    }
+    if endpoint.auth.use_agent {
+        return authenticate_with_agent(handle, &endpoint.username, &endpoint.alias).await;
+    }
+    Ok(false)
+}
+
+async fn authenticate_with_agent(
+    handle: &mut NativeSshHandle,
+    username: &str,
+    alias: &str,
+) -> anyhow::Result<bool> {
+    let mut agent = connect_agent()
+        .await
+        .with_context(|| format!("failed to connect to SSH agent for host {alias}"))?;
+    let identities = agent.request_identities().await?;
+    if identities.is_empty() {
+        return Ok(false);
+    }
+    let hash = handle.best_supported_rsa_hash().await?.flatten();
+    for identity in identities {
+        let result = match identity {
+            AgentIdentity::PublicKey { key, .. } => {
+                handle
+                    .authenticate_publickey_with(username.to_string(), key, hash, &mut agent)
+                    .await?
+            }
+            AgentIdentity::Certificate { certificate, .. } => {
+                handle
+                    .authenticate_certificate_with(
+                        username.to_string(),
+                        certificate,
+                        hash,
+                        &mut agent,
+                    )
+                    .await?
+            }
+        };
+        if result.success() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(unix)]
+async fn connect_agent() -> anyhow::Result<DynamicAgent> {
+    Ok(AgentClient::<tokio::net::UnixStream>::connect_env()
+        .await?
+        .dynamic())
+}
+
+#[cfg(windows)]
+async fn connect_agent() -> anyhow::Result<DynamicAgent> {
+    if let Some(path) = env::var_os("SSH_AUTH_SOCK") {
+        return Ok(
+            AgentClient::<tokio::net::windows::named_pipe::NamedPipeClient>::connect_named_pipe(
+                path,
+            )
+            .await?
+            .dynamic(),
+        );
+    }
+    Ok(AgentClient::connect_pageant().await?.dynamic())
+}
+
+async fn monitor_session(
+    handle: &Arc<NativeSshHandle>,
+    disconnect_rx: &mut mpsc::UnboundedReceiver<String>,
+    session: &Arc<ManagedSshSession>,
+    probe: ProbeConfig,
+) -> String {
+    let mut consecutive_failures = 0_u32;
+    let mut consecutive_successes = 0_u32;
+    let replacement_threshold = probe.fail_threshold.saturating_sub(1).max(1);
+    loop {
+        tokio::select! {
+            reason = disconnect_rx.recv() => {
+                return reason.unwrap_or_else(|| "SSH session disconnected".to_string());
+            }
+            _ = sleep(Duration::from_secs(probe.interval_secs.max(1))) => {
+                if !probe.enabled {
+                    continue;
+                }
+                let started = Instant::now();
+                let result = timeout(
+                    Duration::from_millis(probe.timeout_millis.max(1)),
+                    handle.send_ping(),
+                ).await;
+                stats::record_ssh_session_probe(session.id);
+                match result {
+                    Ok(Ok(())) => {
+                        consecutive_failures = 0;
+                        consecutive_successes = consecutive_successes.saturating_add(1);
+                        let sample = elapsed_ms(started).round() as u64;
+                        let mut state = session.state.write().await;
+                        if !session.retire_requested.load(Ordering::Relaxed)
+                            && consecutive_successes >= probe.recovery_threshold
+                        {
+                            state.status = SshSessionStatus::Healthy;
+                        }
+                        state.rtt_millis = Some(ewma_rtt(state.rtt_millis, sample));
+                        state.last_error = None;
+                    }
+                    Ok(Err(error)) => {
+                        consecutive_successes = 0;
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        let error = format!("SSH ping failed: {error}");
+                        mark_session_probe_failure(
+                            session,
+                            &error,
+                            consecutive_failures >= replacement_threshold,
+                        ).await;
+                        if consecutive_failures >= probe.fail_threshold {
+                            let _ = handle.disconnect(Disconnect::ConnectionLost, &error, "en").await;
+                            return error;
+                        }
+                    }
+                    Err(_) => {
+                        consecutive_successes = 0;
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        let error = format!(
+                            "SSH ping timed out after {} ms",
+                            probe.timeout_millis.max(1)
+                        );
+                        mark_session_probe_failure(
+                            session,
+                            &error,
+                            consecutive_failures >= replacement_threshold,
+                        ).await;
+                        if consecutive_failures >= probe.fail_threshold {
+                            let _ = handle.disconnect(Disconnect::ConnectionLost, &error, "en").await;
+                            return error;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn mark_session_probe_failure(
+    session: &Arc<ManagedSshSession>,
+    error: &str,
+    request_replacement: bool,
+) {
+    let mut state = session.state.write().await;
+    state.status = SshSessionStatus::Suspect;
+    state.last_error = Some(error.to_string());
+    if request_replacement {
+        session.retire_requested.store(true, Ordering::Release);
+    }
+    warn!(
+        ssh_session_id = session.id,
+        request_replacement,
+        %error,
+        "native SSH session health probe failed"
+    );
+}
+
+async fn refresh_node_state(node: &Arc<NativeSshNode>) {
+    let sessions = node.sessions.read().await.clone();
+    let owner_id = *node.remote_owner.read().await;
+    let mut healthy_rtt = None;
+    let mut active = false;
+    let mut last_error = None;
+    for session in sessions {
+        let state = session.state.read().await;
+        active |= state.status != SshSessionStatus::Offline;
+        if state.status == SshSessionStatus::Healthy
+            && !session.retire_requested.load(Ordering::Relaxed)
+        {
+            healthy_rtt = match (healthy_rtt, state.rtt_millis) {
+                (None, rtt) => rtt,
+                (Some(current), Some(rtt)) => Some(current.min(rtt)),
+                (current, None) => current,
+            };
+        }
+        if state.last_error.is_some() {
+            last_error.clone_from(&state.last_error);
+        }
+        drop(state);
+        sync_session_runtime_stats(&session, owner_id == Some(session.id)).await;
+    }
+    let mut state = node.state.write().await;
+    state.status = if healthy_rtt.is_some() {
+        HealthStatus::Healthy
+    } else if active {
+        HealthStatus::Degraded
+    } else {
+        HealthStatus::Offline
+    };
+    state.rtt_millis = healthy_rtt;
+    state.last_error = last_error;
+    let update = stats::HostStateUpdate {
+        status: match state.status {
+            HealthStatus::Healthy => stats::HostRuntimeStatus::Healthy,
+            HealthStatus::Degraded => stats::HostRuntimeStatus::Degraded,
+            HealthStatus::Offline => stats::HostRuntimeStatus::Offline,
+            HealthStatus::Unknown => stats::HostRuntimeStatus::Connecting,
+        },
+        rtt_ms: state.rtt_millis,
+        restart_count: state.restart_count,
+        last_error: state.last_error.clone(),
+    };
+    drop(state);
+    stats::update_host_state(&node.name, update);
+}
+
+async fn sync_session_runtime_stats(session: &Arc<ManagedSshSession>, remote_owner: bool) {
+    let state = session.state.read().await;
+    stats::update_ssh_session_state(
+        session.id,
+        stats::SshSessionStateUpdate {
+            status: match state.status {
+                SshSessionStatus::Connecting => stats::SshSessionRuntimeStatus::Connecting,
+                SshSessionStatus::Healthy => stats::SshSessionRuntimeStatus::Healthy,
+                SshSessionStatus::Suspect => stats::SshSessionRuntimeStatus::Suspect,
+                SshSessionStatus::Draining => stats::SshSessionRuntimeStatus::Draining,
+                SshSessionStatus::Offline => stats::SshSessionRuntimeStatus::Offline,
+            },
+            startup_ms: state.startup_ms,
+            rtt_ms: state.rtt_millis,
+            retiring: session.retire_requested.load(Ordering::Relaxed),
+            remote_forward_owner: remote_owner,
+            last_error: state.last_error.clone(),
+        },
+    );
+}
+
+async fn ensure_remote_owner(
+    node: &Arc<NativeSshNode>,
+    upstream: &SshHostConfig,
+    operation_timeout: Duration,
+) -> anyhow::Result<()> {
+    if upstream.remote_forwards.is_empty() {
+        return Ok(());
+    }
+    let sessions = node.sessions.read().await.clone();
+    let owner_id = *node.remote_owner.read().await;
+    let current = owner_id.and_then(|id| sessions.iter().find(|session| session.id == id).cloned());
+    if let Some(owner) = &current {
+        let is_healthy = owner.state.read().await.status == SshSessionStatus::Healthy
+            && !owner.retire_requested.load(Ordering::Relaxed);
+        if is_healthy && owner.current_handle().await.is_some() {
+            return Ok(());
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for session in &sessions {
+        if Some(session.id) == owner_id || session.retire_requested.load(Ordering::Relaxed) {
+            continue;
+        }
+        let state = session.state.read().await;
+        if state.status == SshSessionStatus::Healthy {
+            candidates.push((state.rtt_millis.unwrap_or(u64::MAX), Arc::clone(session)));
+        }
+    }
+    candidates.sort_by_key(|(rtt, _)| *rtt);
+    if candidates.is_empty()
+        && let Some(owner) = &current
+        && owner.retire_requested.load(Ordering::Relaxed)
+    {
+        if let Some(handle) = owner.current_handle().await {
+            cancel_remote_forwards(&handle, upstream, operation_timeout).await?;
+        }
+        *node.remote_owner.write().await = None;
+        bail!("remote forwards released while waiting for a replacement SSH session");
+    }
+    let (_, replacement) = candidates
+        .into_iter()
+        .next()
+        .context("no healthy standby SSH session is ready for remote forwarding")?;
+
+    if let Some(owner) = current {
+        if let Some(handle) = owner.current_handle().await
+            && let Err(error) = cancel_remote_forwards(&handle, upstream, operation_timeout).await
+        {
+            let _ = handle
+                .disconnect(
+                    Disconnect::ConnectionLost,
+                    &format!("remote forward handover: {error}"),
+                    "en",
+                )
+                .await;
+            *node.remote_owner.write().await = None;
+            bail!(
+                "failed to release remote forwards from session {}: {error}",
+                owner.id
+            );
+        }
+        *node.remote_owner.write().await = None;
+    }
+
+    let handle = replacement
+        .current_handle()
+        .await
+        .context("replacement SSH session closed before remote forward registration")?;
+    register_remote_forwards(&handle, upstream, operation_timeout, replacement.id).await?;
+    *node.remote_owner.write().await = Some(replacement.id);
+    info!(
+        ssh_host = %node.name,
+        ssh_session_id = replacement.id,
+        remote_forward_count = upstream.remote_forwards.len(),
+        "SSH remote forwards assigned to session owner"
+    );
+    Ok(())
+}
+
+async fn register_remote_forwards(
+    handle: &Arc<NativeSshHandle>,
+    upstream: &SshHostConfig,
+    operation_timeout: Duration,
+    owner_session_id: u64,
+) -> anyhow::Result<()> {
+    let mut registered: Vec<(SocketAddr, String)> = Vec::new();
+    for forward in &upstream.remote_forwards {
+        let listen = remote_forward_listen(forward);
+        let tunnel_id = remote_forward_tunnel_id(upstream, forward);
+        let result = timeout(
+            operation_timeout,
+            handle.tcpip_forward(listen.ip().to_string(), u32::from(listen.port())),
+        )
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => {
+                let error = format!("timed out registering SSH remote forward at {listen}");
+                stats::update_tunnel_status(
+                    &tunnel_id,
+                    stats::TunnelRuntimeStatus::Error,
+                    None,
+                    Some(error.clone()),
+                );
+                stats::record_tunnel_error(&upstream.name, &tunnel_id, &error);
+                let _ = timeout(
+                    operation_timeout,
+                    handle.cancel_tcpip_forward(listen.ip().to_string(), u32::from(listen.port())),
+                )
+                .await;
+                rollback_registered_remote_forwards(
+                    handle,
+                    upstream,
+                    operation_timeout,
+                    &registered,
+                    &error,
+                )
+                .await;
+                bail!(error);
+            }
+        };
+        if let Err(error) = result {
+            let error_text = format!("failed to register SSH remote forward at {listen}: {error}");
+            stats::update_tunnel_status(
+                &tunnel_id,
+                stats::TunnelRuntimeStatus::Error,
+                None,
+                Some(error_text.clone()),
+            );
+            stats::record_tunnel_error(&upstream.name, &tunnel_id, &error_text);
+            rollback_registered_remote_forwards(
+                handle,
+                upstream,
+                operation_timeout,
+                &registered,
+                &error_text,
+            )
+            .await;
+            return Err(error)
+                .with_context(|| format!("failed to register SSH remote forward at {listen}"));
+        }
+        registered.push((listen, tunnel_id.clone()));
+        stats::update_tunnel_status(
+            &tunnel_id,
+            stats::TunnelRuntimeStatus::Listening,
+            Some(owner_session_id),
+            None,
+        );
+    }
+    Ok(())
+}
+
+async fn rollback_registered_remote_forwards(
+    handle: &Arc<NativeSshHandle>,
+    upstream: &SshHostConfig,
+    operation_timeout: Duration,
+    registered: &[(SocketAddr, String)],
+    cause: &str,
+) {
+    for (listen, tunnel_id) in registered {
+        let cancellation = timeout(
+            operation_timeout,
+            handle.cancel_tcpip_forward(listen.ip().to_string(), u32::from(listen.port())),
+        )
+        .await;
+        let rollback_error = match cancellation {
+            Ok(Ok(())) => format!(
+                "remote forward at {listen} was rolled back because another listener failed: {cause}"
+            ),
+            Ok(Err(error)) => format!(
+                "remote forward rollback at {listen} failed after another listener failed: {error}"
+            ),
+            Err(_) => format!(
+                "remote forward rollback at {listen} timed out after another listener failed: {cause}"
+            ),
+        };
+        stats::update_tunnel_status(
+            tunnel_id,
+            stats::TunnelRuntimeStatus::Error,
+            None,
+            Some(rollback_error.clone()),
+        );
+        stats::record_tunnel_error(&upstream.name, tunnel_id, &rollback_error);
+    }
+}
+
+async fn cancel_remote_forwards(
+    handle: &Arc<NativeSshHandle>,
+    upstream: &SshHostConfig,
+    operation_timeout: Duration,
+) -> anyhow::Result<()> {
+    for forward in &upstream.remote_forwards {
+        let listen = remote_forward_listen(forward);
+        timeout(
+            operation_timeout,
+            handle.cancel_tcpip_forward(listen.ip().to_string(), u32::from(listen.port())),
+        )
+        .await
+        .with_context(|| format!("timed out cancelling SSH remote forward at {listen}"))??;
+        stats::update_tunnel_status(
+            &remote_forward_tunnel_id(upstream, forward),
+            stats::TunnelRuntimeStatus::Starting,
+            None,
+            None,
+        );
+    }
+    Ok(())
+}
+
+fn mark_remote_tunnels_starting(upstream: &SshHostConfig) {
+    for forward in &upstream.remote_forwards {
+        stats::update_tunnel_status(
+            &remote_forward_tunnel_id(upstream, forward),
+            stats::TunnelRuntimeStatus::Starting,
+            None,
+            None,
+        );
+    }
+}
+
+fn remote_forward_tunnel_id(upstream: &SshHostConfig, forward: &SshRemoteForwardConfig) -> String {
+    match forward {
+        SshRemoteForwardConfig::Tcp { name, .. } => {
+            stats::tunnel_id(&upstream.name, stats::TunnelKind::RemoteForward, name)
+        }
+        SshRemoteForwardConfig::Dynamic { name, .. } => {
+            stats::tunnel_id(&upstream.name, stats::TunnelKind::RemoteProxy, name)
+        }
+    }
+}
+
+async fn drain_replaced_sessions(
+    node: &Arc<NativeSshNode>,
+    minimum_healthy: usize,
+    drain_timeout: Duration,
+) {
+    let owner = *node.remote_owner.read().await;
+    let sessions = node.sessions.read().await.clone();
+    let healthy_non_retiring = {
+        let mut count = 0;
+        for session in &sessions {
+            let state = session.state.read().await;
+            if state.status == SshSessionStatus::Healthy
+                && !session.retire_requested.load(Ordering::Relaxed)
+            {
+                count += 1;
+            }
+        }
+        count
+    };
+    if healthy_non_retiring < minimum_healthy {
+        return;
+    }
+
+    for session in sessions {
+        if !session.retire_requested.load(Ordering::Relaxed) || owner == Some(session.id) {
+            continue;
+        }
+        let mut state = session.state.write().await;
+        if state.status != SshSessionStatus::Draining {
+            state.status = SshSessionStatus::Draining;
+            state.drain_started = Some(Instant::now());
+            info!(
+                ssh_host = %node.name,
+                ssh_session_id = session.id,
+                active_channels = session.in_flight.load(Ordering::Relaxed),
+                "SSH session started draining"
+            );
+        }
+        let timed_out = state
+            .drain_started
+            .is_some_and(|started| started.elapsed() >= drain_timeout);
+        let drained = session.in_flight.load(Ordering::Relaxed) == 0;
+        drop(state);
+        if (drained || timed_out)
+            && let Some(handle) = session.current_handle().await
+        {
+            let reason = if drained {
+                "replacement session is ready and active channels drained"
+            } else {
+                "SSH session drain timeout exceeded"
+            };
+            let _ = handle
+                .disconnect(Disconnect::ByApplication, reason, "en")
+                .await;
+        }
+    }
+}
+
+fn build_remote_routes(upstream: &SshHostConfig) -> HashMap<u32, RemoteForwardRoute> {
+    upstream
+        .remote_forwards
+        .iter()
+        .map(|forward| match forward {
+            SshRemoteForwardConfig::Tcp {
+                name,
+                listen,
+                local_host,
+                local_port,
+            } => (
+                u32::from(listen.port()),
+                RemoteForwardRoute::Tcp {
+                    name: name.clone(),
+                    tunnel_id: stats::tunnel_id(
+                        &upstream.name,
+                        stats::TunnelKind::RemoteForward,
+                        name,
+                    ),
+                    local_host: local_host.clone(),
+                    local_port: *local_port,
+                },
+            ),
+            SshRemoteForwardConfig::Dynamic {
+                name,
+                listen,
+                protocol,
+            } => (
+                u32::from(listen.port()),
+                RemoteForwardRoute::Dynamic {
+                    name: name.clone(),
+                    tunnel_id: stats::tunnel_id(
+                        &upstream.name,
+                        stats::TunnelKind::RemoteProxy,
+                        name,
+                    ),
+                    protocol: *protocol,
+                },
+            ),
+        })
+        .collect()
+}
+
+fn remote_forward_listen(forward: &SshRemoteForwardConfig) -> SocketAddr {
+    match forward {
+        SshRemoteForwardConfig::Tcp { listen, .. }
+        | SshRemoteForwardConfig::Dynamic { listen, .. } => *listen,
+    }
+}
+
+fn target_host_port(target: &TargetAddr) -> (String, u32) {
+    match target {
+        TargetAddr::DomainPort { domain, port } => (domain.clone(), u32::from(*port)),
+        TargetAddr::Socket(address) => (address.ip().to_string(), u32::from(address.port())),
+    }
+}
+
+fn format_ssh_address(host: &str, port: u16) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
+        let home = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE"));
+        if let Some(home) = home {
+            let suffix = path
+                .strip_prefix("~/")
+                .or_else(|| path.strip_prefix("~\\"))
+                .unwrap_or_default();
+            return Path::new(&home).join(suffix);
+        }
+    }
+    PathBuf::from(path)
+}
+
+fn next_backoff(current: Duration, maximum: Duration) -> Duration {
+    current.saturating_mul(2).min(maximum)
+}
+
+fn ewma_rtt(current: Option<u64>, sample: u64) -> u64 {
+    current
+        .map(|current| current.saturating_mul(7).saturating_add(sample) / 8)
+        .unwrap_or(sample)
+}
+
+struct ActiveChannelGuard {
+    counter: Arc<AtomicUsize>,
+    session_id: u64,
+}
+
+impl ActiveChannelGuard {
+    fn new(counter: Arc<AtomicUsize>, session_id: u64) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        stats::ssh_session_channel_accepted(session_id);
+        Self {
+            counter,
+            session_id,
+        }
+    }
+}
+
+impl Drop for ActiveChannelGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+        stats::ssh_session_channel_closed(self.session_id);
+    }
+}
+
+struct InFlightReservation {
+    counter: Arc<AtomicUsize>,
+    session_id: u64,
+    active: bool,
+}
+
+impl InFlightReservation {
+    fn into_stream<S>(mut self, stream: S) -> CountedStream<S> {
+        self.active = false;
+        CountedStream {
+            inner: stream,
+            counter: Arc::clone(&self.counter),
+            session_id: self.session_id,
+            transfer_recorder: stats::session_transfer_recorder(self.session_id),
+        }
+    }
+}
+
+impl Drop for InFlightReservation {
+    fn drop(&mut self) {
+        if self.active {
+            self.counter.fetch_sub(1, Ordering::AcqRel);
+            stats::ssh_session_channel_closed(self.session_id);
+        }
+    }
+}
+
+fn reserve_in_flight(
+    counter: &Arc<AtomicUsize>,
+    maximum: usize,
+    session_id: u64,
+) -> Option<InFlightReservation> {
+    let previous = counter.fetch_add(1, Ordering::AcqRel);
+    if previous >= maximum {
+        counter.fetch_sub(1, Ordering::AcqRel);
+        return None;
+    }
+    stats::ssh_session_channel_reserved(session_id);
+    Some(InFlightReservation {
+        counter: Arc::clone(counter),
+        session_id,
+        active: true,
+    })
+}
+
+struct CountedStream<S> {
+    inner: S,
+    counter: Arc<AtomicUsize>,
+    session_id: u64,
+    transfer_recorder: stats::TransferRecorder,
+}
+
+impl<S> Drop for CountedStream<S> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+        stats::ssh_session_channel_closed(self.session_id);
+    }
+}
+
+impl<S> AsyncRead for CountedStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buffer.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(context, buffer);
+        if let Poll::Ready(Ok(())) = &result {
+            let read = buffer.filled().len().saturating_sub(before);
+            self.transfer_recorder.record(0, read as u64);
+        }
+        result
+    }
+}
+
+impl<S> AsyncWrite for CountedStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(context, buffer);
+        if let Poll::Ready(Ok(written)) = result {
+            self.transfer_recorder.record(written as u64, 0);
+            Poll::Ready(Ok(written))
+        } else {
+            result
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SshHostKeyPolicy;
+    use russh::server;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+    use tokio::net::TcpStream;
+
+    static NEXT_TEST_KEY_ID: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn restart_backoff_is_capped() {
+        assert_eq!(
+            next_backoff(Duration::from_secs(20), Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn target_host_port_preserves_domains_and_ips() {
+        assert_eq!(
+            target_host_port(&TargetAddr::from_host_port("example.com", 443)),
+            ("example.com".to_string(), 443)
+        );
+        assert_eq!(
+            target_host_port(&TargetAddr::from_host_port("127.0.0.1", 8080)),
+            ("127.0.0.1".to_string(), 8080)
+        );
+    }
+
+    #[test]
+    fn remote_routes_distinguish_fixed_and_dynamic_modes() {
+        let upstream = sample_upstream();
+        let routes = build_remote_routes(&upstream);
+        assert!(matches!(
+            routes.get(&18080),
+            Some(RemoteForwardRoute::Tcp { .. })
+        ));
+        assert!(matches!(
+            routes.get(&1080),
+            Some(RemoteForwardRoute::Dynamic { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn dynamic_remote_forward_serves_socks5_without_external_ssh_process() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4];
+            stream.read_exact(&mut buffer).await.unwrap();
+            stream.write_all(&buffer).await.unwrap();
+        });
+        let (mut client, server) = duplex(4096);
+        let proxy = tokio::spawn(serve_remote_proxy(
+            RemoteProxyContext {
+                upstream: "test-upstream".to_string(),
+                session_id: 1,
+                connection_id: next_connection_id(),
+                forward: "remote-socks".to_string(),
+                tunnel_id: "test-upstream/remote-proxy/remote-socks".to_string(),
+                protocol: ProxyProtocol::Socks5h,
+                peer_addr: "127.0.0.1:12345".parse().unwrap(),
+            },
+            server,
+        ));
+
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut method = [0_u8; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [0x05, 0x00]);
+
+        let mut request = vec![0x05, 0x01, 0x00, 0x01];
+        request.extend_from_slice(
+            &target
+                .ip()
+                .to_string()
+                .parse::<std::net::Ipv4Addr>()
+                .unwrap()
+                .octets(),
+        );
+        request.extend_from_slice(&target.port().to_be_bytes());
+        client.write_all(&request).await.unwrap();
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], SOCKS5_REPLY_SUCCEEDED);
+
+        client.write_all(b"ping").await.unwrap();
+        let mut echoed = [0_u8; 4];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+        drop(client);
+
+        proxy.await.unwrap().unwrap();
+        echo.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mixed_remote_proxy_supports_http_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4];
+            stream.read_exact(&mut buffer).await.unwrap();
+            stream.write_all(&buffer).await.unwrap();
+        });
+        let (mut client, server) = duplex(4096);
+        let proxy = tokio::spawn(serve_remote_proxy(
+            RemoteProxyContext {
+                upstream: "test-upstream".to_string(),
+                session_id: 2,
+                connection_id: next_connection_id(),
+                forward: "remote-mixed".to_string(),
+                tunnel_id: "test-upstream/remote-proxy/remote-mixed".to_string(),
+                protocol: ProxyProtocol::Mixed,
+                peer_addr: "127.0.0.1:12345".parse().unwrap(),
+            },
+            server,
+        ));
+
+        client
+            .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        loop {
+            response.push(client.read_u8().await.unwrap());
+            if response.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200 "));
+
+        client.write_all(b"ping").await.unwrap();
+        let mut echoed = [0_u8; 4];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+        drop(client);
+
+        proxy.await.unwrap().unwrap();
+        echo.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_ssh_pool_supports_dynamic_and_remote_forwarding() {
+        let (dynamic_target, dynamic_echo) = start_echo_server().await;
+        let (remote_fixed_target, remote_fixed_echo) = start_echo_server().await;
+        let (remote_dynamic_target, remote_dynamic_echo) = start_echo_server().await;
+        let remote_fixed_listen = unused_local_address().await;
+        let remote_dynamic_listen = unused_local_address().await;
+
+        let ssh_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ssh_address = ssh_listener.local_addr().unwrap();
+        let server_key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let server_config = Arc::new(server::Config {
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            keys: vec![server_key],
+            ..Default::default()
+        });
+        let server = tokio::spawn(async move {
+            let (socket, _) = ssh_listener.accept().await.unwrap();
+            let running = server::run_stream(server_config, socket, TestSshServer::default())
+                .await
+                .unwrap();
+            let _ = running.await;
+        });
+
+        let client_key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let key_path = env::temp_dir().join(format!(
+            "stk-native-ssh-test-{}",
+            NEXT_TEST_KEY_ID.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        let key_text = client_key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap();
+        std::fs::write(&key_path, key_text.as_bytes()).unwrap();
+
+        let pool_config = SshPoolConfig {
+            policy: crate::config::LoadBalancePolicy::RoundRobin,
+            keep_alive_secs: Some(5),
+            min_sessions_per_host: 1,
+            max_sessions_per_host: 2,
+            max_channels_per_session: 8,
+            server_alive_count_max: Some(2),
+            connect_timeout_secs: Some(2),
+            restart_initial_millis: 50,
+            restart_max_secs: 1,
+            session_spawn_cooldown_millis: 20,
+            session_drain_timeout_secs: 2,
+            hosts: vec![SshHostConfig {
+                name: "local-test".to_string(),
+                host: Some(ssh_address.ip().to_string()),
+                ssh_config_host: None,
+                port: Some(ssh_address.port()),
+                username: Some("test".to_string()),
+                auth: Some(SshAuthConfig::PrivateKey {
+                    path: key_path.to_string_lossy().into_owned(),
+                    passphrase_env: None,
+                }),
+                ssh_config_path: None,
+                host_key_policy: Some(SshHostKeyPolicy::InsecureAcceptAny),
+                known_hosts_path: None,
+                remote_forwards: vec![
+                    SshRemoteForwardConfig::Tcp {
+                        name: "remote-fixed".to_string(),
+                        listen: remote_fixed_listen,
+                        local_host: "localhost".to_string(),
+                        local_port: remote_fixed_target.port(),
+                    },
+                    SshRemoteForwardConfig::Dynamic {
+                        name: "remote-dynamic".to_string(),
+                        listen: remote_dynamic_listen,
+                        protocol: crate::config::ProxyProtocol::Socks5h,
+                    },
+                ],
+            }],
+        };
+        let pool = SshPoolDialer::start(
+            "native-test",
+            pool_config,
+            ProbeConfig {
+                interval_secs: 1,
+                timeout_millis: 500,
+                ..ProbeConfig::default()
+            },
+        )
+        .unwrap();
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if pool.nodes[0].state.read().await.status == HealthStatus::Healthy {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("native SSH session did not become healthy");
+
+        let mut stream = pool
+            .dial(DialContext {
+                host_name: "native-test".to_string(),
+                target: TargetAddr::from_host_port("localhost", dynamic_target.port()),
+                connection_id: None,
+            })
+            .await
+            .unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        let mut echoed = [0_u8; 4];
+        stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+        drop(stream);
+
+        let mut remote_fixed_stream = TcpStream::connect(remote_fixed_listen).await.unwrap();
+        remote_fixed_stream.write_all(b"ping").await.unwrap();
+        remote_fixed_stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+        drop(remote_fixed_stream);
+
+        let mut remote_dynamic_stream = TcpStream::connect(remote_dynamic_listen).await.unwrap();
+        remote_dynamic_stream
+            .write_all(&[0x05, 0x01, 0x00])
+            .await
+            .unwrap();
+        let mut method = [0_u8; 2];
+        remote_dynamic_stream.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [0x05, 0x00]);
+        let mut request = vec![0x05, 0x01, 0x00, 0x01];
+        request.extend_from_slice(
+            &remote_dynamic_target
+                .ip()
+                .to_string()
+                .parse::<std::net::Ipv4Addr>()
+                .unwrap()
+                .octets(),
+        );
+        request.extend_from_slice(&remote_dynamic_target.port().to_be_bytes());
+        remote_dynamic_stream.write_all(&request).await.unwrap();
+        let mut socks_reply = [0_u8; 10];
+        remote_dynamic_stream
+            .read_exact(&mut socks_reply)
+            .await
+            .unwrap();
+        assert_eq!(socks_reply[1], SOCKS5_REPLY_SUCCEEDED);
+        remote_dynamic_stream.write_all(b"ping").await.unwrap();
+        remote_dynamic_stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+        drop(remote_dynamic_stream);
+
+        drop(pool);
+        let _ = std::fs::remove_file(key_path);
+        dynamic_echo.await.unwrap();
+        remote_fixed_echo.await.unwrap();
+        remote_dynamic_echo.await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn native_ssh_session_reconnects_after_server_disconnect() {
+        let ssh_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ssh_address = ssh_listener.local_addr().unwrap();
+        let server_key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let server_config = Arc::new(server::Config {
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            keys: vec![server_key],
+            ..Default::default()
+        });
+        let (server_handle_tx, mut server_handle_rx) = mpsc::unbounded_channel();
+        let accepted_connections = Arc::new(AtomicUsize::new(0));
+        let server_connection_count = Arc::clone(&accepted_connections);
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (socket, _) = ssh_listener.accept().await.unwrap();
+                server_connection_count.fetch_add(1, AtomicOrdering::Relaxed);
+                let running = server::run_stream(
+                    Arc::clone(&server_config),
+                    socket,
+                    TestSshServer::default(),
+                )
+                .await
+                .unwrap();
+                server_handle_tx.send(running.handle()).unwrap();
+                tokio::spawn(async move {
+                    let _ = running.await;
+                });
+            }
+        });
+
+        let client_key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let key_path = env::temp_dir().join(format!(
+            "stk-native-ssh-reconnect-test-{}",
+            NEXT_TEST_KEY_ID.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        let key_text = client_key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap();
+        std::fs::write(&key_path, key_text.as_bytes()).unwrap();
+
+        let pool = SshPoolDialer::start(
+            "reconnect-test",
+            SshPoolConfig {
+                policy: crate::config::LoadBalancePolicy::RoundRobin,
+                keep_alive_secs: Some(5),
+                min_sessions_per_host: 1,
+                max_sessions_per_host: 2,
+                max_channels_per_session: 8,
+                server_alive_count_max: Some(2),
+                connect_timeout_secs: Some(2),
+                restart_initial_millis: 20,
+                restart_max_secs: 1,
+                session_spawn_cooldown_millis: 20,
+                session_drain_timeout_secs: 2,
+                hosts: vec![SshHostConfig {
+                    name: "local-test".to_string(),
+                    host: Some(ssh_address.ip().to_string()),
+                    ssh_config_host: None,
+                    port: Some(ssh_address.port()),
+                    username: Some("test".to_string()),
+                    auth: Some(SshAuthConfig::PrivateKey {
+                        path: key_path.to_string_lossy().into_owned(),
+                        passphrase_env: None,
+                    }),
+                    ssh_config_path: None,
+                    host_key_policy: Some(SshHostKeyPolicy::InsecureAcceptAny),
+                    known_hosts_path: None,
+                    remote_forwards: Vec::new(),
+                }],
+            },
+            ProbeConfig {
+                enabled: false,
+                ..ProbeConfig::default()
+            },
+        )
+        .unwrap();
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if pool.nodes[0].state.read().await.status == HealthStatus::Healthy {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial native SSH session did not become healthy");
+        let first_server_handle = timeout(Duration::from_secs(1), server_handle_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        first_server_handle
+            .disconnect(
+                Disconnect::ByApplication,
+                "test disconnect".to_string(),
+                "en".to_string(),
+            )
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let state = pool.nodes[0].state.read().await.clone();
+                if state.restart_count >= 1
+                    && state.status == HealthStatus::Healthy
+                    && accepted_connections.load(AtomicOrdering::Relaxed) >= 2
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("native SSH session did not reconnect");
+
+        drop(pool);
+        let _ = std::fs::remove_file(key_path);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_ssh_pool_uses_multiple_sessions_concurrently() {
+        let (target, target_task) = start_persistent_echo_server(2).await;
+        let ssh_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ssh_address = ssh_listener.local_addr().unwrap();
+        let server_key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let server_config = Arc::new(server::Config {
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            keys: vec![server_key],
+            ..Default::default()
+        });
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = ssh_listener.accept().await else {
+                    return;
+                };
+                let running = server::run_stream(
+                    Arc::clone(&server_config),
+                    socket,
+                    TestSshServer::default(),
+                )
+                .await
+                .unwrap();
+                tokio::spawn(async move {
+                    let _ = running.await;
+                });
+            }
+        });
+        let key_path = write_test_key("multi-session");
+        let pool = SshPoolDialer::start(
+            "multi-session-test",
+            test_pool_config(ssh_address, &key_path, 2, 3, 1, Vec::new()),
+            ProbeConfig {
+                enabled: false,
+                ..ProbeConfig::default()
+            },
+        )
+        .unwrap();
+
+        wait_for_healthy_sessions(&pool.nodes[0], 2).await;
+        let mut first = pool
+            .dial(DialContext {
+                host_name: "multi-session-test".to_string(),
+                target: TargetAddr::Socket(target),
+                connection_id: None,
+            })
+            .await
+            .unwrap();
+        let mut second = pool
+            .dial(DialContext {
+                host_name: "multi-session-test".to_string(),
+                target: TargetAddr::Socket(target),
+                connection_id: None,
+            })
+            .await
+            .unwrap();
+
+        let sessions = pool.nodes[0].sessions.read().await.clone();
+        assert_eq!(
+            sessions
+                .iter()
+                .filter(|session| session.in_flight.load(AtomicOrdering::Relaxed) == 1)
+                .count(),
+            2
+        );
+        first.write_all(b"one1").await.unwrap();
+        second.write_all(b"two2").await.unwrap();
+        let mut first_reply = [0_u8; 4];
+        let mut second_reply = [0_u8; 4];
+        first.read_exact(&mut first_reply).await.unwrap();
+        second.read_exact(&mut second_reply).await.unwrap();
+        assert_eq!(&first_reply, b"one1");
+        assert_eq!(&second_reply, b"two2");
+
+        drop(first);
+        drop(second);
+        drop(pool);
+        let _ = std::fs::remove_file(key_path);
+        target_task.await.unwrap();
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxy_command_stream_is_bidirectional() {
+        let endpoint = ResolvedSshEndpoint {
+            alias: "proxy-command-test".to_string(),
+            host: "example.test".to_string(),
+            port: 22,
+            username: "test".to_string(),
+            auth: crate::ssh_config::ResolvedSshAuth {
+                explicit: None,
+                identity_files: Vec::new(),
+                use_agent: false,
+            },
+            host_key_policy: ResolvedHostKeyPolicy::InsecureAcceptAny,
+            host_key_name: "example.test".to_string(),
+            known_hosts_paths: Vec::new(),
+            connect_timeout: Duration::from_secs(1),
+            keep_alive: Duration::from_secs(1),
+            keep_alive_max: 1,
+            tcp_keep_alive: true,
+            proxy_command: Some("cat".to_string()),
+        };
+        let mut stream = ProxyCommandStream::spawn(&endpoint).unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut reply = [0_u8; 4];
+        timeout(Duration::from_secs(1), stream.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"ping");
+    }
+
+    #[tokio::test]
+    async fn native_ssh_pool_connects_multiple_sessions_through_two_proxy_jumps() {
+        let (target, target_task) = start_echo_server().await;
+        let (final_ssh, final_server) = start_test_ssh_server().await;
+        let (jump_b, jump_b_server) = start_test_ssh_server().await;
+        let (jump_a, jump_a_server) = start_test_ssh_server().await;
+        let key_path = write_test_key("proxy-jump");
+        let config_path = env::temp_dir().join(format!(
+            "stk-proxy-jump-config-{}",
+            NEXT_TEST_KEY_ID.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        std::fs::write(
+            &config_path,
+            format!(
+                "Host target\n  HostName {}\n  Port {}\n  ProxyJump jump-a,jump-b\nHost jump-a\n  HostName {}\n  Port {}\nHost jump-b\n  HostName {}\n  Port {}\nHost *\n  User test\n  IdentityFile {}\n  IdentitiesOnly yes\n  StrictHostKeyChecking no\n",
+                final_ssh.ip(),
+                final_ssh.port(),
+                jump_a.ip(),
+                jump_a.port(),
+                jump_b.ip(),
+                jump_b.port(),
+                key_path.display()
+            ),
+        )
+        .unwrap();
+
+        let mut config = test_pool_config(final_ssh, &key_path, 2, 2, 8, Vec::new());
+        let upstream = &mut config.hosts[0];
+        upstream.host = None;
+        upstream.ssh_config_host = Some("target".to_string());
+        upstream.ssh_config_path = Some(config_path.to_string_lossy().into_owned());
+        upstream.port = None;
+        upstream.username = None;
+        upstream.auth = None;
+        upstream.host_key_policy = None;
+
+        let pool = SshPoolDialer::start(
+            "proxy-jump-test",
+            config,
+            ProbeConfig {
+                enabled: false,
+                ..ProbeConfig::default()
+            },
+        )
+        .unwrap();
+        wait_for_healthy_sessions(&pool.nodes[0], 2).await;
+
+        let mut stream = pool
+            .dial(DialContext {
+                host_name: "proxy-jump-test".to_string(),
+                target: TargetAddr::Socket(target),
+                connection_id: None,
+            })
+            .await
+            .unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        let mut reply = [0_u8; 4];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"ping");
+
+        drop(stream);
+        drop(pool);
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_file(key_path);
+        target_task.await.unwrap();
+        final_server.abort();
+        jump_b_server.abort();
+        jump_a_server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_forward_owner_handover_preserves_existing_channel() {
+        let (local_target, target_task) = start_persistent_echo_server(2).await;
+        let remote_listen = unused_local_address().await;
+        let ssh_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ssh_address = ssh_listener.local_addr().unwrap();
+        let server_key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let server_config = Arc::new(server::Config {
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            keys: vec![server_key],
+            ..Default::default()
+        });
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = ssh_listener.accept().await else {
+                    return;
+                };
+                let running = server::run_stream(
+                    Arc::clone(&server_config),
+                    socket,
+                    TestSshServer::default(),
+                )
+                .await
+                .unwrap();
+                tokio::spawn(async move {
+                    let _ = running.await;
+                });
+            }
+        });
+        let key_path = write_test_key("remote-owner");
+        let remote_forward = SshRemoteForwardConfig::Tcp {
+            name: "handover".to_string(),
+            listen: remote_listen,
+            local_host: local_target.ip().to_string(),
+            local_port: local_target.port(),
+        };
+        let pool = SshPoolDialer::start(
+            "remote-owner-test",
+            test_pool_config(ssh_address, &key_path, 2, 3, 8, vec![remote_forward]),
+            ProbeConfig {
+                enabled: false,
+                ..ProbeConfig::default()
+            },
+        )
+        .unwrap();
+        let node = Arc::clone(&pool.nodes[0]);
+        wait_for_healthy_sessions(&node, 2).await;
+        let original_owner = timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(owner) = *node.remote_owner.read().await {
+                    break owner;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("remote forward owner was not assigned");
+
+        let mut existing = TcpStream::connect(remote_listen).await.unwrap();
+        existing.write_all(b"old1").await.unwrap();
+        let mut reply = [0_u8; 4];
+        existing.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"old1");
+
+        let owner_session = node
+            .sessions
+            .read()
+            .await
+            .iter()
+            .find(|session| session.id == original_owner)
+            .cloned()
+            .unwrap();
+        owner_session
+            .retire_requested
+            .store(true, AtomicOrdering::Release);
+        owner_session.state.write().await.status = SshSessionStatus::Suspect;
+
+        let replacement_owner = timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(owner) = *node.remote_owner.read().await
+                    && owner != original_owner
+                {
+                    break owner;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("remote forward ownership did not move to a standby session");
+        assert_ne!(replacement_owner, original_owner);
+
+        existing.write_all(b"old2").await.unwrap();
+        existing.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"old2");
+
+        let mut new_connection = timeout(Duration::from_secs(3), async {
+            loop {
+                match TcpStream::connect(remote_listen).await {
+                    Ok(stream) => break stream,
+                    Err(_) => sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("replacement remote listener did not become available");
+        new_connection.write_all(b"new1").await.unwrap();
+        new_connection.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"new1");
+
+        drop(existing);
+        drop(new_connection);
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if !node
+                    .sessions
+                    .read()
+                    .await
+                    .iter()
+                    .any(|session| session.id == original_owner)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("drained remote forward owner was not retired");
+
+        drop(pool);
+        let _ = std::fs::remove_file(key_path);
+        target_task.await.unwrap();
+        server.abort();
+    }
+
+    fn write_test_key(prefix: &str) -> PathBuf {
+        let client_key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let key_path = env::temp_dir().join(format!(
+            "stk-{prefix}-{}",
+            NEXT_TEST_KEY_ID.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        let key_text = client_key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap();
+        std::fs::write(&key_path, key_text.as_bytes()).unwrap();
+        key_path
+    }
+
+    fn test_pool_config(
+        ssh_address: SocketAddr,
+        key_path: &Path,
+        min_sessions: usize,
+        max_sessions: usize,
+        max_channels: usize,
+        remote_forwards: Vec<SshRemoteForwardConfig>,
+    ) -> SshPoolConfig {
+        SshPoolConfig {
+            policy: crate::config::LoadBalancePolicy::RoundRobin,
+            keep_alive_secs: Some(5),
+            min_sessions_per_host: min_sessions,
+            max_sessions_per_host: max_sessions,
+            max_channels_per_session: max_channels,
+            server_alive_count_max: Some(2),
+            connect_timeout_secs: Some(1),
+            restart_initial_millis: 20,
+            restart_max_secs: 1,
+            session_spawn_cooldown_millis: 20,
+            session_drain_timeout_secs: 2,
+            hosts: vec![SshHostConfig {
+                name: "local-test".to_string(),
+                host: Some(ssh_address.ip().to_string()),
+                ssh_config_host: None,
+                port: Some(ssh_address.port()),
+                username: Some("test".to_string()),
+                auth: Some(SshAuthConfig::PrivateKey {
+                    path: key_path.to_string_lossy().into_owned(),
+                    passphrase_env: None,
+                }),
+                ssh_config_path: None,
+                host_key_policy: Some(SshHostKeyPolicy::InsecureAcceptAny),
+                known_hosts_path: None,
+                remote_forwards,
+            }],
+        }
+    }
+
+    async fn wait_for_healthy_sessions(node: &Arc<NativeSshNode>, expected: usize) {
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let sessions = node.sessions.read().await.clone();
+                let mut healthy = 0;
+                for session in sessions {
+                    if session.state.read().await.status == SshSessionStatus::Healthy
+                        && !session.retire_requested.load(AtomicOrdering::Relaxed)
+                    {
+                        healthy += 1;
+                    }
+                }
+                if healthy >= expected {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("SSH session pool did not reach the expected healthy size");
+    }
+
+    async fn start_persistent_echo_server(
+        expected_connections: usize,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            for _ in 0..expected_connections {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                connections.spawn(async move {
+                    let mut buffer = [0_u8; 64];
+                    loop {
+                        let read = stream.read(&mut buffer).await.unwrap();
+                        if read == 0 {
+                            break;
+                        }
+                        stream.write_all(&buffer[..read]).await.unwrap();
+                    }
+                });
+            }
+            while let Some(result) = connections.join_next().await {
+                result.unwrap();
+            }
+        });
+        (address, task)
+    }
+
+    async fn start_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4];
+            stream.read_exact(&mut buffer).await.unwrap();
+            stream.write_all(&buffer).await.unwrap();
+        });
+        (address, task)
+    }
+
+    async fn start_test_ssh_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
+        let server_config = Arc::new(server::Config {
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            keys: vec![server_key],
+            ..Default::default()
+        });
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let running = server::run_stream(
+                    Arc::clone(&server_config),
+                    socket,
+                    TestSshServer::default(),
+                )
+                .await
+                .unwrap();
+                tokio::spawn(async move {
+                    let _ = running.await;
+                });
+            }
+        });
+        (address, task)
+    }
+
+    async fn unused_local_address() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    #[derive(Clone, Default)]
+    struct TestSshServer {
+        remote_listeners: Arc<tokio::sync::Mutex<HashMap<(String, u32), tokio::task::AbortHandle>>>,
+    }
+
+    impl server::Handler for TestSshServer {
+        type Error = anyhow::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _user: &str,
+            _public_key: &russh::keys::ssh_key::PublicKey,
+        ) -> Result<server::Auth, Self::Error> {
+            Ok(server::Auth::Accept)
+        }
+
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            channel: Channel<server::Msg>,
+            host_to_connect: &str,
+            port_to_connect: u32,
+            _originator_address: &str,
+            _originator_port: u32,
+            reply: server::ChannelOpenHandle,
+            _session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            let host = host_to_connect.to_string();
+            tokio::spawn(async move {
+                let Ok(port) = u16::try_from(port_to_connect) else {
+                    reply.reject(ChannelOpenFailure::ConnectFailed).await;
+                    return;
+                };
+                match TcpStream::connect((host.as_str(), port)).await {
+                    Ok(mut target) => {
+                        reply.accept().await;
+                        let mut stream = channel.into_stream();
+                        let _ = copy_bidirectional(&mut stream, &mut target).await;
+                    }
+                    Err(_) => reply.reject(ChannelOpenFailure::ConnectFailed).await,
+                }
+            });
+            Ok(())
+        }
+
+        async fn tcpip_forward(
+            &mut self,
+            address: &str,
+            port: &mut u32,
+            session: &mut server::Session,
+        ) -> Result<bool, Self::Error> {
+            let Ok(requested_port) = u16::try_from(*port) else {
+                return Ok(false);
+            };
+            let listener = match TcpListener::bind((address, requested_port)).await {
+                Ok(listener) => listener,
+                Err(_) => return Ok(false),
+            };
+            let listen = listener.local_addr()?;
+            *port = u32::from(listen.port());
+            let listen_port = u32::from(listen.port());
+            let handle = session.handle();
+            let connected_address = address.to_string();
+            let listener_task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut remote_stream, originator)) = listener.accept().await else {
+                        return;
+                    };
+                    let connection_handle = handle.clone();
+                    let connection_address = connected_address.clone();
+                    tokio::spawn(async move {
+                        let Ok(channel) = connection_handle
+                            .channel_open_forwarded_tcpip(
+                                connection_address,
+                                listen_port,
+                                originator.ip().to_string(),
+                                u32::from(originator.port()),
+                            )
+                            .await
+                        else {
+                            return;
+                        };
+                        let mut ssh_stream = channel.into_stream();
+                        let _ = copy_bidirectional(&mut remote_stream, &mut ssh_stream).await;
+                    });
+                }
+            });
+            self.remote_listeners.lock().await.insert(
+                (address.to_string(), listen_port),
+                listener_task.abort_handle(),
+            );
+            Ok(true)
+        }
+
+        async fn cancel_tcpip_forward(
+            &mut self,
+            address: &str,
+            port: u32,
+            _session: &mut server::Session,
+        ) -> Result<bool, Self::Error> {
+            let Some(listener) = self
+                .remote_listeners
+                .lock()
+                .await
+                .remove(&(address.to_string(), port))
+            else {
+                return Ok(false);
+            };
+            listener.abort();
+            Ok(true)
+        }
+    }
+
+    fn sample_upstream() -> SshHostConfig {
+        SshHostConfig {
+            name: "jump-a".to_string(),
+            host: Some("ssh.example.com".to_string()),
+            ssh_config_host: None,
+            port: Some(22),
+            username: Some("alice".to_string()),
+            auth: Some(SshAuthConfig::Agent),
+            ssh_config_path: None,
+            host_key_policy: Some(SshHostKeyPolicy::KnownHosts),
+            known_hosts_path: None,
+            remote_forwards: vec![
+                SshRemoteForwardConfig::Tcp {
+                    name: "local-web".to_string(),
+                    listen: "127.0.0.1:18080".parse().unwrap(),
+                    local_host: "127.0.0.1".to_string(),
+                    local_port: 8080,
+                },
+                SshRemoteForwardConfig::Dynamic {
+                    name: "remote-socks".to_string(),
+                    listen: "127.0.0.1:1080".parse().unwrap(),
+                    protocol: crate::config::ProxyProtocol::Socks5h,
+                },
+            ],
+        }
+    }
+}

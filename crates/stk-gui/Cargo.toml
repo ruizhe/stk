@@ -1,0 +1,58 @@
+[package]
+name = "stk-gui"
+description = "Desktop application for SSH Tunnel Keeper"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+version = "0.1.0"
+
+[features]
+default = []
+desktop = ["dep:dioxus", "dep:image"]
+
+[dependencies]
+anyhow = "1.0.103"
+clap = { version = "4.6.1", features = ["derive", "env"] }
+dioxus = { version = "0.7.0", features = ["desktop"], optional = true }
+image = { version = "0.25.10", default-features = false, features = ["png"], optional = true }
+lucide-dioxus = { version = "3.26.0", features = ["arrows", "connectivity", "development", "files", "multimedia", "navigation", "notifications", "text", "time"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_yaml = "0.9.34"
+tempfile = "3.23.0"
+time = { version = "0.3.53", features = ["formatting", "local-offset", "macros"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+stk-core = { path = "../stk-core" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = {
+  version = "0.3.2",
+  default-features = false,
+  features = [
+    "NSApplication",
+    "NSAttributedString",
+    "NSButton",
+    "NSControl",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSParagraphStyle",
+    "NSResponder",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView"
+  ]
+}
+objc2-foundation = {
+  version = "0.3.2",
+  default-features = false,
+  features = ["std", "NSAttributedString", "NSRange", "NSString", "NSValue"]
+}
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.23"
+
+[[bin]]
+name = "stk-gui"
+path = "src/main.rs"
+required-features = ["desktop"]

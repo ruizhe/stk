@@ -1,0 +1,13 @@
+{
+  "hosts": {
+    "main": {
+      "ssh-config-host": "localhost",
+      "local-proxies": [
+        {
+          "listen": "127.0.0.1:17890",
+          "mixed": true
+        }
+      ]
+    }
+  }
+}

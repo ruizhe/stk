@@ -1,0 +1,14 @@
+[Unit]
+Description=SSH Tunnel Keeper
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/stk serve --config /etc/stk/config.yaml
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

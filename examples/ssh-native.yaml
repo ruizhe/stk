@@ -1,0 +1,42 @@
+control:
+  endpoint: tcp:127.0.0.1:19090
+
+override-default:
+  min-sessions: 1
+  max-sessions: 3
+  keep-alive-secs: 15
+  server-alive-count-max: 3
+  connect-timeout-secs: 10
+  probe:
+    interval-secs: 5
+    timeout-millis: 1000
+    fail-threshold: 2
+    recovery-threshold: 1
+  proxy:
+    mixed: true
+
+hosts:
+  production:
+    ssh-config-host: jump-a
+    inherit-ssh-config-forwards: false
+    host: ssh.example.com
+    port: 22
+    username: alice
+    auth:
+      method: agent
+    host-key-policy: known-hosts
+    min-sessions: 2
+    local-proxies:
+      - name: mixed-ssh
+        listen: 127.0.0.1:17892
+    local-forwards:
+      - name: database
+        listen: 127.0.0.1:15432
+        target: database.internal:5432
+    remote-proxies:
+      - name: remote-mixed
+        listen: 127.0.0.1:1080
+    remote-forwards:
+      - name: local-web
+        listen: 127.0.0.1:18080
+        target: localhost:8080
