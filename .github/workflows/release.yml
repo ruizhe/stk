@@ -131,6 +131,7 @@ jobs:
             librsvg2-dev \
             libxdo-dev \
             desktop-file-utils \
+            file \
             patchelf \
             pkg-config
 

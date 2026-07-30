@@ -128,7 +128,7 @@ Build outputs:
 On Linux, package the release binaries as an AppImage with:
 
 ```bash
-sudo apt-get install -y desktop-file-utils patchelf pkg-config
+sudo apt-get install -y desktop-file-utils file patchelf pkg-config
 ./scripts/build-linux-appimage.sh
 ```
 

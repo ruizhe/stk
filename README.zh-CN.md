@@ -129,7 +129,7 @@ cargo build --manifest-path crates/stk-gui/Cargo.toml \
 在 Linux 上可以用下面的命令把 release 二进制打包为 AppImage：
 
 ```bash
-sudo apt-get install -y desktop-file-utils patchelf pkg-config
+sudo apt-get install -y desktop-file-utils file patchelf pkg-config
 ./scripts/build-linux-appimage.sh
 ```
 

@@ -29,6 +29,10 @@ command -v curl >/dev/null 2>&1 || {
     echo "curl is required to download AppImage packaging tools" >&2
     exit 1
 }
+command -v file >/dev/null 2>&1 || {
+    echo "file is required by appimagetool" >&2
+    exit 1
+}
 command -v pkg-config >/dev/null 2>&1 || {
     echo "pkg-config is required by the linuxdeploy GTK plugin" >&2
     exit 1
