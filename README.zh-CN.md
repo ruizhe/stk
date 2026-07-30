@@ -69,31 +69,40 @@ Release 提供自包含的 GUI 软件包和独立的 CLI 归档：
 
 | 平台 | 归档 | 内容 |
 | --- | --- | --- |
-| Linux x86_64 GUI | `ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage` | 包含 GTK/WebKitGTK 运行库的便携 GUI |
-| Linux x86_64 CLI | `ssh-tunnel-keeper-vX.Y.Z-linux-x86_64-cli.tar.gz` | `stk`、systemd unit、样例配置 |
+| Linux x86_64 GUI | `SSH-Tunnel-Keeper-linux-x86_64.AppImage` | 包含 GTK/WebKitGTK 运行库的便携 GUI |
+| Linux x86_64 CLI | `stk-linux-x86_64-musl.tar.gz` | 静态链接的 musl `stk`、systemd unit、样例配置 |
+| Linux aarch64 CLI | `stk-linux-aarch64-musl.tar.gz` | 静态链接的 musl `stk`、systemd unit、样例配置 |
 | Windows x86_64 | `ssh-tunnel-keeper-vX.Y.Z-windows-x86_64.zip` | `stk.exe`、`stk-gui.exe`、样例配置 |
 | macOS universal GUI | `ssh-tunnel-keeper-vX.Y.Z-macos-universal.dmg` | 可安装的 `SSH Tunnel Keeper.app` 镜像 |
 | macOS universal CLI + GUI | `ssh-tunnel-keeper-vX.Y.Z-macos-universal.zip` | `stk`、`SSH Tunnel Keeper.app`、样例配置 |
 
-每个发布包都有对应的 `.sha256` 文件。下载后可以验证：
+每个 Release 都包含一个覆盖全部上传产物的 `SHA256SUMS` 文件。下载所需产物和 `SHA256SUMS` 后，可以验证本地已有的文件：
 
 ```bash
-shasum -a 256 -c ssh-tunnel-keeper-vX.Y.Z-macos-universal.zip.sha256
-shasum -a 256 -c ssh-tunnel-keeper-vX.Y.Z-macos-universal.dmg.sha256
-sha256sum -c ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage.sha256
-sha256sum -c ssh-tunnel-keeper-vX.Y.Z-linux-x86_64-cli.tar.gz.sha256
+sha256sum --ignore-missing --check SHA256SUMS
 ```
 
 当前自动发布的 macOS 应用使用 ad-hoc 签名，尚未使用 Apple Developer ID 公证，因此首次运行可能出现 Gatekeeper 提示。正式分发前应在 Release workflow 中接入 Developer ID 签名和 notarization。
 
-Linux AppImage 会捆绑 GUI 使用的 GTK 和 WebKitGTK 运行库。下载后执行：
+两个 Linux CLI 归档中的 `stk` 都是没有动态库依赖的 musl 静态可执行文件，不依赖宿主机的 glibc 版本：
 
 ```bash
-chmod +x ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage
-./ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage
+tar -xzf stk-linux-x86_64-musl.tar.gz
+./stk-linux-x86_64-musl/stk --help
 ```
 
-AppImage 使用静态链接的 runtime，因此宿主机不需要提供 `libfuse.so.2`。直接挂载仍需要可用的 `/dev/fuse` 设备以及 `fusermount` 或 `fusermount3` 辅助程序；在容器或其他不能使用 FUSE 挂载的受限环境中，可以用 `APPIMAGE_EXTRACT_AND_RUN=1 ./ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage` 启动同一个文件。
+Linux GUI AppImage 会捆绑应用使用的 GTK 和 WebKitGTK 运行库，但 GUI 本身并不是完全静态链接的可执行文件。下载后执行：
+
+```bash
+chmod +x SSH-Tunnel-Keeper-linux-x86_64.AppImage
+./SSH-Tunnel-Keeper-linux-x86_64.AppImage
+```
+
+AppImage 使用静态链接的 type-2 runtime，因此宿主机不需要提供 `libfuse.so.2`。直接挂载仍需要可用的 `/dev/fuse` 设备以及 `fusermount` 或 `fusermount3` 辅助程序；在容器或其他不能使用 FUSE 挂载的受限环境中，使用提取运行模式：
+
+```bash
+APPIMAGE_EXTRACT_AND_RUN=1 ./SSH-Tunnel-Keeper-linux-x86_64.AppImage
+```
 
 从源码构建裸 Linux GUI 可执行文件时仍然需要安装开发包：
 
@@ -538,8 +547,8 @@ cargo test --manifest-path crates/stk-gui/Cargo.toml \
 
 ## CI 与发布
 
-- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) 在 push 和 pull request 上执行格式、Clippy、测试、Linux/macOS/Windows release build、Linux AppImage 运行检查，以及 macOS DMG 打包检查。
-- [`.github/workflows/release.yml`](.github/workflows/release.yml) 在推送 `v*` tag 时构建 Linux AppImage、各平台 CLI 归档和 universal macOS DMG、生成 SHA-256，并创建 GitHub Release。
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) 在 push 和 pull request 上执行格式、Clippy、测试、各平台 release build、x86_64/aarch64 musl 静态 CLI 检查、Ubuntu 22.04/24.04 与 Arch Linux AppImage 提取运行检查，以及 macOS DMG 打包检查。
+- [`.github/workflows/release.yml`](.github/workflows/release.yml) 在推送 `v*` tag 时发布两个 Linux musl 静态 CLI 归档、Linux x86_64 AppImage、Windows 与 universal macOS 产物、统一的 `SHA256SUMS`，并创建 GitHub Release。
 - [`.github/release.yml`](.github/release.yml) 定义 GitHub 自动生成发布说明的分类。
 
 发布版本前同步更新：

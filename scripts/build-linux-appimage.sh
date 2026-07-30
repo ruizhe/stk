@@ -3,7 +3,7 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 GUI_BINARY=${1:-"$ROOT/crates/stk-gui/target/release/stk-gui"}
-OUTPUT=${2:-"$ROOT/dist/ssh-tunnel-keeper-linux-x86_64.AppImage"}
+OUTPUT=${2:-"$ROOT/dist/SSH-Tunnel-Keeper-linux-x86_64.AppImage"}
 
 if [ "$(uname -s)" != "Linux" ]; then
     echo "AppImage packaging must run on Linux" >&2

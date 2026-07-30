@@ -69,31 +69,40 @@ Release assets include self-contained GUI packages and separate CLI archives:
 
 | Platform | Archive | Contents |
 | --- | --- | --- |
-| Linux x86_64 GUI | `ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage` | Portable GUI with GTK/WebKitGTK runtime libraries |
-| Linux x86_64 CLI | `ssh-tunnel-keeper-vX.Y.Z-linux-x86_64-cli.tar.gz` | `stk`, systemd unit, and examples |
+| Linux x86_64 GUI | `SSH-Tunnel-Keeper-linux-x86_64.AppImage` | Portable GUI with GTK/WebKitGTK runtime libraries |
+| Linux x86_64 CLI | `stk-linux-x86_64-musl.tar.gz` | Statically linked musl `stk`, systemd unit, and examples |
+| Linux aarch64 CLI | `stk-linux-aarch64-musl.tar.gz` | Statically linked musl `stk`, systemd unit, and examples |
 | Windows x86_64 | `ssh-tunnel-keeper-vX.Y.Z-windows-x86_64.zip` | `stk.exe`, `stk-gui.exe`, and examples |
 | macOS universal GUI | `ssh-tunnel-keeper-vX.Y.Z-macos-universal.dmg` | Installable `SSH Tunnel Keeper.app` image |
 | macOS universal CLI + GUI | `ssh-tunnel-keeper-vX.Y.Z-macos-universal.zip` | `stk`, `SSH Tunnel Keeper.app`, and examples |
 
-Every release package has a matching `.sha256` file:
+Every release includes one `SHA256SUMS` file covering all uploaded packages. After downloading the packages you need and `SHA256SUMS`, verify the available files with:
 
 ```bash
-shasum -a 256 -c ssh-tunnel-keeper-vX.Y.Z-macos-universal.zip.sha256
-shasum -a 256 -c ssh-tunnel-keeper-vX.Y.Z-macos-universal.dmg.sha256
-sha256sum -c ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage.sha256
-sha256sum -c ssh-tunnel-keeper-vX.Y.Z-linux-x86_64-cli.tar.gz.sha256
+sha256sum --ignore-missing --check SHA256SUMS
 ```
 
 The automated macOS release currently uses ad-hoc signing rather than Apple Developer ID signing and notarization. Gatekeeper may therefore display a warning on first launch. Developer ID signing and notarization should be added to the Release workflow before broad public distribution.
 
-The Linux AppImage bundles the GTK and WebKitGTK runtime libraries used by the GUI. After downloading it:
+The two Linux CLI archives contain musl executables with no shared-library dependencies. They can run independently of the host's glibc version:
 
 ```bash
-chmod +x ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage
-./ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage
+tar -xzf stk-linux-x86_64-musl.tar.gz
+./stk-linux-x86_64-musl/stk --help
 ```
 
-The AppImage uses a statically linked runtime, so the host does not need to provide `libfuse.so.2`. Direct mounting still requires a usable `/dev/fuse` device and a `fusermount` or `fusermount3` helper. In containers or other restricted environments where FUSE mounting is unavailable, start the same package with `APPIMAGE_EXTRACT_AND_RUN=1 ./ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage`.
+The Linux GUI AppImage bundles the GTK and WebKitGTK runtime libraries used by the application. The GUI payload is not a completely statically linked executable. After downloading it:
+
+```bash
+chmod +x SSH-Tunnel-Keeper-linux-x86_64.AppImage
+./SSH-Tunnel-Keeper-linux-x86_64.AppImage
+```
+
+The AppImage uses a statically linked type-2 runtime, so the host does not need to provide `libfuse.so.2`. Direct mounting still requires a usable `/dev/fuse` device and a `fusermount` or `fusermount3` helper. In containers or other restricted environments where FUSE mounting is unavailable, use extraction mode:
+
+```bash
+APPIMAGE_EXTRACT_AND_RUN=1 ./SSH-Tunnel-Keeper-linux-x86_64.AppImage
+```
 
 Building the raw Linux GUI executable from source still requires the development packages:
 
@@ -537,8 +546,8 @@ Regenerate all platform icon resources after changing the SVG sources:
 
 ## CI and Releases
 
-- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs formatting, Clippy, tests, Linux/macOS/Windows release builds, a Linux AppImage execution check, and a macOS DMG packaging check on pushes and pull requests.
-- [`.github/workflows/release.yml`](.github/workflows/release.yml) builds the Linux AppImage, platform CLI archives, and universal macOS DMG, generates SHA-256 files, and creates a GitHub Release for a pushed `v*` tag.
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs formatting, Clippy, tests, platform release builds, static musl CLI checks for x86_64 and aarch64, AppImage extraction tests on Ubuntu 22.04/24.04 and Arch Linux, and macOS DMG packaging checks.
+- [`.github/workflows/release.yml`](.github/workflows/release.yml) publishes both static Linux CLI archives, the Linux x86_64 AppImage, Windows and universal macOS packages, a consolidated `SHA256SUMS`, and the GitHub Release for a pushed `v*` tag.
 - [`.github/release.yml`](.github/release.yml) configures categories for GitHub-generated release notes.
 
 Before publishing a version, update:

@@ -80,6 +80,85 @@ jobs:
           --features desktop
           --locked
 
+  linux-cli-musl:
+    name: Static Linux CLI on ${{ matrix.arch }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            runner: native
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            runner: qemu-aarch64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install static binary verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y file qemu-user
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+          cache-key: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+          fallback: none
+
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-musl-${{ matrix.target }}
+
+      - name: Build static CLI
+        run: >-
+          cargo zigbuild
+          --release
+          -p stk-cli
+          --target ${{ matrix.target }}
+          --locked
+
+      - name: Verify static CLI
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          RUNNER: ${{ matrix.runner }}
+        run: |
+          set -euo pipefail
+          binary="target/${TARGET}/release/stk"
+          description="$(file "$binary")"
+          echo "$description"
+          if [[ ! "$description" =~ (statically\ linked|static-pie\ linked) ]]; then
+            echo "Expected a statically linked musl executable" >&2
+            exit 1
+          fi
+          if readelf -d "$binary" 2>/dev/null | grep -q '(NEEDED)'; then
+            echo "Static CLI unexpectedly contains a shared-library dependency" >&2
+            exit 1
+          fi
+          if [[ "$RUNNER" == native ]]; then
+            "$binary" --help >/dev/null
+          else
+            "$RUNNER" "$binary" --help >/dev/null
+          fi
+
   platform-build:
     name: Release build on ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
@@ -151,20 +230,40 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          appimage="dist/ssh-tunnel-keeper-ci-linux-x86_64.AppImage"
+          appimage="dist/SSH-Tunnel-Keeper-linux-x86_64.AppImage"
           ./scripts/build-linux-appimage.sh \
             crates/stk-gui/target/release/stk-gui \
             "$appimage"
-          "$appimage" --appimage-offset >/dev/null
+
+          runtime="target/appimage-tools/runtime-x86_64-20251108"
+          expected_runtime_sha256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
+          test "$(sha256sum "$runtime" | awk '{print $1}')" = "$expected_runtime_sha256"
+          test "$("$appimage" --appimage-offset)" = "$(stat -c %s "$runtime")"
+          sha256sum "$appimage" > "$appimage.sha256"
+          sha256sum --check "$appimage.sha256"
+
           APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --help >/dev/null
+
+          for ubuntu in 22.04 24.04; do
+            docker run --rm \
+              -e APPIMAGE_EXTRACT_AND_RUN=1 \
+              -v "$PWD/$appimage:/opt/stk.AppImage:ro" \
+              "ubuntu:$ubuntu" \
+              sh -eu -c '
+                apt-get update >/dev/null
+                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                  libegl1 libgl1 libx11-6 libx11-xcb1 libxcb1 >/dev/null
+                /opt/stk.AppImage --help >/dev/null
+              '
+          done
+
           docker run --rm \
+            -e APPIMAGE_EXTRACT_AND_RUN=1 \
             -v "$PWD/$appimage:/opt/stk.AppImage:ro" \
-            -w /tmp \
             archlinux:base \
             sh -eu -c '
-              /opt/stk.AppImage --appimage-offset >/dev/null
-              /opt/stk.AppImage --appimage-extract AppRun >/dev/null
-              test -x squashfs-root/AppRun
+              pacman -Sy --noconfirm --needed libglvnd libx11 libxcb >/dev/null
+              /opt/stk.AppImage --help >/dev/null
             '
 
       - name: Verify macOS application and DMG packaging
