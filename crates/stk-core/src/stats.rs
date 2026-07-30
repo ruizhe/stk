@@ -967,6 +967,7 @@ impl RuntimeStats {
 static RUNTIME_STATS: LazyLock<RuntimeStats> = LazyLock::new(RuntimeStats::new);
 static RUNTIME_DETAILS: LazyLock<StdMutex<RuntimeDetails>> =
     LazyLock::new(|| StdMutex::new(RuntimeDetails::default()));
+static ACTIVE_RUNTIME_GUARDS: LazyLock<StdMutex<usize>> = LazyLock::new(|| StdMutex::new(0));
 static TRAFFIC_HISTORY: LazyLock<StdMutex<TrafficHistory>> =
     LazyLock::new(|| StdMutex::new(TrafficHistory::default()));
 static RUNTIME_STATUS_CHANGES: LazyLock<watch::Sender<u64>> = LazyLock::new(|| watch::channel(0).0);
@@ -1234,17 +1235,26 @@ impl RuntimeGuard {
         configured_local_listeners: usize,
         configured_remote_listeners: usize,
     ) -> Self {
+        let mut active_guards = ACTIVE_RUNTIME_GUARDS
+            .lock()
+            .expect("runtime guard lock poisoned");
+        let first_guard = *active_guards == 0;
+        *active_guards = (*active_guards)
+            .checked_add(1)
+            .expect("runtime guard count overflow");
         let _ = RUNTIME_STATS.config_generation.compare_exchange(
             0,
             1,
             Ordering::Relaxed,
             Ordering::Relaxed,
         );
-        RUNTIME_STATS.running.store(true, Ordering::Relaxed);
-        *RUNTIME_STATS
-            .started_at
-            .lock()
-            .expect("runtime stats lock poisoned") = Some(Instant::now());
+        if first_guard {
+            RUNTIME_STATS.running.store(true, Ordering::Relaxed);
+            *RUNTIME_STATS
+                .started_at
+                .lock()
+                .expect("runtime stats lock poisoned") = Some(Instant::now());
+        }
         RUNTIME_STATS.configured_hosts.store(
             u64::try_from(configured_hosts).unwrap_or(u64::MAX),
             Ordering::Relaxed,
@@ -1260,6 +1270,7 @@ impl RuntimeGuard {
         *RUNTIME_DETAILS
             .lock()
             .expect("runtime details lock poisoned") = RuntimeDetails::default();
+        drop(active_guards);
         Self
     }
 
@@ -1286,6 +1297,15 @@ impl RuntimeGuard {
 
 impl Drop for RuntimeGuard {
     fn drop(&mut self) {
+        let mut active_guards = ACTIVE_RUNTIME_GUARDS
+            .lock()
+            .expect("runtime guard lock poisoned");
+        *active_guards = (*active_guards)
+            .checked_sub(1)
+            .expect("runtime guard count underflow");
+        if *active_guards != 0 {
+            return;
+        }
         RUNTIME_STATS.running.store(false, Ordering::Relaxed);
         *RUNTIME_STATS
             .started_at
