@@ -50,7 +50,8 @@ STK 专注于 SSH，不提供 VMess、VLESS、Trojan 或 Clash 配置兼容层�
 ```mermaid
 flowchart LR
     GUI[SSH Tunnel Keeper GUI] --> CORE[stk-core runtime]
-    CLI[stk run / serve] --> CORE
+    CLI[stk serve] --> CORE
+    ENV[stk env command] --> LP
     CTL[stk status / top / reload] --> API[Control endpoint]
     API --> CORE
     CORE --> POOL[SSH session pool]
@@ -59,7 +60,7 @@ flowchart LR
     SSHD --> RP[Remote proxies / forwards]
 ```
 
-GUI 与 CLI 不存在启动依赖。GUI 会先尝试附着到配置对应的 control endpoint，endpoint 不存在时才在自己的进程内启动 runtime；`stk run` 和 `stk serve` 会直接启动 runtime。相同 endpoint 的独占绑定可以防止同一份配置重复启动 listener。
+GUI 与 CLI 不存在启动依赖。GUI 会先尝试附着到配置对应的 control endpoint，endpoint 不存在时才在自己的进程内启动 runtime；`stk serve` 会直接启动 runtime。相同 endpoint 的独占绑定可以防止同一份配置重复启动 listener。
 
 ## 安装
 
@@ -204,13 +205,13 @@ hosts:
 
 ```bash
 stk check
-stk run
+stk serve
 ```
 
 也可以启动 GUI，GUI 不要求先运行 daemon。需要交给 systemd、launchd 或 Windows Service Manager 托管时使用：
 
 ```bash
-stk serve --config /etc/stk/config.yaml
+stk serve --system --config /etc/stk/config.yaml
 ```
 
 `serve` 不会自行 fork；进程生命周期、日志和重启应交给服务管理器。Linux systemd 样例位于 [`packaging/systemd/stk.service`](packaging/systemd/stk.service)。
@@ -223,6 +224,39 @@ curl --proxy http://127.0.0.1:17890 https://api.ipify.org
 ```
 
 `--socks5-hostname` 会让目标域名经 SSH 远端解析，避免本地 DNS 泄漏。
+
+### 让命令使用配置中的代理
+
+`stk env` 会选择一个已启用的本地代理，注入对应的代理环境变量，然后直接执行命令，不经过 shell：
+
+```bash
+stk env curl https://api.ipify.org
+stk env -p production curl https://api.ipify.org
+stk env -p production/mixed-ssh@socks5h curl https://api.ipify.org
+stk env -p production -s http curl https://api.ipify.org
+```
+
+可以在配置中定义简短且可复用的 profile：
+
+```yaml
+env:
+  default: production
+  profiles:
+    production:
+      host: production
+      tunnel: mixed-ssh
+      scheme: socks5h
+```
+
+不提供子命令时，`stk env` 会打印计算出的环境变量。增加 `--live` 后还会查询 control endpoint，只有所选 tunnel 当前处于 listening 状态才会继续。默认会选择第一个启用的 host 和 local proxy，也包括从 OpenSSH `DynamicForward` 继承的代理。mixed listener 默认使用 `socks5h`，可以通过 `-s http` 或 `-s socks5` 覆盖。
+
+选择优先级为：
+
+```text
+自动选择 < env.default < STK_PROXY_PROFILE < -p/--proxy < --host/--tunnel/--scheme
+```
+
+SOCKS 模式会设置 `ALL_PROXY` 和 `all_proxy`；HTTP 模式会同时设置大小写形式的 `HTTP_PROXY` 和 `HTTPS_PROXY`。已有的 `NO_PROXY` 和 `no_proxy` 会保留。
 
 ## 四类转发
 
@@ -282,8 +316,8 @@ stk print-default-config --format toml
 
 | 入口 | Unix | Windows |
 | --- | --- | --- |
-| GUI、`stk run`、`stk check` | `~/.config/stk` | `%USERPROFILE%/.config/stk` |
-| `stk serve` | `/etc/stk` | `%PROGRAMDATA%/stk` |
+| GUI、`stk serve`、`stk env`、`stk check` | `~/.config/stk` | `%USERPROFILE%/.config/stk` |
+| `stk serve --system` 和带 `--system` 的控制命令 | `/etc/stk` | `%PROGRAMDATA%/stk` |
 
 目录中依次查找 `config.yaml`、`config.yml`、`config.json` 和 `config.toml`。所有相关命令都可以通过 `--config` 指定文件或已有目录。
 
@@ -343,7 +377,7 @@ hosts:
 
 ### 动态加载
 
-GUI、`stk run` 和 `stk serve` 使用原生文件系统通知监听配置：Linux 使用 inotify，macOS 使用 FSEvents，Windows 使用 `ReadDirectoryChangesW`。连续事件会经过约 300 ms 合并，再以新 generation 应用。
+GUI 和 `stk serve` 使用原生文件系统通知监听配置：Linux 使用 inotify，macOS 使用 FSEvents，Windows 使用 `ReadDirectoryChangesW`。连续事件会经过约 300 ms 合并，再以新 generation 应用。
 
 - 新配置解析或启动失败时继续使用上一份有效 generation。
 - listener 会短暂释放并重新绑定，新连接在切换期间可能失败。
@@ -408,8 +442,8 @@ sudo systemctl reload sshd
 不带参数运行 `stk` 会显示帮助：
 
 ```text
-stk serve                 # 由服务管理器托管的长期 runtime
-stk run                   # 前台运行用户 runtime
+stk serve                 # 前台用户 runtime；系统服务增加 --system
+stk env [选项] 命令       # 为命令注入代理环境变量
 stk check                 # 校验配置
 stk status                # 输出当前分层状态
 stk top                   # 持续显示服务端推送状态

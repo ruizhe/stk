@@ -1,6 +1,14 @@
 [control]
 endpoint = "tcp:127.0.0.1:19090"
 
+[env]
+default = "production"
+
+[env.profiles.production]
+host = "production"
+tunnel = "mixed-ssh"
+scheme = "socks5h"
+
 [override-default]
 min-sessions = 1
 max-sessions = 3

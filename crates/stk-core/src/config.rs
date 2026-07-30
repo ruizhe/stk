@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use hyper::http::uri::Authority;
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
@@ -39,6 +40,8 @@ pub enum ConfigError {
     InvalidHostConfig { host: String, reason: String },
     #[error("invalid control endpoint: {0}")]
     InvalidControlEndpoint(String),
+    #[error("invalid proxy environment configuration: {0}")]
+    InvalidEnvConfig(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +82,8 @@ impl fmt::Display for ConfigFormat {
 pub struct AppConfig {
     #[serde(default, skip_serializing_if = "ControlConfig::is_empty")]
     pub control: ControlConfig,
+    #[serde(default, skip_serializing_if = "EnvConfig::is_empty")]
+    pub env: EnvConfig,
     #[serde(default, skip_serializing_if = "OverrideDefaultConfig::is_empty")]
     pub override_default: OverrideDefaultConfig,
     #[serde(default = "default_hosts", deserialize_with = "deserialize_hosts")]
@@ -177,6 +182,7 @@ impl AppConfig {
                 .parse::<crate::control::ControlEndpoint>()
                 .map_err(|error| ConfigError::InvalidControlEndpoint(error.to_string()))?;
         }
+        self.env.validate()?;
         if self.hosts.is_empty() {
             return Err(ConfigError::EmptyHosts);
         }
@@ -197,12 +203,38 @@ impl AppConfig {
         }
         Ok(())
     }
+
+    pub fn resolved_local_proxies(&self) -> anyhow::Result<Vec<LocalProxyCandidate>> {
+        let mut candidates = Vec::new();
+        for (host_name, host) in &self.hosts {
+            let mut host = host.resolve(&self.override_default);
+            if !host.auto {
+                continue;
+            }
+            crate::ssh_config::inherit_ssh_config_forwards(&mut host).with_context(|| {
+                format!("failed to inherit SSH config forwards for host {host_name}")
+            })?;
+            candidates.extend(
+                host.local_proxies
+                    .iter()
+                    .filter(|proxy| proxy.auto)
+                    .map(|proxy| LocalProxyCandidate {
+                        host: host_name.clone(),
+                        tunnel: proxy.runtime_name("local-proxy"),
+                        listen: proxy.listen,
+                        protocol: proxy.resolved_protocol(),
+                    }),
+            );
+        }
+        Ok(candidates)
+    }
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             control: ControlConfig::default(),
+            env: EnvConfig::default(),
             override_default: OverrideDefaultConfig::default(),
             hosts: default_hosts(),
         }
@@ -220,6 +252,83 @@ impl ControlConfig {
     fn is_empty(&self) -> bool {
         self == &Self::default()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct EnvConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, EnvProfileConfig>,
+}
+
+impl EnvConfig {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(default) = &self.default {
+            if default.trim().is_empty() {
+                return Err(ConfigError::InvalidEnvConfig(
+                    "default profile name must not be empty".to_string(),
+                ));
+            }
+            if !self.profiles.contains_key(default) {
+                return Err(ConfigError::InvalidEnvConfig(format!(
+                    "default profile {default} is not defined"
+                )));
+            }
+        }
+        for (name, profile) in &self.profiles {
+            if name.trim().is_empty() {
+                return Err(ConfigError::InvalidEnvConfig(
+                    "profile name must not be empty".to_string(),
+                ));
+            }
+            for (field, value) in [
+                ("host", profile.host.as_deref()),
+                ("tunnel", profile.tunnel.as_deref()),
+            ] {
+                if value.is_some_and(|value| value.trim().is_empty()) {
+                    return Err(ConfigError::InvalidEnvConfig(format!(
+                        "profile {name} has an empty {field}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct EnvProfileConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<ProxyEnvScheme>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxyEnvScheme {
+    #[default]
+    Auto,
+    Socks5h,
+    Socks5,
+    Http,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalProxyCandidate {
+    pub host: String,
+    pub tunnel: String,
+    pub listen: SocketAddr,
+    pub protocol: ProxyProtocol,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1255,6 +1364,66 @@ mod tests {
             let parsed = AppConfig::from_str(&serialized, format).unwrap();
             assert_eq!(parsed, expected);
         }
+    }
+
+    #[test]
+    fn env_profiles_round_trip_all_formats() {
+        let mut expected = AppConfig::default();
+        expected.env.default = Some("corp".to_string());
+        expected.env.profiles.insert(
+            "corp".to_string(),
+            EnvProfileConfig {
+                host: Some("default".to_string()),
+                tunnel: Some("local-proxy-127.0.0.1:7890".to_string()),
+                scheme: Some(ProxyEnvScheme::Socks5h),
+            },
+        );
+        expected.validate().unwrap();
+
+        for format in [ConfigFormat::Yaml, ConfigFormat::Json, ConfigFormat::Toml] {
+            let serialized = expected.to_string(format).unwrap();
+            let parsed = AppConfig::from_str(&serialized, format).unwrap();
+            assert_eq!(parsed, expected);
+        }
+    }
+
+    #[test]
+    fn env_default_must_name_a_defined_profile() {
+        let mut config = AppConfig::default();
+        config.env.default = Some("missing".to_string());
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidEnvConfig(_)
+        ));
+    }
+
+    #[test]
+    fn resolved_local_proxies_include_ssh_dynamic_forwards() {
+        let directory =
+            std::env::temp_dir().join(format!("stk-config-env-forwards-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let ssh_config = directory.join("config");
+        fs::write(
+            &ssh_config,
+            "Host target\n  DynamicForward 127.0.0.1:19080\n",
+        )
+        .unwrap();
+
+        let mut config = AppConfig::default();
+        let host = default_host_mut(&mut config);
+        host.ssh_config_host = Some("target".to_string());
+        host.ssh_config_path = Some(ssh_config.to_string_lossy().into_owned());
+        host.local_proxies[0].auto = Some(false);
+
+        let candidates = config.resolved_local_proxies().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].host, "default");
+        assert_eq!(candidates[0].tunnel, "ssh-config-dynamic-19080");
+        assert_eq!(candidates[0].listen.port(), 19080);
+        assert_eq!(candidates[0].protocol, ProxyProtocol::Mixed);
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

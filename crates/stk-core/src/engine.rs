@@ -125,6 +125,7 @@ impl Engine {
         let reload_handle = self.reload_handle;
         let AppConfig {
             control,
+            env: _,
             override_default,
             hosts,
         } = self.config;

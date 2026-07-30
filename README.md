@@ -50,7 +50,8 @@ STK is focused exclusively on SSH. It does not implement VMess, VLESS, Trojan, o
 ```mermaid
 flowchart LR
     GUI[SSH Tunnel Keeper GUI] --> CORE[stk-core runtime]
-    CLI[stk run / serve] --> CORE
+    CLI[stk serve] --> CORE
+    ENV[stk env command] --> LP
     CTL[stk status / top / reload] --> API[Control endpoint]
     API --> CORE
     CORE --> POOL[SSH session pool]
@@ -59,7 +60,7 @@ flowchart LR
     SSHD --> RP[Remote proxies / forwards]
 ```
 
-The GUI and CLI do not depend on each other. The GUI first attempts to attach to the configured control endpoint and starts its own runtime only when no existing endpoint is available. `stk run` and `stk serve` start a runtime directly. Exclusive control endpoint binding prevents the same configuration from starting duplicate listeners.
+The GUI and CLI do not depend on each other. The GUI first attempts to attach to the configured control endpoint and starts its own runtime only when no existing endpoint is available. `stk serve` starts a runtime directly. Exclusive control endpoint binding prevents the same configuration from starting duplicate listeners.
 
 ## Installation
 
@@ -203,13 +204,13 @@ hosts:
 
 ```bash
 stk check
-stk run
+stk serve
 ```
 
 The GUI can run independently and does not require a daemon to be started first. For systemd, launchd, or Windows Service Manager deployments, use:
 
 ```bash
-stk serve --config /etc/stk/config.yaml
+stk serve --system --config /etc/stk/config.yaml
 ```
 
 `serve` does not fork or detach itself. Process lifetime, logs, and restart policy should be managed by the platform service manager. A Linux example is available at [`packaging/systemd/stk.service`](packaging/systemd/stk.service).
@@ -222,6 +223,39 @@ curl --proxy http://127.0.0.1:17890 https://api.ipify.org
 ```
 
 `--socks5-hostname` sends the destination hostname through the SSH path for remote resolution instead of resolving it through local DNS.
+
+### Run Commands Through a Configured Proxy
+
+`stk env` selects an enabled local proxy, injects the appropriate proxy environment variables, and executes a command directly without invoking a shell:
+
+```bash
+stk env curl https://api.ipify.org
+stk env -p production curl https://api.ipify.org
+stk env -p production/mixed-ssh@socks5h curl https://api.ipify.org
+stk env -p production -s http curl https://api.ipify.org
+```
+
+Define short, reusable profiles in the configuration:
+
+```yaml
+env:
+  default: production
+  profiles:
+    production:
+      host: production
+      tunnel: mixed-ssh
+      scheme: socks5h
+```
+
+Without a child command, `stk env` prints the computed variables. `--live` additionally queries the control endpoint and fails unless the selected tunnel is currently listening. Selection defaults to the first enabled host and local proxy, including inherited OpenSSH `DynamicForward` entries. A mixed listener defaults to `socks5h`; use `-s http` or `-s socks5` to override it.
+
+Selection precedence is:
+
+```text
+automatic selection < env.default < STK_PROXY_PROFILE < -p/--proxy < --host/--tunnel/--scheme
+```
+
+For SOCKS, STK sets `ALL_PROXY` and `all_proxy`. For HTTP, it sets upper- and lowercase `HTTP_PROXY` and `HTTPS_PROXY`. Existing `NO_PROXY` and `no_proxy` values are preserved.
 
 ## Forwarding Modes
 
@@ -281,8 +315,8 @@ stk print-default-config --format toml
 
 | Entry point | Unix | Windows |
 | --- | --- | --- |
-| GUI, `stk run`, and `stk check` | `~/.config/stk` | `%USERPROFILE%/.config/stk` |
-| `stk serve` | `/etc/stk` | `%PROGRAMDATA%/stk` |
+| GUI, `stk serve`, `stk env`, and `stk check` | `~/.config/stk` | `%USERPROFILE%/.config/stk` |
+| `stk serve --system` and control commands with `--system` | `/etc/stk` | `%PROGRAMDATA%/stk` |
 
 STK searches a configuration directory for `config.yaml`, `config.yml`, `config.json`, and `config.toml`, in that order. Every related command accepts `--config` with either a file or an existing directory.
 
@@ -342,7 +376,7 @@ Current OpenSSH config support includes `Host`, `Include`, `ProxyJump`, `ProxyCo
 
 ### Dynamic Reload
 
-The GUI, `stk run`, and `stk serve` monitor configuration changes through native file-system notifications: inotify on Linux, FSEvents on macOS, and `ReadDirectoryChangesW` on Windows. Consecutive events are debounced for approximately 300 ms before a new configuration generation is applied.
+The GUI and `stk serve` monitor configuration changes through native file-system notifications: inotify on Linux, FSEvents on macOS, and `ReadDirectoryChangesW` on Windows. Consecutive events are debounced for approximately 300 ms before a new configuration generation is applied.
 
 - A parse, validation, or startup failure keeps the previous valid generation active.
 - Listeners are released and rebound during generation replacement, so new connections may briefly fail.
@@ -407,8 +441,8 @@ The service may be named `ssh` on some distributions. You can also inspect the e
 Running `stk` without a subcommand prints help:
 
 ```text
-stk serve                 # Long-running runtime managed by a service manager
-stk run                   # Foreground user runtime
+stk serve                 # Foreground user runtime; add --system for a system service
+stk env [OPTIONS] COMMAND # Run a command with proxy environment variables
 stk check                 # Validate configuration
 stk status                # Print the current hierarchical status
 stk top                   # Continuously display server-pushed status

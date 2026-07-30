@@ -1,9 +1,20 @@
 {
+  "env": {
+    "default": "main",
+    "profiles": {
+      "main": {
+        "host": "main",
+        "tunnel": "primary",
+        "scheme": "socks5h"
+      }
+    }
+  },
   "hosts": {
     "main": {
       "ssh-config-host": "localhost",
       "local-proxies": [
         {
+          "name": "primary",
           "listen": "127.0.0.1:17890",
           "mixed": true
         }

@@ -5,7 +5,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/stk serve --config /etc/stk/config.yaml
+ExecStart=/usr/local/bin/stk serve --system --config /etc/stk/config.yaml
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true

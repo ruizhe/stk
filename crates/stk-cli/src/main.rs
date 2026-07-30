@@ -21,6 +21,8 @@ use stk_core::{
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod proxy_env;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "stk",
@@ -34,12 +36,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    #[command(
-        about = "Run as a service with the control API; defaults to the system config directory"
-    )]
-    Serve(ConfigArgs),
-    #[command(about = "Run in the foreground; defaults to the user config directory")]
-    Run(ConfigArgs),
+    #[command(about = "Run the runtime in the foreground; defaults to the user config directory")]
+    Serve(ServeArgs),
+    #[command(about = "Run a command with proxy environment variables")]
+    Env(proxy_env::EnvArgs),
     #[command(about = "Validate a config; defaults to the user config directory")]
     Check(ConfigArgs),
     #[command(about = "Show the running GUI, foreground, or service runtime status")]
@@ -56,9 +56,24 @@ struct ConfigArgs {
     #[arg(
         short,
         long,
-        help = "Config file or directory; defaults depend on the command"
+        help = "Config file or directory; defaults to the user config directory"
     )]
     config: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ServeArgs {
+    #[arg(
+        short,
+        long,
+        help = "Config file or directory; defaults depend on --system"
+    )]
+    config: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Use the system config directory and system control endpoint"
+    )]
+    system: bool,
 }
 
 #[derive(Debug, Args)]
@@ -123,8 +138,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     };
     match command {
-        Command::Serve(args) => run(args, RuntimeProfile::Service, ConfigScope::System).await,
-        Command::Run(args) => run(args, RuntimeProfile::Foreground, ConfigScope::User).await,
+        Command::Serve(args) => serve(args).await,
+        Command::Env(args) => proxy_env::run(args).await,
         Command::Check(args) => check(args, ConfigScope::User),
         Command::Status(args) => status(args).await,
         Command::Top(args) => top(args).await,
@@ -614,7 +629,12 @@ fn resolve_control_endpoint(args: &ControlArgs) -> anyhow::Result<ControlEndpoin
     ControlEndpoint::from_config(&control, scope)
 }
 
-async fn run(args: ConfigArgs, profile: RuntimeProfile, scope: ConfigScope) -> anyhow::Result<()> {
+async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    let (profile, scope) = if args.system {
+        (RuntimeProfile::Service, ConfigScope::System)
+    } else {
+        (RuntimeProfile::Foreground, ConfigScope::User)
+    };
     let config = resolve_config_path(args.config.as_deref(), scope);
     info!(?profile, config = %config.display(), "starting SSH Tunnel Keeper runtime with config reload");
     run_config_file_until_shutdown(config, profile, shutdown_signal()).await
@@ -655,7 +675,49 @@ mod tests {
         assert!(help.contains("Commands:"));
         assert!(help.contains("status"));
         assert!(help.contains("top"));
-        assert!(help.contains("run"));
+        assert!(help.contains("serve"));
+        assert!(help.contains("env"));
+        assert!(!help.contains("Run in the foreground"));
+    }
+
+    #[test]
+    fn env_subcommand_keeps_child_options_as_os_arguments() {
+        let cli = Cli::try_parse_from([
+            "stk",
+            "env",
+            "-p",
+            "corp",
+            "curl",
+            "--silent",
+            "https://example.com",
+        ])
+        .unwrap();
+        let Some(Command::Env(args)) = cli.command else {
+            panic!("expected env command");
+        };
+        assert_eq!(args.proxy.as_deref(), Some("corp"));
+        assert_eq!(
+            args.command,
+            ["curl", "--silent", "https://example.com"]
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn serve_defaults_to_user_scope_and_accepts_system_scope() {
+        let user = Cli::try_parse_from(["stk", "serve"]).unwrap();
+        let Some(Command::Serve(user)) = user.command else {
+            panic!("expected serve command");
+        };
+        assert!(!user.system);
+
+        let system = Cli::try_parse_from(["stk", "serve", "--system"]).unwrap();
+        let Some(Command::Serve(system)) = system.command else {
+            panic!("expected serve command");
+        };
+        assert!(system.system);
     }
 
     #[test]
