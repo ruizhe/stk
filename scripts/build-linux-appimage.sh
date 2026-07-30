@@ -41,6 +41,17 @@ pkg-config --exists gtk+-3.0 || {
     echo "GTK 3 development metadata is required to package the AppImage" >&2
     exit 1
 }
+pkg-config --exists ayatana-appindicator3-0.1 || {
+    echo "Ayatana AppIndicator development metadata is required to package the AppImage" >&2
+    exit 1
+}
+
+APPINDICATOR_LIB_DIR=$(pkg-config --variable=libdir ayatana-appindicator3-0.1)
+APPINDICATOR_LIBRARY="$APPINDICATOR_LIB_DIR/libayatana-appindicator3.so.1"
+if [ ! -e "$APPINDICATOR_LIBRARY" ]; then
+    echo "Ayatana AppIndicator runtime library was not found: $APPINDICATOR_LIBRARY" >&2
+    exit 1
+fi
 
 TOOLS_DIR=${STK_APPIMAGE_TOOLS_DIR:-"$ROOT/target/appimage-tools"}
 APP_DIR="$ROOT/target/appimage/SSH_Tunnel_Keeper.AppDir"
@@ -164,7 +175,13 @@ export DEPLOY_GTK_VERSION=3
     --appimage-extract-and-run \
     --verbosity 2 \
     --appdir "$APP_DIR" \
+    --library "$APPINDICATOR_LIBRARY" \
     --plugin gtk
+
+if [ ! -e "$APP_DIR/usr/lib/libayatana-appindicator3.so.1" ]; then
+    echo "linuxdeploy did not bundle libayatana-appindicator3.so.1" >&2
+    exit 1
+fi
 
 "$APPIMAGETOOL" \
     --appimage-extract-and-run \

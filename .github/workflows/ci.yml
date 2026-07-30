@@ -248,6 +248,7 @@ jobs:
           test "$("$appimage" --appimage-offset)" = "$(stat -c %s "$runtime")"
           test -e "$appdir/usr/lib/libgtk-3.so.0"
           test -e "$appdir/usr/lib/libwebkit2gtk-4.1.so.0"
+          test -e "$appdir/usr/lib/libayatana-appindicator3.so.1"
           test -x "$appdir/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitNetworkProcess"
           test -x "$appdir/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitWebProcess"
           sha256sum "$appimage" > "$appimage.sha256"
@@ -267,8 +268,7 @@ jobs:
             sh -eu -c '
               apt-get update >/dev/null
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                libayatana-appindicator3-1 libwebkit2gtk-4.1-0 \
-                librsvg2-2 libxdo3 >/dev/null
+                libwebkit2gtk-4.1-0 librsvg2-2 libxdo3 >/dev/null
               /opt/stk.AppImage --help
             '
 
@@ -285,8 +285,7 @@ jobs:
             sh -eu -c '
               apt-get update >/dev/null
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                libayatana-appindicator3-1 libwebkit2gtk-4.1-0 \
-                librsvg2-2 libxdo3 >/dev/null
+                libwebkit2gtk-4.1-0 librsvg2-2 libxdo3 >/dev/null
               /opt/stk.AppImage --help
             '
 
@@ -303,8 +302,15 @@ jobs:
             sh -eu -c '
               sed -i "s/^#DisableSandboxSyscalls/DisableSandboxSyscalls/" /etc/pacman.conf
               pacman -Sy --noconfirm --needed \
-                gtk3 libayatana-appindicator librsvg webkit2gtk-4.1 xdotool >/dev/null
+                gtk3 librsvg webkit2gtk-4.1 xdotool >/dev/null
               /opt/stk.AppImage --help
+              cd /tmp
+              /opt/stk.AppImage --appimage-extract >/dev/null
+              test -e squashfs-root/usr/lib/libayatana-appindicator3.so.1
+              LD_LIBRARY_PATH="$PWD/squashfs-root/usr/lib" \
+                ldd squashfs-root/usr/lib/libayatana-appindicator3.so.1 \
+                > /tmp/stk-appindicator-ldd.txt
+              ! grep -q "not found" /tmp/stk-appindicator-ldd.txt
             '
 
       - name: Verify macOS application and DMG packaging

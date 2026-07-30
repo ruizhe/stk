@@ -9,6 +9,7 @@ use std::{
     collections::VecDeque,
     fs,
     io::Write as _,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -320,6 +321,28 @@ pub(super) fn update_system_tray_throughput(
 
 #[component]
 pub fn App() -> Element {
+    rsx! {
+        ErrorBoundary {
+            handle_error: |errors: ErrorContext| {
+                let details = format!("{errors:?}");
+                tracing::error!(error = %details, "GUI component tree failed");
+                rsx! {
+                    style { dangerous_inner_html: APP_CSS }
+                    main { class: "fatal-startup-error",
+                        CircleAlert { size: 24 }
+                        h1 { "SSH Tunnel Keeper" }
+                        p { "The GUI encountered an internal error and could not render this view." }
+                        p { "Details were written to ~/.config/stk/stk.log." }
+                    }
+                }
+            },
+            AppContent {}
+        }
+    }
+}
+
+#[component]
+fn AppContent() -> Element {
     let Some(context) = super::GUI_CONTEXT.get() else {
         return rsx! {
             style { dangerous_inner_html: APP_CSS }
@@ -333,27 +356,36 @@ pub fn App() -> Element {
     let initial_gui_config = context.gui_config.clone();
     let initial_language = initial_gui_config.language;
     let system_tray = use_hook(move || {
-        super::init_system_tray(initial_language).map_err(|error| format!("{error:#}"))
-    });
-    let system_tray = match system_tray {
-        Ok(system_tray) => system_tray,
-        Err(error) => {
-            context
-                .runtime
-                .set_error(format!("failed to initialize the system tray: {error}"));
-            return rsx! {
-                style { dangerous_inner_html: APP_CSS }
-                main { class: "fatal-startup-error",
-                    CircleAlert { size: 24 }
-                    h1 { "SSH Tunnel Keeper" }
-                    p { "Failed to initialize the system tray: {error}" }
-                }
-            };
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            super::init_system_tray(initial_language)
+        }));
+        match outcome {
+            Ok(Ok(tray)) => Some(tray),
+            Ok(Err(error)) => {
+                let message = format!(
+                    "failed to initialize the system tray; continuing without it: {error:#}"
+                );
+                context.runtime.set_error(message.clone());
+                warn!(error = %message, "system tray is unavailable");
+                None
+            }
+            Err(payload) => {
+                let panic = super::panic_payload_message(payload.as_ref());
+                let message =
+                    format!("system tray initialization panicked; continuing without it: {panic}");
+                context.runtime.set_error(message.clone());
+                warn!(error = %message, "system tray is unavailable");
+                None
+            }
         }
-    };
+    });
     let runtime_for_tray = Arc::clone(&context.runtime);
     let tray_for_runtime = system_tray.clone();
-    use_hook(move || runtime_for_tray.register_system_tray(tray_for_runtime));
+    use_hook(move || {
+        if let Some(tray) = tray_for_runtime {
+            runtime_for_tray.register_system_tray(tray);
+        }
+    });
     let window = use_window();
     let window_for_menu = window.clone();
     let _tray_menu_handler =
@@ -415,7 +447,9 @@ pub fn App() -> Element {
                     observe_configuration_change(&config_path_for_poll, &mut editor, language);
                 }
 
-                update_system_tray(&tray_for_poll, language, &next, next_throughput);
+                if let Some(tray) = tray_for_poll.as_ref() {
+                    update_system_tray(tray, language, &next, next_throughput);
+                }
                 throughput.set(next_throughput);
                 status.set(next);
                 runtime_error.set(next_error);
@@ -445,7 +479,9 @@ pub fn App() -> Element {
         let rates = *throughput.read();
         let snapshot = status.read();
         let language = gui_config.read().language;
-        update_system_tray(&tray_for_effect, language, &snapshot, rates);
+        if let Some(tray) = tray_for_effect.as_ref() {
+            update_system_tray(tray, language, &snapshot, rates);
+        }
     });
 
     let active = *active_view.read();
