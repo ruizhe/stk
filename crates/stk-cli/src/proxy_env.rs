@@ -1,14 +1,14 @@
 use anyhow::Context as _;
 use clap::{Args, ValueEnum};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
 };
 use stk_core::{
-    AppConfig, ConfigScope, ControlEndpoint, LocalProxyCandidate, ProxyEnvScheme,
+    AppConfig, ConfigScope, ControlEndpoint, LocalProxyCandidate, ProxyEnvScheme, ProxyEnvVariable,
     config::{EnvProfileConfig, ProxyProtocol},
     fetch_runtime_snapshot, resolve_config_path,
     stats::{TunnelKind, TunnelRuntimeStatus},
@@ -80,6 +80,8 @@ struct ProxySelection {
     host: Option<String>,
     tunnel: Option<String>,
     scheme: Option<ProxyEnvScheme>,
+    inject: Option<BTreeSet<ProxyEnvVariable>>,
+    inherit: Option<BTreeSet<ProxyEnvVariable>>,
 }
 
 impl From<EnvProfileConfig> for ProxySelection {
@@ -88,6 +90,8 @@ impl From<EnvProfileConfig> for ProxySelection {
             host: profile.host,
             tunnel: profile.tunnel,
             scheme: profile.scheme,
+            inject: profile.inject,
+            inherit: profile.inherit,
         }
     }
 }
@@ -224,6 +228,7 @@ fn parse_proxy_selector(value: &str) -> anyhow::Result<ProxySelection> {
         host,
         tunnel,
         scheme,
+        ..ProxySelection::default()
     })
 }
 
@@ -299,20 +304,27 @@ fn build_proxy_environment_plan(
     let listen = proxy_connect_address(candidate.listen);
     let url = format!("{}://{listen}", proxy_scheme_name(scheme));
     let mut set = BTreeMap::new();
-    let remove = match scheme {
-        ProxyEnvScheme::Socks5h | ProxyEnvScheme::Socks5 => {
-            set.insert("ALL_PROXY".to_string(), url.clone());
-            set.insert("all_proxy".to_string(), url.clone());
-            vec!["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]
-        }
-        ProxyEnvScheme::Http => {
-            for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+    let inject = selection.inject.as_ref().unwrap_or(&config.env.inject);
+    let inherit = selection.inherit.as_ref().unwrap_or(&config.env.inherit);
+    if inject.contains(&ProxyEnvVariable::NoProxy) {
+        anyhow::bail!("no-proxy cannot be injected; add it to inherit instead");
+    }
+    let mut remove = Vec::new();
+    for variable in [
+        ProxyEnvVariable::AllProxy,
+        ProxyEnvVariable::HttpProxy,
+        ProxyEnvVariable::HttpsProxy,
+        ProxyEnvVariable::NoProxy,
+    ] {
+        let names = proxy_environment_variable_names(variable);
+        if inject.contains(&variable) {
+            for name in names {
                 set.insert(name.to_string(), url.clone());
             }
-            vec!["ALL_PROXY", "all_proxy"]
+        } else if !inherit.contains(&variable) {
+            remove.extend(names);
         }
-        ProxyEnvScheme::Auto => unreachable!("proxy scheme must be resolved before planning"),
-    };
+    }
     set.insert("STK_PROXY_HOST".to_string(), candidate.host.clone());
     set.insert(
         "STK_PROXY_SCHEME".to_string(),
@@ -328,6 +340,15 @@ fn build_proxy_environment_plan(
         set,
         remove,
     })
+}
+
+fn proxy_environment_variable_names(variable: ProxyEnvVariable) -> [&'static str; 2] {
+    match variable {
+        ProxyEnvVariable::AllProxy => ["ALL_PROXY", "all_proxy"],
+        ProxyEnvVariable::HttpProxy => ["HTTP_PROXY", "http_proxy"],
+        ProxyEnvVariable::HttpsProxy => ["HTTPS_PROXY", "https_proxy"],
+        ProxyEnvVariable::NoProxy => ["NO_PROXY", "no_proxy"],
+    }
 }
 
 fn proxy_scheme_is_compatible(protocol: ProxyProtocol, scheme: ProxyEnvScheme) -> bool {
@@ -348,8 +369,8 @@ fn resolve_proxy_scheme(protocol: ProxyProtocol, requested: ProxyEnvScheme) -> P
         return requested;
     }
     match protocol {
-        ProxyProtocol::Socks5h | ProxyProtocol::Mixed => ProxyEnvScheme::Socks5h,
-        ProxyProtocol::Http => ProxyEnvScheme::Http,
+        ProxyProtocol::Socks5h => ProxyEnvScheme::Socks5h,
+        ProxyProtocol::Mixed | ProxyProtocol::Http => ProxyEnvScheme::Http,
     }
 }
 
@@ -468,11 +489,12 @@ env:
     corp:
       host: alpha
       tunnel: socks
-      scheme: socks5h
     web:
       host: alpha
       tunnel: web
       scheme: http
+      inject: [https-proxy]
+      inherit: [no-proxy]
 hosts:
   alpha:
     host: alpha.example
@@ -503,6 +525,7 @@ hosts:
                 host: Some("alpha".to_string()),
                 tunnel: Some("socks".to_string()),
                 scheme: Some(ProxyEnvScheme::Socks5h),
+                ..ProxySelection::default()
             }
         );
         assert_eq!(
@@ -511,6 +534,7 @@ hosts:
                 host: Some("alpha".to_string()),
                 tunnel: None,
                 scheme: Some(ProxyEnvScheme::Http),
+                ..ProxySelection::default()
             }
         );
         assert!(parse_proxy_selector("alpha/socks/extra").is_err());
@@ -545,10 +569,18 @@ hosts:
         let socks = build_proxy_environment_plan(&config, &ProxySelection::default()).unwrap();
         assert_eq!(socks.candidate.host, "alpha");
         assert_eq!(socks.candidate.tunnel, "socks");
-        assert_eq!(socks.url, "socks5h://127.0.0.1:1080");
-        assert_eq!(socks.set["ALL_PROXY"], socks.url);
-        assert!(socks.remove.contains(&"HTTP_PROXY"));
-        assert!(!socks.remove.contains(&"NO_PROXY"));
+        assert_eq!(socks.url, "http://127.0.0.1:1080");
+        for name in [
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+        ] {
+            assert_eq!(socks.set[name], socks.url);
+        }
+        assert_eq!(socks.remove, ["NO_PROXY", "no_proxy"]);
 
         let http = build_proxy_environment_plan(
             &config,
@@ -561,7 +593,75 @@ hosts:
         assert_eq!(http.candidate.tunnel, "socks");
         assert_eq!(http.url, "http://127.0.0.1:1080");
         assert_eq!(http.set["HTTPS_PROXY"], http.url);
-        assert!(http.remove.contains(&"ALL_PROXY"));
+        assert_eq!(http.set["ALL_PROXY"], http.url);
+        assert_eq!(http.remove, ["NO_PROXY", "no_proxy"]);
+
+        let socks_only = build_proxy_environment_plan(
+            &config,
+            &ProxySelection {
+                host: Some("beta".to_string()),
+                tunnel: Some("socks".to_string()),
+                ..ProxySelection::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(socks_only.url, "socks5h://127.0.0.1:2080");
+    }
+
+    #[test]
+    fn global_and_profile_environment_policies_are_applied() {
+        let mut config = env_test_config();
+        config.env.inject = [ProxyEnvVariable::AllProxy].into_iter().collect();
+        config.env.inherit = [ProxyEnvVariable::HttpProxy, ProxyEnvVariable::NoProxy]
+            .into_iter()
+            .collect();
+
+        let global = build_proxy_environment_plan(&config, &ProxySelection::default()).unwrap();
+        assert_eq!(global.set["ALL_PROXY"], global.url);
+        assert!(!global.set.contains_key("HTTP_PROXY"));
+        assert!(!global.remove.contains(&"HTTP_PROXY"));
+        assert!(!global.remove.contains(&"NO_PROXY"));
+        assert!(global.remove.contains(&"HTTPS_PROXY"));
+
+        let inherited_profile =
+            requested_proxy_selection_with_environment(&config, &env_args(), None).unwrap();
+        let inherited_profile = build_proxy_environment_plan(&config, &inherited_profile).unwrap();
+        assert_eq!(inherited_profile.set["ALL_PROXY"], inherited_profile.url);
+        assert!(!inherited_profile.set.contains_key("HTTP_PROXY"));
+        assert!(!inherited_profile.remove.contains(&"HTTP_PROXY"));
+        assert!(!inherited_profile.remove.contains(&"NO_PROXY"));
+
+        let profile =
+            requested_proxy_selection_with_environment(&config, &env_args(), Some("web")).unwrap();
+        let profile = build_proxy_environment_plan(&config, &profile).unwrap();
+        assert_eq!(profile.set["HTTPS_PROXY"], profile.url);
+        assert!(!profile.set.contains_key("ALL_PROXY"));
+        assert!(profile.remove.contains(&"ALL_PROXY"));
+        assert!(profile.remove.contains(&"HTTP_PROXY"));
+        assert!(!profile.remove.contains(&"NO_PROXY"));
+
+        let empty_profile = build_proxy_environment_plan(
+            &config,
+            &ProxySelection {
+                inject: Some(BTreeSet::new()),
+                inherit: Some(BTreeSet::new()),
+                ..ProxySelection::default()
+            },
+        )
+        .unwrap();
+        for name in [
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ] {
+            assert!(!empty_profile.set.contains_key(name));
+            assert!(empty_profile.remove.contains(&name));
+        }
     }
 
     #[test]
@@ -573,6 +673,7 @@ hosts:
                 host: Some("alpha".to_string()),
                 tunnel: Some("web".to_string()),
                 scheme: Some(ProxyEnvScheme::Auto),
+                ..ProxySelection::default()
             },
         )
         .unwrap();
@@ -584,6 +685,7 @@ hosts:
                     host: Some("alpha".to_string()),
                     tunnel: Some("web".to_string()),
                     scheme: Some(ProxyEnvScheme::Socks5h),
+                    ..ProxySelection::default()
                 },
             )
             .is_err()

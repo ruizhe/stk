@@ -5,7 +5,7 @@
       "main": {
         "host": "main",
         "tunnel": "primary",
-        "scheme": "socks5h"
+        "scheme": "http"
       }
     }
   },

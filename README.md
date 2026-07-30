@@ -240,14 +240,19 @@ Define short, reusable profiles in the configuration:
 ```yaml
 env:
   default: production
+  inject: [all-proxy, http-proxy, https-proxy]
+  inherit: []
   profiles:
     production:
       host: production
       tunnel: mixed-ssh
-      scheme: socks5h
+      scheme: http
+      # Profile lists replace the corresponding global lists.
+      inject: [all-proxy]
+      inherit: [no-proxy]
 ```
 
-Without a child command, `stk env` prints the computed variables. `--live` additionally queries the control endpoint and fails unless the selected tunnel is currently listening. Selection defaults to the first enabled host and local proxy, including inherited OpenSSH `DynamicForward` entries. A mixed listener defaults to `socks5h`; use `-s http` or `-s socks5` to override it.
+Without a child command, `stk env` prints the computed variables. `--live` additionally queries the control endpoint and fails unless the selected tunnel is currently listening. Selection defaults to the first enabled host and local proxy, including inherited OpenSSH `DynamicForward` entries. A mixed listener defaults to `http`; use `-s socks5h` or `-s socks5` to override it. A SOCKS-only listener still defaults to `socks5h`.
 
 Selection precedence is:
 
@@ -255,7 +260,9 @@ Selection precedence is:
 automatic selection < env.default < STK_PROXY_PROFILE < -p/--proxy < --host/--tunnel/--scheme
 ```
 
-For SOCKS, STK sets `ALL_PROXY` and `all_proxy`. For HTTP, it sets upper- and lowercase `HTTP_PROXY` and `HTTPS_PROXY`. Existing `NO_PROXY` and `no_proxy` values are preserved.
+`inject` and `inherit` control the proxy-related environment variables passed to the child process. The available groups are `all-proxy`, `http-proxy`, and `https-proxy`; `inherit` also accepts `no-proxy`. Each group covers both uppercase and lowercase names, for example `http-proxy` means both `HTTP_PROXY` and `http_proxy`.
+
+When no policy is configured, STK inherits none of the existing proxy variables, injects `ALL_PROXY`, `HTTP_PROXY`, and `HTTPS_PROXY` in both cases with the selected proxy URL, and removes `NO_PROXY/no_proxy`. A profile can independently replace the global `inject` and `inherit` lists; an omitted profile list uses the global list, while an explicit empty list disables that behavior. Injection takes precedence if a group appears in both lists. Other process environment variables such as `PATH` and `HOME` continue to be inherited normally. `STK_PROXY_HOST`, `STK_PROXY_TUNNEL`, `STK_PROXY_SCHEME`, and `STK_PROXY_URL` are always set.
 
 ## Forwarding Modes
 

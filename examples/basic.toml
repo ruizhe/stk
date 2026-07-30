@@ -4,7 +4,7 @@ default = "main"
 [env.profiles.main]
 host = "main"
 tunnel = "primary"
-scheme = "socks5h"
+scheme = "http"
 
 [hosts.main]
 ssh-config-host = "localhost"

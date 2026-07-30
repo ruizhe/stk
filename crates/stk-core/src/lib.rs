@@ -12,7 +12,7 @@ pub mod stats;
 
 pub use config::{
     AppConfig, ConfigError, ControlConfig, EnvConfig, EnvProfileConfig, LocalProxyCandidate,
-    ProxyEnvScheme,
+    ProxyEnvScheme, ProxyEnvVariable,
 };
 pub use config_path::{
     ConfigScope, default_config_directory, default_config_path, resolve_config_path,

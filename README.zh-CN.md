@@ -241,14 +241,19 @@ stk env -p production -s http curl https://api.ipify.org
 ```yaml
 env:
   default: production
+  inject: [all-proxy, http-proxy, https-proxy]
+  inherit: []
   profiles:
     production:
       host: production
       tunnel: mixed-ssh
-      scheme: socks5h
+      scheme: http
+      # profile 列表会完整覆盖对应的全局列表。
+      inject: [all-proxy]
+      inherit: [no-proxy]
 ```
 
-不提供子命令时，`stk env` 会打印计算出的环境变量。增加 `--live` 后还会查询 control endpoint，只有所选 tunnel 当前处于 listening 状态才会继续。默认会选择第一个启用的 host 和 local proxy，也包括从 OpenSSH `DynamicForward` 继承的代理。mixed listener 默认使用 `socks5h`，可以通过 `-s http` 或 `-s socks5` 覆盖。
+不提供子命令时，`stk env` 会打印计算出的环境变量。增加 `--live` 后还会查询 control endpoint，只有所选 tunnel 当前处于 listening 状态才会继续。默认会选择第一个启用的 host 和 local proxy，也包括从 OpenSSH `DynamicForward` 继承的代理。mixed listener 默认使用 `http`，可以通过 `-s socks5h` 或 `-s socks5` 覆盖；只支持 SOCKS 的 listener 仍默认使用 `socks5h`。
 
 选择优先级为：
 
@@ -256,7 +261,9 @@ env:
 自动选择 < env.default < STK_PROXY_PROFILE < -p/--proxy < --host/--tunnel/--scheme
 ```
 
-SOCKS 模式会设置 `ALL_PROXY` 和 `all_proxy`；HTTP 模式会同时设置大小写形式的 `HTTP_PROXY` 和 `HTTPS_PROXY`。已有的 `NO_PROXY` 和 `no_proxy` 会保留。
+`inject` 和 `inherit` 用来控制传递给子进程的代理相关环境变量。可用变量组包括 `all-proxy`、`http-proxy` 和 `https-proxy`，`inherit` 还支持 `no-proxy`。每个变量组同时表示大小写形式，例如 `http-proxy` 同时对应 `HTTP_PROXY` 和 `http_proxy`。
+
+未配置策略时，STK 默认不继承任何已有代理变量，将选中代理的 URL 同时注入大小写形式的 `ALL_PROXY`、`HTTP_PROXY` 和 `HTTPS_PROXY`，并清理 `NO_PROXY/no_proxy`。profile 可以分别完整覆盖全局的 `inject` 和 `inherit` 列表；profile 中省略某个列表时继续使用全局列表，显式配置空列表则禁用对应行为。同一个变量组同时出现在两个列表中时，注入优先。`PATH`、`HOME` 等普通进程环境变量仍会正常继承。`STK_PROXY_HOST`、`STK_PROXY_TUNNEL`、`STK_PROXY_SCHEME` 和 `STK_PROXY_URL` 始终会被设置。
 
 ## 四类转发
 

@@ -3,11 +3,15 @@ endpoint = "tcp:127.0.0.1:19090"
 
 [env]
 default = "production"
+inject = ["all-proxy", "http-proxy", "https-proxy"]
+inherit = []
 
 [env.profiles.production]
 host = "production"
 tunnel = "mixed-ssh"
-scheme = "socks5h"
+scheme = "http"
+inject = ["all-proxy"]
+inherit = ["no-proxy"]
 
 [override-default]
 min-sessions = 1

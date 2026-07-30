@@ -3,11 +3,20 @@ control:
 
 env:
   default: production
+  inject:
+    - all-proxy
+    - http-proxy
+    - https-proxy
+  inherit: []
   profiles:
     production:
       host: production
       tunnel: mixed-ssh
-      scheme: socks5h
+      scheme: http
+      inject:
+        - all-proxy
+      inherit:
+        - no-proxy
 
 override-default:
   min-sessions: 1

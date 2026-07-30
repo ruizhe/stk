@@ -5,7 +5,7 @@ use serde::{
     de::{Error as _, MapAccess, Visitor},
 };
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt, fs,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
@@ -254,13 +254,31 @@ impl ControlConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct EnvConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
+    #[serde(
+        default = "default_proxy_env_inject",
+        skip_serializing_if = "is_default_proxy_env_inject"
+    )]
+    pub inject: BTreeSet<ProxyEnvVariable>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub inherit: BTreeSet<ProxyEnvVariable>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, EnvProfileConfig>,
+}
+
+impl Default for EnvConfig {
+    fn default() -> Self {
+        Self {
+            default: None,
+            inject: default_proxy_env_inject(),
+            inherit: BTreeSet::new(),
+            profiles: BTreeMap::new(),
+        }
+    }
 }
 
 impl EnvConfig {
@@ -269,6 +287,7 @@ impl EnvConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        validate_proxy_env_inject("global env configuration", &self.inject)?;
         if let Some(default) = &self.default {
             if default.trim().is_empty() {
                 return Err(ConfigError::InvalidEnvConfig(
@@ -297,6 +316,9 @@ impl EnvConfig {
                     )));
                 }
             }
+            if let Some(inject) = &profile.inject {
+                validate_proxy_env_inject(&format!("profile {name}"), inject)?;
+            }
         }
         Ok(())
     }
@@ -311,6 +333,45 @@ pub struct EnvProfileConfig {
     pub tunnel: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheme: Option<ProxyEnvScheme>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject: Option<BTreeSet<ProxyEnvVariable>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit: Option<BTreeSet<ProxyEnvVariable>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxyEnvVariable {
+    AllProxy,
+    HttpProxy,
+    HttpsProxy,
+    NoProxy,
+}
+
+fn default_proxy_env_inject() -> BTreeSet<ProxyEnvVariable> {
+    [
+        ProxyEnvVariable::AllProxy,
+        ProxyEnvVariable::HttpProxy,
+        ProxyEnvVariable::HttpsProxy,
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn is_default_proxy_env_inject(value: &BTreeSet<ProxyEnvVariable>) -> bool {
+    value == &default_proxy_env_inject()
+}
+
+fn validate_proxy_env_inject(
+    owner: &str,
+    inject: &BTreeSet<ProxyEnvVariable>,
+) -> Result<(), ConfigError> {
+    if inject.contains(&ProxyEnvVariable::NoProxy) {
+        return Err(ConfigError::InvalidEnvConfig(format!(
+            "{owner} cannot inject no-proxy; add it to inherit instead"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1370,12 +1431,16 @@ mod tests {
     fn env_profiles_round_trip_all_formats() {
         let mut expected = AppConfig::default();
         expected.env.default = Some("corp".to_string());
+        expected.env.inject = [ProxyEnvVariable::AllProxy].into_iter().collect();
+        expected.env.inherit = [ProxyEnvVariable::NoProxy].into_iter().collect();
         expected.env.profiles.insert(
             "corp".to_string(),
             EnvProfileConfig {
                 host: Some("default".to_string()),
                 tunnel: Some("local-proxy-127.0.0.1:7890".to_string()),
                 scheme: Some(ProxyEnvScheme::Socks5h),
+                inject: Some([ProxyEnvVariable::HttpsProxy].into_iter().collect()),
+                inherit: Some(BTreeSet::new()),
             },
         );
         expected.validate().unwrap();
@@ -1385,6 +1450,21 @@ mod tests {
             let parsed = AppConfig::from_str(&serialized, format).unwrap();
             assert_eq!(parsed, expected);
         }
+    }
+
+    #[test]
+    fn env_defaults_inject_all_proxy_urls_and_inherit_nothing() {
+        let env = EnvConfig::default();
+        assert_eq!(env.inject, default_proxy_env_inject());
+        assert!(env.inherit.is_empty());
+    }
+
+    #[test]
+    fn no_proxy_cannot_be_configured_as_an_injected_proxy_url() {
+        let mut config = AppConfig::default();
+        config.env.inject.insert(ProxyEnvVariable::NoProxy);
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("cannot inject no-proxy"));
     }
 
     #[test]
