@@ -225,7 +225,7 @@ jobs:
           --locked
           named_pipe_listener_waits_for_previous_generation_connections
 
-      - name: Verify Linux AppImage packaging
+      - name: Build Linux AppImage
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -235,35 +235,67 @@ jobs:
             crates/stk-gui/target/release/stk-gui \
             "$appimage"
 
+      - name: Verify Linux AppImage runtime
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          appimage="dist/SSH-Tunnel-Keeper-linux-x86_64.AppImage"
           runtime="target/appimage-tools/runtime-x86_64-20251108"
           expected_runtime_sha256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
           test "$(sha256sum "$runtime" | awk '{print $1}')" = "$expected_runtime_sha256"
           test "$("$appimage" --appimage-offset)" = "$(stat -c %s "$runtime")"
           sha256sum "$appimage" > "$appimage.sha256"
           sha256sum --check "$appimage.sha256"
-
           APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --help >/dev/null
 
-          for ubuntu in 22.04 24.04; do
-            docker run --rm \
-              -e APPIMAGE_EXTRACT_AND_RUN=1 \
-              -v "$PWD/$appimage:/opt/stk.AppImage:ro" \
-              "ubuntu:$ubuntu" \
-              sh -eu -c '
-                apt-get update >/dev/null
-                DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                  libegl1 libgl1 libx11-6 libx11-xcb1 libxcb1 >/dev/null
-                /opt/stk.AppImage --help >/dev/null
-              '
-          done
+      - name: Verify AppImage extraction on Ubuntu 22.04
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          appimage="dist/SSH-Tunnel-Keeper-linux-x86_64.AppImage"
+          docker run --rm \
+            -e APPIMAGE_EXTRACT_AND_RUN=1 \
+            -v "$PWD/$appimage:/opt/stk.AppImage:ro" \
+            ubuntu:22.04 \
+            sh -eu -c '
+              apt-get update >/dev/null
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                libegl1 libgl1 libx11-6 libx11-xcb1 libxcb1 >/dev/null
+              /opt/stk.AppImage --help
+            '
 
+      - name: Verify AppImage extraction on Ubuntu 24.04
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          appimage="dist/SSH-Tunnel-Keeper-linux-x86_64.AppImage"
+          docker run --rm \
+            -e APPIMAGE_EXTRACT_AND_RUN=1 \
+            -v "$PWD/$appimage:/opt/stk.AppImage:ro" \
+            ubuntu:24.04 \
+            sh -eu -c '
+              apt-get update >/dev/null
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                libegl1 libgl1 libx11-6 libx11-xcb1 libxcb1 >/dev/null
+              /opt/stk.AppImage --help
+            '
+
+      - name: Verify AppImage extraction on Arch Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          appimage="dist/SSH-Tunnel-Keeper-linux-x86_64.AppImage"
           docker run --rm \
             -e APPIMAGE_EXTRACT_AND_RUN=1 \
             -v "$PWD/$appimage:/opt/stk.AppImage:ro" \
             archlinux:base \
             sh -eu -c '
               pacman -Sy --noconfirm --needed libglvnd libx11 libxcb >/dev/null
-              /opt/stk.AppImage --help >/dev/null
+              /opt/stk.AppImage --help
             '
 
       - name: Verify macOS application and DMG packaging
