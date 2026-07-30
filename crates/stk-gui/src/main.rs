@@ -220,10 +220,36 @@ fn main() {
     if let Some(error) = argument_error {
         runtime.set_error(format!("invalid GUI arguments; using defaults:\n{error}"));
     }
-    dioxus::LaunchBuilder::desktop()
-        .with_cfg(desktop_config(args.hidden))
-        .launch(App);
+    launch_desktop(desktop_config(args.hidden));
     runtime.stop();
+}
+
+#[cfg(target_os = "macos")]
+fn launch_desktop(config: Config) {
+    use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+
+    let process_info = NSProcessInfo::processInfo();
+    let reason = NSString::from_str("Keep SSH tunnels and tray throughput updates responsive");
+    let activity = process_info.beginActivityWithOptions_reason(
+        NSActivityOptions::UserInitiatedAllowingIdleSystemSleep,
+        &reason,
+    );
+
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(config)
+        .launch(App);
+
+    // The token was returned by this NSProcessInfo instance and remains valid here.
+    unsafe {
+        process_info.endActivity(&activity);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launch_desktop(config: Config) {
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(config)
+        .launch(App);
 }
 
 fn desktop_config(start_hidden: bool) -> Config {
