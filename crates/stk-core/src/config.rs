@@ -460,6 +460,13 @@ pub(crate) struct ResolvedHostConfig {
 }
 
 impl ResolvedHostConfig {
+    pub(crate) fn has_automatic_tunnels(&self) -> bool {
+        self.local_proxies.iter().any(|proxy| proxy.auto)
+            || self.local_forwards.iter().any(|forward| forward.auto)
+            || self.remote_proxies.iter().any(|proxy| proxy.auto)
+            || self.remote_forwards.iter().any(|forward| forward.auto)
+    }
+
     pub(crate) fn runtime_pool(&self, host_name: &str) -> SshPoolConfig {
         let remote_proxies = self
             .remote_proxies
@@ -1219,6 +1226,22 @@ mod tests {
         assert!(!output.contains("probe:"));
         assert!(!output.contains("min-sessions:"));
         assert!(!output.contains("control:"));
+    }
+
+    #[test]
+    fn automatic_tunnel_detection_ignores_empty_and_disabled_entries() {
+        let mut config = AppConfig::default();
+        let resolved = default_host(&config).resolve(&config.override_default);
+        assert!(resolved.has_automatic_tunnels());
+
+        let host = default_host_mut(&mut config);
+        host.local_proxies[0].auto = Some(false);
+        let resolved = default_host(&config).resolve(&config.override_default);
+        assert!(!resolved.has_automatic_tunnels());
+
+        default_host_mut(&mut config).local_proxies.clear();
+        let resolved = default_host(&config).resolve(&config.override_default);
+        assert!(!resolved.has_automatic_tunnels());
     }
 
     #[test]

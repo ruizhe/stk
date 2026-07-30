@@ -544,6 +544,7 @@ fn format_bytes(bytes: u64) -> String {
 
 fn host_status_label(status: HostRuntimeStatus) -> &'static str {
     match status {
+        HostRuntimeStatus::Idle => "idle",
         HostRuntimeStatus::Connecting => "connecting",
         HostRuntimeStatus::Healthy => "healthy",
         HostRuntimeStatus::Degraded => "degraded",

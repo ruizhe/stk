@@ -304,13 +304,7 @@ impl SshPoolDialer {
         let mut tasks = Vec::new();
 
         for (upstream, plan) in pool.hosts.iter().zip(plans) {
-            stats::register_host(stats::HostRegistration {
-                name: upstream.name.clone(),
-                ssh_alias: plan.target.alias.clone(),
-                address: format_ssh_address(&plan.target.host, plan.target.port),
-                min_sessions: pool.min_sessions_per_host,
-                max_sessions: pool.max_sessions_per_host,
-            });
+            register_resolved_host(upstream, &plan, &pool);
             let state = Arc::new(RwLock::new(SshNodeState::default()));
             let node = Arc::new(NativeSshNode {
                 name: upstream.name.clone(),
@@ -385,6 +379,35 @@ impl SshPoolDialer {
     fn node(&self, name: &str) -> Option<&Arc<NativeSshNode>> {
         self.nodes.iter().find(|node| node.name == name)
     }
+}
+
+pub(crate) fn register_idle_ssh_host(host_name: &str, pool: &SshPoolConfig) -> anyhow::Result<()> {
+    let upstream = pool
+        .hosts
+        .first()
+        .with_context(|| format!("SSH host {host_name} has no runtime endpoint"))?;
+    let plan = resolve_ssh_plan(upstream, pool)?;
+    register_resolved_host(upstream, &plan, pool);
+    stats::update_host_state(
+        host_name,
+        stats::HostStateUpdate {
+            status: stats::HostRuntimeStatus::Idle,
+            rtt_ms: None,
+            restart_count: 0,
+            last_error: None,
+        },
+    );
+    Ok(())
+}
+
+fn register_resolved_host(upstream: &SshHostConfig, plan: &ResolvedSshPlan, pool: &SshPoolConfig) {
+    stats::register_host(stats::HostRegistration {
+        name: upstream.name.clone(),
+        ssh_alias: plan.target.alias.clone(),
+        address: format_ssh_address(&plan.target.host, plan.target.port),
+        min_sessions: pool.min_sessions_per_host,
+        max_sessions: pool.max_sessions_per_host,
+    });
 }
 
 impl Drop for SshPoolDialer {

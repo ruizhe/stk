@@ -1151,7 +1151,17 @@ fn HostRuntimeDetail(host: HostRuntimeSnapshot, language: Language) -> Element {
                     }
                 }
                 if sessions.is_empty() {
-                    div { class: "runtime-empty-row", Unplug { size: 18 } {tr(language, "No session attempts recorded", "尚无会话记录")} }
+                    if host.status == HostRuntimeStatus::Idle {
+                        div { class: "runtime-empty-row", Router { size: 18 }
+                            span { {tr(
+                                language,
+                                "No enabled tunnels are configured, so SSH sessions are not started.",
+                                "未配置已启用的隧道，因此不会启动 SSH 会话。",
+                            )} }
+                        }
+                    } else {
+                        div { class: "runtime-empty-row", Unplug { size: 18 } span { {tr(language, "No session attempts recorded", "尚无会话记录")} } }
+                    }
                 } else {
                     div { class: "runtime-record-list",
                         for session in sessions {
@@ -1745,6 +1755,7 @@ fn TrafficRecordMetric(label: &'static str, upload: String, download: String) ->
 #[component]
 fn HostStateBadge(status: HostRuntimeStatus, language: Language) -> Element {
     let (class, label) = match status {
+        HostRuntimeStatus::Idle => ("state-badge idle", tr(language, "Idle", "待命")),
         HostRuntimeStatus::Connecting => (
             "state-badge connecting",
             tr(language, "Connecting", "连接中"),

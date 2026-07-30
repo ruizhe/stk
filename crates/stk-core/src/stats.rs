@@ -34,6 +34,7 @@ pub struct LatencySnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HostRuntimeStatus {
+    Idle,
     Connecting,
     Healthy,
     Degraded,

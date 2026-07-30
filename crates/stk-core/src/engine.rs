@@ -9,7 +9,7 @@ use crate::{
     },
     outbound::{BoxedProxyStream, DialContext, OutboundDialer, TargetAddr},
     reload::ReloadHandle,
-    ssh::SshPoolDialer,
+    ssh::{SshPoolDialer, register_idle_ssh_host},
     ssh_config::inherit_ssh_config_forwards,
     stats::{self, BodyTiming, TimedBody, TimedIo, elapsed_ms, next_connection_id},
 };
@@ -160,6 +160,14 @@ impl Engine {
                     .filter(|forward| forward.auto)
                     .count();
             register_host_tunnels(&host_name, &host);
+            if !host.has_automatic_tunnels() {
+                register_idle_ssh_host(&host_name, &host.runtime_pool(&host_name))?;
+                info!(
+                    host_name,
+                    "SSH host is idle because it has no enabled tunnels"
+                );
+                continue;
+            }
             let dialer = build_ssh_host(&host_name, &host)?;
             retained_dialers.push(Arc::clone(&dialer));
             let listener_retry = ListenerRetryPolicy {
