@@ -168,9 +168,14 @@ jobs:
             "$appimage"
 
           runtime="target/appimage-tools/runtime-x86_64-20251108"
+          appdir="target/appimage/SSH_Tunnel_Keeper.AppDir"
           expected_runtime_sha256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
           test "$(sha256sum "$runtime" | awk '{print $1}')" = "$expected_runtime_sha256"
           test "$("$appimage" --appimage-offset)" = "$(stat -c %s "$runtime")"
+          test -e "$appdir/usr/lib/libgtk-3.so.0"
+          test -e "$appdir/usr/lib/libwebkit2gtk-4.1.so.0"
+          test -x "$appdir/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitNetworkProcess"
+          test -x "$appdir/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitWebProcess"
           checksum="$(sha256sum "$appimage")"
           printf '%s\n' "$checksum" | sha256sum --check
 
@@ -184,7 +189,8 @@ jobs:
               sh -eu -c '
                 apt-get update >/dev/null
                 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                  libegl1 libgl1 libx11-6 libx11-xcb1 libxcb1 >/dev/null
+                  libayatana-appindicator3-1 libwebkit2gtk-4.1-0 \
+                  librsvg2-2 libxdo3 >/dev/null
                 /opt/stk.AppImage --help >/dev/null
               '
           done
@@ -194,7 +200,9 @@ jobs:
             -v "$PWD/$appimage:/opt/stk.AppImage:ro" \
             archlinux:base \
             sh -eu -c '
-              pacman -Sy --noconfirm --needed libglvnd libx11 libxcb >/dev/null
+              sed -i "s/^#DisableSandboxSyscalls/DisableSandboxSyscalls/" /etc/pacman.conf
+              pacman -Sy --noconfirm --needed \
+                gtk3 libayatana-appindicator librsvg webkit2gtk-4.1 xdotool >/dev/null
               /opt/stk.AppImage --help >/dev/null
             '
 
