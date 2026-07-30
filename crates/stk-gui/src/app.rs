@@ -288,11 +288,8 @@ fn update_system_tray(
         Language::English => format!("Upload  {upload}"),
         Language::Chinese => format!("上传  {upload}"),
     });
-    tray.reload_item.set_text(tr(
-        language,
-        "Reload configuration",
-        "重新加载配置",
-    ));
+    tray.reload_item
+        .set_text(tr(language, "Reload configuration", "重新加载配置"));
     tray.quit_item.set_text(tr(
         language,
         "Quit SSH Tunnel Keeper",
@@ -399,11 +396,7 @@ pub fn App() -> Element {
 
                     append_runtime_events(&mut events, &previous, &next);
                     if next.config_generation != previous.config_generation {
-                        observe_configuration_change(
-                            &config_path_for_poll,
-                            &mut editor,
-                            language,
-                        );
+                        observe_configuration_change(&config_path_for_poll, &mut editor, language);
                     }
 
                     update_system_tray(&tray_for_poll, language, &next, next_throughput);

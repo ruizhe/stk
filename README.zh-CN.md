@@ -65,26 +65,37 @@ GUI 与 CLI 不存在启动依赖。GUI 会先尝试附着到配置对应的 con
 
 ### GitHub Releases
 
-Release 同时提供 macOS GUI 安装镜像以及包含 CLI 和 GUI 的完整归档：
+Release 提供自包含的 GUI 软件包和独立的 CLI 归档：
 
 | 平台 | 归档 | 内容 |
 | --- | --- | --- |
-| Linux x86_64 | `ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.tar.gz` | `stk`、`stk-gui`、systemd unit、样例配置 |
+| Linux x86_64 GUI | `ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage` | 包含 GTK/WebKitGTK 运行库的便携 GUI |
+| Linux x86_64 CLI | `ssh-tunnel-keeper-vX.Y.Z-linux-x86_64-cli.tar.gz` | `stk`、systemd unit、样例配置 |
 | Windows x86_64 | `ssh-tunnel-keeper-vX.Y.Z-windows-x86_64.zip` | `stk.exe`、`stk-gui.exe`、样例配置 |
 | macOS universal GUI | `ssh-tunnel-keeper-vX.Y.Z-macos-universal.dmg` | 可安装的 `SSH Tunnel Keeper.app` 镜像 |
 | macOS universal CLI + GUI | `ssh-tunnel-keeper-vX.Y.Z-macos-universal.zip` | `stk`、`SSH Tunnel Keeper.app`、样例配置 |
 
-每个归档都有对应的 `.sha256` 文件。下载后可以验证：
+每个发布包都有对应的 `.sha256` 文件。下载后可以验证：
 
 ```bash
 shasum -a 256 -c ssh-tunnel-keeper-vX.Y.Z-macos-universal.zip.sha256
 shasum -a 256 -c ssh-tunnel-keeper-vX.Y.Z-macos-universal.dmg.sha256
-sha256sum -c ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.tar.gz.sha256
+sha256sum -c ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage.sha256
+sha256sum -c ssh-tunnel-keeper-vX.Y.Z-linux-x86_64-cli.tar.gz.sha256
 ```
 
 当前自动发布的 macOS 应用使用 ad-hoc 签名，尚未使用 Apple Developer ID 公证，因此首次运行可能出现 Gatekeeper 提示。正式分发前应在 Release workflow 中接入 Developer ID 签名和 notarization。
 
-Linux GUI 使用系统 WebKitGTK。Debian/Ubuntu 运行或从源码构建 GUI 时需要安装：
+Linux AppImage 会捆绑 GUI 使用的 GTK 和 WebKitGTK 运行库。下载后执行：
+
+```bash
+chmod +x ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage
+./ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage
+```
+
+部分 Linux 发行版需要安装 FUSE 2 兼容包才能挂载 AppImage。如果系统没有 FUSE，也可以用 `APPIMAGE_EXTRACT_AND_RUN=1 ./ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage` 启动同一个文件。
+
+从源码构建裸 Linux GUI 可执行文件时仍然需要安装开发包：
 
 ```bash
 sudo apt-get update
@@ -114,6 +125,13 @@ cargo build --manifest-path crates/stk-gui/Cargo.toml \
 - Windows CLI：`target/release/stk.exe`
 - Linux GUI：`crates/stk-gui/target/release/stk-gui`
 - Windows GUI：`crates/stk-gui/target/release/stk-gui.exe`
+
+在 Linux 上可以用下面的命令把 release 二进制打包为 AppImage：
+
+```bash
+sudo apt-get install -y desktop-file-utils patchelf pkg-config
+./scripts/build-linux-appimage.sh
+```
 
 macOS 请使用脚本生成标准 `.app`，不要在 Finder 中直接双击裸可执行文件：
 
@@ -520,8 +538,8 @@ cargo test --manifest-path crates/stk-gui/Cargo.toml \
 
 ## CI 与发布
 
-- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) 在 push 和 pull request 上执行格式、Clippy、测试、Linux/macOS/Windows release build，以及 macOS DMG 打包检查。
-- [`.github/workflows/release.yml`](.github/workflows/release.yml) 在推送 `v*` tag 时构建各平台归档和 universal macOS DMG、生成 SHA-256，并创建 GitHub Release。
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) 在 push 和 pull request 上执行格式、Clippy、测试、Linux/macOS/Windows release build、Linux AppImage 运行检查，以及 macOS DMG 打包检查。
+- [`.github/workflows/release.yml`](.github/workflows/release.yml) 在推送 `v*` tag 时构建 Linux AppImage、各平台 CLI 归档和 universal macOS DMG、生成 SHA-256，并创建 GitHub Release。
 - [`.github/release.yml`](.github/release.yml) 定义 GitHub 自动生成发布说明的分类。
 
 发布版本前同步更新：

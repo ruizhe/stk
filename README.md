@@ -65,26 +65,37 @@ The GUI and CLI do not depend on each other. The GUI first attempts to attach to
 
 ### GitHub Releases
 
-Release assets include a macOS GUI installer and combined CLI/GUI archives:
+Release assets include self-contained GUI packages and separate CLI archives:
 
 | Platform | Archive | Contents |
 | --- | --- | --- |
-| Linux x86_64 | `ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.tar.gz` | `stk`, `stk-gui`, systemd unit, and examples |
+| Linux x86_64 GUI | `ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage` | Portable GUI with GTK/WebKitGTK runtime libraries |
+| Linux x86_64 CLI | `ssh-tunnel-keeper-vX.Y.Z-linux-x86_64-cli.tar.gz` | `stk`, systemd unit, and examples |
 | Windows x86_64 | `ssh-tunnel-keeper-vX.Y.Z-windows-x86_64.zip` | `stk.exe`, `stk-gui.exe`, and examples |
 | macOS universal GUI | `ssh-tunnel-keeper-vX.Y.Z-macos-universal.dmg` | Installable `SSH Tunnel Keeper.app` image |
 | macOS universal CLI + GUI | `ssh-tunnel-keeper-vX.Y.Z-macos-universal.zip` | `stk`, `SSH Tunnel Keeper.app`, and examples |
 
-Every archive has a matching `.sha256` file:
+Every release package has a matching `.sha256` file:
 
 ```bash
 shasum -a 256 -c ssh-tunnel-keeper-vX.Y.Z-macos-universal.zip.sha256
 shasum -a 256 -c ssh-tunnel-keeper-vX.Y.Z-macos-universal.dmg.sha256
-sha256sum -c ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.tar.gz.sha256
+sha256sum -c ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage.sha256
+sha256sum -c ssh-tunnel-keeper-vX.Y.Z-linux-x86_64-cli.tar.gz.sha256
 ```
 
 The automated macOS release currently uses ad-hoc signing rather than Apple Developer ID signing and notarization. Gatekeeper may therefore display a warning on first launch. Developer ID signing and notarization should be added to the Release workflow before broad public distribution.
 
-The Linux GUI uses the system WebKitGTK runtime. On Debian or Ubuntu, install these packages before running or building the GUI:
+The Linux AppImage bundles the GTK and WebKitGTK runtime libraries used by the GUI. After downloading it:
+
+```bash
+chmod +x ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage
+./ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage
+```
+
+Some Linux distributions require the FUSE 2 compatibility package to mount AppImages. When FUSE is unavailable, start the same package with `APPIMAGE_EXTRACT_AND_RUN=1 ./ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage`.
+
+Building the raw Linux GUI executable from source still requires the development packages:
 
 ```bash
 sudo apt-get update
@@ -113,6 +124,13 @@ Build outputs:
 - Windows CLI: `target/release/stk.exe`
 - Linux GUI: `crates/stk-gui/target/release/stk-gui`
 - Windows GUI: `crates/stk-gui/target/release/stk-gui.exe`
+
+On Linux, package the release binaries as an AppImage with:
+
+```bash
+sudo apt-get install -y desktop-file-utils patchelf pkg-config
+./scripts/build-linux-appimage.sh
+```
 
 On macOS, use the packaging script to create a standard `.app` bundle instead of opening the raw executable from Finder:
 
@@ -519,8 +537,8 @@ Regenerate all platform icon resources after changing the SVG sources:
 
 ## CI and Releases
 
-- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs formatting, Clippy, tests, Linux/macOS/Windows release builds, and a macOS DMG packaging check on pushes and pull requests.
-- [`.github/workflows/release.yml`](.github/workflows/release.yml) builds the platform archives and universal macOS DMG, generates SHA-256 files, and creates a GitHub Release for a pushed `v*` tag.
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs formatting, Clippy, tests, Linux/macOS/Windows release builds, a Linux AppImage execution check, and a macOS DMG packaging check on pushes and pull requests.
+- [`.github/workflows/release.yml`](.github/workflows/release.yml) builds the Linux AppImage, platform CLI archives, and universal macOS DMG, generates SHA-256 files, and creates a GitHub Release for a pushed `v*` tag.
 - [`.github/release.yml`](.github/release.yml) configures categories for GitHub-generated release notes.
 
 Before publishing a version, update:

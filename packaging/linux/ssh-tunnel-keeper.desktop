@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=SSH Tunnel Keeper
+Comment=Reliable SSH proxies and tunnel management
+Exec=stk-gui
+Icon=ssh-tunnel-keeper
+Terminal=false
+Categories=Network;Utility;
+StartupWMClass=stk-gui

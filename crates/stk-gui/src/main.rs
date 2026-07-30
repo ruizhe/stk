@@ -778,8 +778,20 @@ fn activate_macos_application() {
 fn activate_macos_application() {}
 
 fn create_tray_icon() -> TrayIcon {
-    let (rgba, width, height) = decode_icon(include_bytes!("../assets/stk-tray-icon.png"));
+    let (rgba, width, height) = decode_icon(tray_icon_bytes());
     TrayIcon::from_rgba(rgba, width, height).expect("tray icon pixels must be valid")
+}
+
+fn tray_icon_bytes() -> &'static [u8] {
+    #[cfg(target_os = "macos")]
+    {
+        include_bytes!("../assets/stk-tray-icon.png")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Windows and Linux do not recolor macOS-style black template icons.
+        include_bytes!("../assets/stk-icon-64.png")
+    }
 }
 
 fn create_window_icon() -> dioxus::desktop::tao::window::Icon {
@@ -828,8 +840,16 @@ mod tests {
         let (_, width, height) = decode_icon(include_bytes!("../assets/stk-icon-64.png"));
         assert_eq!((width, height), (64, 64));
 
-        let (_, width, height) = decode_icon(include_bytes!("../assets/stk-tray-icon.png"));
-        assert_eq!((width, height), (22, 22));
+        let (_, width, height) = decode_icon(include_bytes!("../assets/stk-icon-256.png"));
+        assert_eq!((width, height), (256, 256));
+
+        let (_, width, height) = decode_icon(tray_icon_bytes());
+        let expected = if cfg!(target_os = "macos") {
+            (22, 22)
+        } else {
+            (64, 64)
+        };
+        assert_eq!((width, height), expected);
     }
 
     #[test]
