@@ -3,7 +3,7 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 GUI_BINARY=${1:-"$ROOT/crates/stk-gui/target/release/stk-gui"}
-OUTPUT=${2:-"$ROOT/dist/SSH-Tunnel-Keeper-linux-x86_64.AppImage"}
+OUTPUT=${2:-}
 
 if [ "$(uname -s)" != "Linux" ]; then
     echo "AppImage packaging must run on Linux" >&2
@@ -13,12 +13,27 @@ fi
 case "$(uname -m)" in
     x86_64)
         TOOL_ARCH=x86_64
+        LIB_ARCH=x86_64-linux-gnu
+        APPIMAGE_RUNTIME_SHA256=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+        APPIMAGE_RUNTIME_DIGEST_OFFSET=932096
+        APPIMAGE_RUNTIME_DIGEST_SIZE=16
+        ;;
+    aarch64 | arm64)
+        TOOL_ARCH=aarch64
+        LIB_ARCH=aarch64-linux-gnu
+        APPIMAGE_RUNTIME_SHA256=00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444
+        APPIMAGE_RUNTIME_DIGEST_OFFSET=923920
+        APPIMAGE_RUNTIME_DIGEST_SIZE=16
         ;;
     *)
         echo "unsupported AppImage architecture: $(uname -m)" >&2
         exit 1
         ;;
 esac
+
+if [ -z "$OUTPUT" ]; then
+    OUTPUT="$ROOT/dist/stk-linux-$TOOL_ARCH.appimage"
+fi
 
 if [ ! -x "$GUI_BINARY" ]; then
     echo "required executable does not exist: $GUI_BINARY" >&2
@@ -102,14 +117,6 @@ download_tool \
     "https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-$TOOL_ARCH" \
     "$APPIMAGE_RUNTIME"
 
-case "$TOOL_ARCH" in
-    x86_64)
-        APPIMAGE_RUNTIME_SHA256=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
-        APPIMAGE_RUNTIME_DIGEST_OFFSET=932096
-        APPIMAGE_RUNTIME_DIGEST_SIZE=16
-        ;;
-esac
-
 runtime_sha256=$(sha256sum "$APPIMAGE_RUNTIME" | awk '{print $1}')
 if [ "$runtime_sha256" != "$APPIMAGE_RUNTIME_SHA256" ]; then
     echo "AppImage runtime checksum mismatch: $APPIMAGE_RUNTIME" >&2
@@ -141,7 +148,7 @@ for relative in \
 do
     found=false
     for base in \
-        /usr/lib/x86_64-linux-gnu \
+        "/usr/lib/$LIB_ARCH" \
         /usr/lib64 \
         /usr/lib \
         /usr/libexec

@@ -169,10 +169,23 @@ jobs:
         include:
           - platform: Linux x86_64
             os: ubuntu-22.04
+            arch: x86_64
+            lib_arch: x86_64-linux-gnu
+            runtime_sha256: 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+          - platform: Linux aarch64
+            os: ubuntu-22.04-arm
+            arch: aarch64
+            lib_arch: aarch64-linux-gnu
+            runtime_sha256: 00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444
           - platform: macOS
             os: macos-latest
+            arch: universal
           - platform: Windows x86_64
             os: windows-latest
+            arch: x86_64
+          - platform: Windows aarch64
+            os: windows-11-arm
+            arch: aarch64
 
     steps:
       - name: Check out repository
@@ -204,7 +217,7 @@ jobs:
           workspaces: |
             . -> target
             crates/stk-gui -> crates/stk-gui/target
-          shared-key: ${{ runner.os }}-release
+          shared-key: ${{ runner.os }}-${{ matrix.arch }}-release
 
       - name: Build CLI
         run: cargo build --release -p stk-cli --locked
@@ -228,9 +241,11 @@ jobs:
       - name: Build Linux AppImage
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          appimage="dist/SSH-Tunnel-Keeper-linux-x86_64.AppImage"
+          appimage="dist/stk-linux-${ARCH}.appimage"
           ./scripts/build-linux-appimage.sh \
             crates/stk-gui/target/release/stk-gui \
             "$appimage"
@@ -238,19 +253,22 @@ jobs:
       - name: Verify Linux AppImage runtime
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          LIB_ARCH: ${{ matrix.lib_arch }}
+          RUNTIME_SHA256: ${{ matrix.runtime_sha256 }}
         run: |
           set -euo pipefail
-          appimage="dist/SSH-Tunnel-Keeper-linux-x86_64.AppImage"
-          runtime="target/appimage-tools/runtime-x86_64-20251108"
+          appimage="dist/stk-linux-${ARCH}.appimage"
+          runtime="target/appimage-tools/runtime-${ARCH}-20251108"
           appdir="target/appimage/SSH_Tunnel_Keeper.AppDir"
-          expected_runtime_sha256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
-          test "$(sha256sum "$runtime" | awk '{print $1}')" = "$expected_runtime_sha256"
+          test "$(sha256sum "$runtime" | awk '{print $1}')" = "$RUNTIME_SHA256"
           test "$("$appimage" --appimage-offset)" = "$(stat -c %s "$runtime")"
           test -e "$appdir/usr/lib/libgtk-3.so.0"
           test -e "$appdir/usr/lib/libwebkit2gtk-4.1.so.0"
           test -e "$appdir/usr/lib/libayatana-appindicator3.so.1"
-          test -x "$appdir/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitNetworkProcess"
-          test -x "$appdir/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitWebProcess"
+          test -x "$appdir/usr/lib/${LIB_ARCH}/webkit2gtk-4.1/WebKitNetworkProcess"
+          test -x "$appdir/usr/lib/${LIB_ARCH}/webkit2gtk-4.1/WebKitWebProcess"
           sha256sum "$appimage" > "$appimage.sha256"
           sha256sum --check "$appimage.sha256"
           APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --help >/dev/null
@@ -258,54 +276,58 @@ jobs:
       - name: Verify AppImage extraction on Ubuntu 22.04
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          appimage="dist/SSH-Tunnel-Keeper-linux-x86_64.AppImage"
+          appimage="dist/stk-linux-${ARCH}.appimage"
           docker run --rm \
             -e APPIMAGE_EXTRACT_AND_RUN=1 \
-            -v "$PWD/$appimage:/opt/stk.AppImage:ro" \
+            -v "$PWD/$appimage:/opt/stk.appimage:ro" \
             ubuntu:22.04 \
             sh -eu -c '
               apt-get update >/dev/null
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
                 libwebkit2gtk-4.1-0 librsvg2-2 libxdo3 >/dev/null
-              /opt/stk.AppImage --help
+              /opt/stk.appimage --help
             '
 
       - name: Verify AppImage extraction on Ubuntu 24.04
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          appimage="dist/SSH-Tunnel-Keeper-linux-x86_64.AppImage"
+          appimage="dist/stk-linux-${ARCH}.appimage"
           docker run --rm \
             -e APPIMAGE_EXTRACT_AND_RUN=1 \
-            -v "$PWD/$appimage:/opt/stk.AppImage:ro" \
+            -v "$PWD/$appimage:/opt/stk.appimage:ro" \
             ubuntu:24.04 \
             sh -eu -c '
               apt-get update >/dev/null
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
                 libwebkit2gtk-4.1-0 librsvg2-2 libxdo3 >/dev/null
-              /opt/stk.AppImage --help
+              /opt/stk.appimage --help
             '
 
       - name: Verify AppImage extraction on Arch Linux
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.arch == 'x86_64'
         shell: bash
         run: |
           set -euo pipefail
-          appimage="dist/SSH-Tunnel-Keeper-linux-x86_64.AppImage"
+          appimage="dist/stk-linux-x86_64.appimage"
           docker run --rm \
             -e APPIMAGE_EXTRACT_AND_RUN=1 \
-            -v "$PWD/$appimage:/opt/stk.AppImage:ro" \
+            -v "$PWD/$appimage:/opt/stk.appimage:ro" \
             archlinux:base \
             sh -eu -c '
               sed -i "s/^#DisableSandboxSyscalls/DisableSandboxSyscalls/" /etc/pacman.conf
               pacman -Sy --noconfirm --needed \
                 gtk3 librsvg webkit2gtk-4.1 xdotool >/dev/null
-              /opt/stk.AppImage --help
+              /opt/stk.appimage --help
               cd /tmp
-              /opt/stk.AppImage --appimage-extract >/dev/null
+              /opt/stk.appimage --appimage-extract >/dev/null
               test -e squashfs-root/usr/lib/libayatana-appindicator3.so.1
               LD_LIBRARY_PATH="$PWD/squashfs-root/usr/lib" \
                 ldd squashfs-root/usr/lib/libayatana-appindicator3.so.1 \
@@ -321,4 +343,4 @@ jobs:
           app="$(./scripts/build-macos-app.sh)"
           ./scripts/create-macos-dmg.sh \
             "$app" \
-            "dist/ssh-tunnel-keeper-ci-macos-${{ runner.arch }}.dmg"
+            "dist/stk-ci-macos-${{ runner.arch }}.dmg"

@@ -70,17 +70,19 @@ Release assets include self-contained GUI packages and separate CLI archives:
 
 | Platform | Archive | Contents |
 | --- | --- | --- |
-| Linux x86_64 GUI | `SSH-Tunnel-Keeper-linux-x86_64.AppImage` | Portable GUI with GTK/WebKitGTK runtime libraries |
-| Linux x86_64 CLI | `stk-linux-x86_64-musl.tar.gz` | Statically linked musl `stk`, systemd unit, and examples |
-| Linux aarch64 CLI | `stk-linux-aarch64-musl.tar.gz` | Statically linked musl `stk`, systemd unit, and examples |
-| Windows x86_64 | `ssh-tunnel-keeper-vX.Y.Z-windows-x86_64.zip` | `stk.exe`, `stk-gui.exe`, and examples |
-| macOS universal GUI | `ssh-tunnel-keeper-vX.Y.Z-macos-universal.dmg` | Installable `SSH Tunnel Keeper.app` image |
-| macOS universal CLI + GUI | `ssh-tunnel-keeper-vX.Y.Z-macos-universal.zip` | `stk`, `SSH Tunnel Keeper.app`, and examples |
+| Linux x86_64 GUI | `stk-vX.Y.Z-linux-x86_64.appimage` | Portable GUI with GTK/WebKitGTK runtime libraries |
+| Linux aarch64 GUI | `stk-vX.Y.Z-linux-aarch64.appimage` | Portable ARM64 GUI with GTK/WebKitGTK runtime libraries |
+| Linux x86_64 CLI | `stk-vX.Y.Z-linux-x86_64-musl.tar.gz` | Statically linked musl `stk`, systemd unit, and examples |
+| Linux aarch64 CLI | `stk-vX.Y.Z-linux-aarch64-musl.tar.gz` | Statically linked musl `stk`, systemd unit, and examples |
+| Windows x86_64 | `stk-vX.Y.Z-windows-x86_64.zip` | `stk.exe`, `stk-gui.exe`, and examples |
+| Windows aarch64 | `stk-vX.Y.Z-windows-aarch64.zip` | ARM64 `stk.exe`, `stk-gui.exe`, and examples |
+| macOS universal GUI | `stk-vX.Y.Z-macos-universal.dmg` | Installable `SSH Tunnel Keeper.app` image |
+| macOS universal CLI + GUI | `stk-vX.Y.Z-macos-universal.zip` | `stk`, `SSH Tunnel Keeper.app`, and examples |
 
-Every release includes one `SHA256SUMS` file covering all uploaded packages. After downloading the packages you need and `SHA256SUMS`, verify the available files with:
+Every release includes one `stk-vX.Y.Z-sha256sums.txt` file covering all uploaded packages. After downloading the packages you need and the checksum file, verify the available files with:
 
 ```bash
-sha256sum --ignore-missing --check SHA256SUMS
+sha256sum --ignore-missing --check stk-v*-sha256sums.txt
 ```
 
 The automated macOS release currently uses ad-hoc signing rather than Apple Developer ID signing and notarization. Gatekeeper may therefore display a warning on first launch. Developer ID signing and notarization should be added to the Release workflow before broad public distribution.
@@ -88,21 +90,21 @@ The automated macOS release currently uses ad-hoc signing rather than Apple Deve
 The two Linux CLI archives contain musl executables with no shared-library dependencies. They can run independently of the host's glibc version:
 
 ```bash
-tar -xzf stk-linux-x86_64-musl.tar.gz
-./stk-linux-x86_64-musl/stk --help
+tar -xzf stk-v*-linux-x86_64-musl.tar.gz
+./stk-v*-linux-x86_64-musl/stk --help
 ```
 
 The Linux GUI AppImage bundles the GTK and WebKitGTK runtime libraries used by the application. The GUI payload is not a completely statically linked executable. After downloading it:
 
 ```bash
-chmod +x SSH-Tunnel-Keeper-linux-x86_64.AppImage
-./SSH-Tunnel-Keeper-linux-x86_64.AppImage
+chmod +x stk-v*-linux-x86_64.appimage
+./stk-v*-linux-x86_64.appimage
 ```
 
 The AppImage uses a statically linked type-2 runtime, so the host does not need to provide `libfuse.so.2`. Direct mounting still requires a usable `/dev/fuse` device and a `fusermount` or `fusermount3` helper. In containers or other restricted environments where FUSE mounting is unavailable, use extraction mode:
 
 ```bash
-APPIMAGE_EXTRACT_AND_RUN=1 ./SSH-Tunnel-Keeper-linux-x86_64.AppImage
+APPIMAGE_EXTRACT_AND_RUN=1 ./stk-v*-linux-x86_64.appimage
 ```
 
 Building the raw Linux GUI executable from source still requires the development packages:
@@ -588,7 +590,7 @@ Regenerate all platform icon resources after changing the SVG sources:
 ## CI and Releases
 
 - [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs formatting, Clippy, tests, platform release builds, static musl CLI checks for x86_64 and aarch64, AppImage extraction tests on Ubuntu 22.04/24.04 and Arch Linux, and macOS DMG packaging checks.
-- [`.github/workflows/release.yml`](.github/workflows/release.yml) publishes both static Linux CLI archives, the Linux x86_64 AppImage, Windows and universal macOS packages, a consolidated `SHA256SUMS`, and the GitHub Release for a pushed `v*` tag.
+- [`.github/workflows/release.yml`](.github/workflows/release.yml) publishes x86_64 and aarch64 static Linux CLI archives, x86_64 and aarch64 Linux AppImages, x86_64 and aarch64 Windows packages, universal macOS packages, a versioned checksum file, and the GitHub Release for a pushed `v*` tag.
 - [`.github/release.yml`](.github/release.yml) configures categories for GitHub-generated release notes.
 
 Before publishing a version, update:

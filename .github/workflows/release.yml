@@ -112,10 +112,22 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   linux-appimage:
-    name: Package Linux x86_64 AppImage
+    name: Package Linux ${{ matrix.arch }} AppImage
     needs: validate
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+            lib_arch: x86_64-linux-gnu
+            runtime_sha256: 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            lib_arch: aarch64-linux-gnu
+            runtime_sha256: 00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444
 
     steps:
       - name: Check out release tag
@@ -147,7 +159,7 @@ jobs:
         with:
           workspaces: |
             crates/stk-gui -> crates/stk-gui/target
-          shared-key: linux-appimage-release
+          shared-key: linux-appimage-${{ matrix.arch }}-release
 
       - name: Build GUI
         run: >-
@@ -159,24 +171,28 @@ jobs:
 
       - name: Create Linux AppImage
         shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          LIB_ARCH: ${{ matrix.lib_arch }}
+          RUNTIME_SHA256: ${{ matrix.runtime_sha256 }}
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
 
-          appimage="dist/SSH-Tunnel-Keeper-linux-x86_64.AppImage"
+          appimage="dist/stk-v${VERSION}-linux-${ARCH}.appimage"
           ./scripts/build-linux-appimage.sh \
             crates/stk-gui/target/release/stk-gui \
             "$appimage"
 
-          runtime="target/appimage-tools/runtime-x86_64-20251108"
+          runtime="target/appimage-tools/runtime-${ARCH}-20251108"
           appdir="target/appimage/SSH_Tunnel_Keeper.AppDir"
-          expected_runtime_sha256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
-          test "$(sha256sum "$runtime" | awk '{print $1}')" = "$expected_runtime_sha256"
+          test "$(sha256sum "$runtime" | awk '{print $1}')" = "$RUNTIME_SHA256"
           test "$("$appimage" --appimage-offset)" = "$(stat -c %s "$runtime")"
           test -e "$appdir/usr/lib/libgtk-3.so.0"
           test -e "$appdir/usr/lib/libwebkit2gtk-4.1.so.0"
           test -e "$appdir/usr/lib/libayatana-appindicator3.so.1"
-          test -x "$appdir/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitNetworkProcess"
-          test -x "$appdir/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitWebProcess"
+          test -x "$appdir/usr/lib/${LIB_ARCH}/webkit2gtk-4.1/WebKitNetworkProcess"
+          test -x "$appdir/usr/lib/${LIB_ARCH}/webkit2gtk-4.1/WebKitWebProcess"
           checksum="$(sha256sum "$appimage")"
           printf '%s\n' "$checksum" | sha256sum --check
 
@@ -185,39 +201,41 @@ jobs:
           for ubuntu in 22.04 24.04; do
             docker run --rm \
               -e APPIMAGE_EXTRACT_AND_RUN=1 \
-              -v "$PWD/$appimage:/opt/stk.AppImage:ro" \
+              -v "$PWD/$appimage:/opt/stk.appimage:ro" \
               "ubuntu:$ubuntu" \
               sh -eu -c '
                 apt-get update >/dev/null
                 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
                   libwebkit2gtk-4.1-0 librsvg2-2 libxdo3 >/dev/null
-                /opt/stk.AppImage --help >/dev/null
+                /opt/stk.appimage --help >/dev/null
               '
           done
 
-          docker run --rm \
-            -e APPIMAGE_EXTRACT_AND_RUN=1 \
-            -v "$PWD/$appimage:/opt/stk.AppImage:ro" \
-            archlinux:base \
-            sh -eu -c '
-              sed -i "s/^#DisableSandboxSyscalls/DisableSandboxSyscalls/" /etc/pacman.conf
-              pacman -Sy --noconfirm --needed \
-                gtk3 librsvg webkit2gtk-4.1 xdotool >/dev/null
-              /opt/stk.AppImage --help >/dev/null
-              cd /tmp
-              /opt/stk.AppImage --appimage-extract >/dev/null
-              test -e squashfs-root/usr/lib/libayatana-appindicator3.so.1
-              LD_LIBRARY_PATH="$PWD/squashfs-root/usr/lib" \
-                ldd squashfs-root/usr/lib/libayatana-appindicator3.so.1 \
-                > /tmp/stk-appindicator-ldd.txt
-              ! grep -q "not found" /tmp/stk-appindicator-ldd.txt
-            '
+          if [[ "$ARCH" == x86_64 ]]; then
+            docker run --rm \
+              -e APPIMAGE_EXTRACT_AND_RUN=1 \
+              -v "$PWD/$appimage:/opt/stk.appimage:ro" \
+              archlinux:base \
+              sh -eu -c '
+                sed -i "s/^#DisableSandboxSyscalls/DisableSandboxSyscalls/" /etc/pacman.conf
+                pacman -Sy --noconfirm --needed \
+                  gtk3 librsvg webkit2gtk-4.1 xdotool >/dev/null
+                /opt/stk.appimage --help >/dev/null
+                cd /tmp
+                /opt/stk.appimage --appimage-extract >/dev/null
+                test -e squashfs-root/usr/lib/libayatana-appindicator3.so.1
+                LD_LIBRARY_PATH="$PWD/squashfs-root/usr/lib" \
+                  ldd squashfs-root/usr/lib/libayatana-appindicator3.so.1 \
+                  > /tmp/stk-appindicator-ldd.txt
+                ! grep -q "not found" /tmp/stk-appindicator-ldd.txt
+              '
+          fi
 
       - name: Upload Linux AppImage
         uses: actions/upload-artifact@v4
         with:
-          name: linux-appimage-x86_64
-          path: dist/SSH-Tunnel-Keeper-linux-x86_64.AppImage
+          name: linux-appimage-${{ matrix.arch }}
+          path: dist/stk-v${{ needs.validate.outputs.version }}-linux-${{ matrix.arch }}.appimage
           if-no-files-found: error
           retention-days: 7
 
@@ -285,6 +303,7 @@ jobs:
           ARCH: ${{ matrix.arch }}
           TARGET: ${{ matrix.target }}
           RUNNER: ${{ matrix.runner }}
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
 
@@ -305,7 +324,7 @@ jobs:
             "$RUNNER" "$binary" --help >/dev/null
           fi
 
-          package="stk-linux-${ARCH}-musl"
+          package="stk-v${VERSION}-linux-${ARCH}-musl"
           stage="dist/${package}"
           mkdir -p "$stage/examples" "$stage/packaging/systemd"
 
@@ -323,15 +342,23 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-cli-${{ matrix.arch }}-musl
-          path: dist/stk-linux-${{ matrix.arch }}-musl.tar.gz
+          path: dist/stk-v${{ needs.validate.outputs.version }}-linux-${{ matrix.arch }}-musl.tar.gz
           if-no-files-found: error
           retention-days: 7
 
   windows:
-    name: Package Windows x86_64
+    name: Package Windows ${{ matrix.arch }}
     needs: validate
-    runs-on: windows-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-latest
+          - arch: aarch64
+            runner: windows-11-arm
 
     steps:
       - name: Check out release tag
@@ -350,7 +377,7 @@ jobs:
           workspaces: |
             . -> target
             crates/stk-gui -> crates/stk-gui/target
-          shared-key: windows-release
+          shared-key: windows-${{ matrix.arch }}-release
 
       - name: Build CLI
         run: cargo build --release -p stk-cli --locked
@@ -366,10 +393,11 @@ jobs:
       - name: Create release archive
         shell: pwsh
         env:
+          ARCH: ${{ matrix.arch }}
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           $ErrorActionPreference = "Stop"
-          $package = "ssh-tunnel-keeper-v$env:VERSION-windows-x86_64"
+          $package = "stk-v$env:VERSION-windows-$env:ARCH"
           $stage = Join-Path "dist" $package
           $examples = Join-Path $stage "examples"
 
@@ -386,7 +414,7 @@ jobs:
       - name: Upload Windows archive
         uses: actions/upload-artifact@v4
         with:
-          name: windows-x86_64
+          name: windows-${{ matrix.arch }}
           path: dist/*.zip
           if-no-files-found: error
           retention-days: 7
@@ -449,7 +477,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          package="ssh-tunnel-keeper-v${VERSION}-macos-universal"
+          package="stk-v${VERSION}-macos-universal"
           stage="dist/${package}"
           app="$stage/SSH Tunnel Keeper.app"
           contents="$app/Contents"
@@ -513,18 +541,21 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Generate SHA256SUMS
+      - name: Generate release checksums
         shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
           checksum_file="$(mktemp)"
+          release_checksum="stk-v${VERSION}-sha256sums.txt"
           trap 'rm -f "$checksum_file"' EXIT
           cd dist
-          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+          find . -maxdepth 1 -type f ! -name "$release_checksum" -printf '%f\0' \
             | sort -z \
             | xargs -0 sha256sum > "$checksum_file"
-          mv "$checksum_file" SHA256SUMS
-          sha256sum --check SHA256SUMS
+          mv "$checksum_file" "$release_checksum"
+          sha256sum --check "$release_checksum"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
