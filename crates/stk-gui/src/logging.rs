@@ -4,7 +4,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tracing::{
@@ -60,15 +60,12 @@ impl GuiLogCollector {
     }
 
     fn push(&self, mut entry: GuiLogEntry) {
-        let mut next_sequence = self
-            .next_sequence
-            .lock()
-            .expect("GUI log sequence lock poisoned");
+        let mut next_sequence = lock_or_recover(&self.next_sequence);
         entry.sequence = *next_sequence;
         *next_sequence = next_sequence.saturating_add(1);
         drop(next_sequence);
 
-        let mut entries = self.entries.lock().expect("GUI log buffer lock poisoned");
+        let mut entries = lock_or_recover(&self.entries);
         entries.push_front(entry);
         while entries.len() > MEMORY_LOG_LIMIT {
             entries.pop_back();
@@ -76,21 +73,13 @@ impl GuiLogCollector {
     }
 
     fn snapshot(&self) -> Vec<GuiLogEntry> {
-        self.entries
-            .lock()
-            .expect("GUI log buffer lock poisoned")
-            .iter()
-            .cloned()
-            .collect()
+        lock_or_recover(&self.entries).iter().cloned().collect()
     }
 
     fn clear(&self) {
-        self.entries
-            .lock()
-            .expect("GUI log buffer lock poisoned")
-            .clear();
+        lock_or_recover(&self.entries).clear();
         if let Some(file) = &self.file {
-            let file = file.lock().expect("GUI log file lock poisoned");
+            let file = lock_or_recover(file);
             let _ = file.set_len(0);
         }
     }
@@ -235,9 +224,7 @@ impl<'a> MakeWriter<'a> for GuiLogMakeWriter {
 impl Write for GuiLogWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         if let Some(file) = &self.file {
-            file.lock()
-                .expect("GUI log file lock poisoned")
-                .write(buffer)
+            lock_or_recover(file).write(buffer)
         } else {
             io::stderr().write(buffer)
         }
@@ -245,7 +232,7 @@ impl Write for GuiLogWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         if let Some(file) = &self.file {
-            file.lock().expect("GUI log file lock poisoned").flush()
+            lock_or_recover(file).flush()
         } else {
             io::stderr().flush()
         }
@@ -277,6 +264,7 @@ pub fn init(log_path: PathBuf) {
     if let Err(error) = result {
         eprintln!("failed to initialize GUI logging: {error}");
     }
+    install_panic_logging();
 }
 
 pub fn snapshot() -> Vec<GuiLogEntry> {
@@ -338,6 +326,34 @@ fn current_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or_default()
+}
+
+fn install_panic_logging() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|location| format!("{}:{}", location.file(), location.line()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let message = info
+            .payload()
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                info.payload()
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_string())
+            })
+            .unwrap_or_else(|| "unknown panic payload".to_string());
+        tracing::error!(%location, %message, "GUI thread panicked");
+        previous(info);
+    }));
+}
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]

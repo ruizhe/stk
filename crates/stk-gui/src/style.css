@@ -165,8 +165,8 @@ textarea:focus-visible {
 }
 
 .workspace {
-    display: grid;
-    grid-template-rows: 66px minmax(0, 1fr);
+    display: flex;
+    flex-direction: column;
     min-width: 0;
     min-height: 0;
 }
@@ -176,10 +176,48 @@ textarea:focus-visible {
     align-items: center;
     justify-content: space-between;
     gap: 20px;
+    flex: 0 0 66px;
     min-width: 0;
     padding: 0 24px;
     background: var(--surface);
     border-bottom: 1px solid var(--border);
+}
+
+.runtime-error-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    flex: 0 0 auto;
+    max-height: 104px;
+    padding: 10px 24px;
+    overflow: auto;
+    color: #8f2d2d;
+    background: var(--red-soft);
+    border-bottom: 1px solid #efc1c1;
+}
+
+.runtime-error-banner > svg {
+    flex: 0 0 18px;
+    margin-top: 1px;
+}
+
+.runtime-error-banner > div {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.runtime-error-banner strong {
+    font-size: 12px;
+}
+
+.runtime-error-banner span {
+    overflow-wrap: anywhere;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    line-height: 1.45;
+    white-space: pre-wrap;
 }
 
 .topbar-title {
@@ -306,10 +344,49 @@ textarea:focus-visible {
 }
 
 .content {
+    flex: 1 1 auto;
     min-width: 0;
     min-height: 0;
     overflow: auto;
     padding: 22px 24px 28px;
+}
+
+.fatal-startup-error {
+    display: grid;
+    place-content: center;
+    width: 100%;
+    height: 100%;
+    padding: 32px;
+    color: var(--text);
+    text-align: center;
+    background: #f4f6f7;
+}
+
+.fatal-startup-error svg {
+    margin: 0 auto 10px;
+    color: var(--red);
+}
+
+.fatal-startup-error h1 {
+    margin: 0;
+    font-size: 18px;
+}
+
+.fatal-startup-error p {
+    max-width: 480px;
+    margin: 8px 0 0;
+    color: var(--text-muted);
+}
+
+.inline-error {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px;
+    color: #8f2d2d;
+    background: var(--red-soft);
+    border: 1px solid #efc1c1;
+    border-radius: 6px;
 }
 
 .overview-page,

@@ -155,7 +155,10 @@ where
 
                 info!(config = %path.display(), force, "validated reload request; replacing runtime generation");
                 let previous_config = active_config.clone();
-                active.stop().await?;
+                if let Err(error) = active.stop().await {
+                    stats::record_error();
+                    warn!(config = %path.display(), error = %format_args!("{error:#}"), "previous runtime generation stopped with an error; continuing reload");
+                }
                 match start_engine(candidate.clone(), profile, handle.clone()).await {
                     Ok(next) => {
                         active = next;

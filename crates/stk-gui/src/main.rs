@@ -1,23 +1,27 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-use clap::Parser;
+use clap::{Parser, error::ErrorKind};
 use dioxus::desktop::trayicon::{
-    DioxusTray, Icon as TrayIcon, init_tray_icon,
+    DioxusTray, Icon as TrayIcon, TrayIconBuilder,
     menu::{Menu, MenuItem, PredefinedMenuItem},
 };
 use dioxus::desktop::{Config, LogicalSize, WindowBuilder, WindowCloseBehaviour};
 #[cfg(target_os = "linux")]
 use std::env;
 use std::{
+    any::Any,
     io,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
 };
 use stk_core::{
     AppConfig, ConfigScope, ControlConfig, ControlEndpoint, RuntimeProfile,
-    RuntimeSnapshotSubscription, default_config_directory, fetch_runtime_snapshot,
-    fetch_traffic_history,
+    default_config_directory, fetch_runtime_snapshot, fetch_traffic_history,
     reload::{
         ReloadControl, ReloadHandle, run_config_file_until_shutdown,
         run_config_file_with_control_until_shutdown,
@@ -29,7 +33,6 @@ use stk_core::{
         set_connection_capture_auto_clear_closed, set_connection_capture_recording,
         traffic_history_snapshot,
     },
-    subscribe_runtime_snapshots,
 };
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
@@ -44,6 +47,7 @@ use gui_config::{GuiConfig, Language};
 
 const TRAY_SHOW_ID: &str = "stk-show";
 const TRAY_RELOAD_ID: &str = "stk-reload";
+const STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -81,7 +85,8 @@ struct SystemTray {
 
 struct GuiRuntimeManager {
     config_path: PathBuf,
-    runtime_error: Arc<Mutex<Option<String>>>,
+    errors: Arc<Mutex<GuiErrors>>,
+    reload_in_progress: AtomicBool,
     state: Mutex<GuiRuntimeState>,
 }
 
@@ -90,6 +95,47 @@ struct GuiRuntimeState {
     reload_handle: Option<ReloadHandle>,
     attached_endpoint: Option<ControlEndpoint>,
     last_snapshot: Option<RuntimeSnapshot>,
+}
+
+#[derive(Debug, Default)]
+struct GuiErrors {
+    runtime: Option<String>,
+    status: Option<String>,
+    action: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GuiErrorKind {
+    Runtime,
+    Status,
+    Action,
+}
+
+impl GuiErrors {
+    fn get_mut(&mut self, kind: GuiErrorKind) -> &mut Option<String> {
+        match kind {
+            GuiErrorKind::Runtime => &mut self.runtime,
+            GuiErrorKind::Status => &mut self.status,
+            GuiErrorKind::Action => &mut self.action,
+        }
+    }
+
+    fn message(&self) -> Option<String> {
+        let mut messages = Vec::new();
+        for message in [
+            self.action.as_deref(),
+            self.runtime.as_deref(),
+            self.status.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !messages.contains(&message) {
+                messages.push(message);
+            }
+        }
+        (!messages.is_empty()).then(|| messages.join("\n"))
+    }
 }
 
 static GUI_CONTEXT: OnceLock<GuiContext> = OnceLock::new();
@@ -117,7 +163,29 @@ fn main() {
             "failed to create default GUI configuration"
         );
     }
-    let args = GuiArgs::parse();
+    let (args, argument_error) = match GuiArgs::try_parse() {
+        Ok(args) => (args, None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            let _ = error.print();
+            return;
+        }
+        Err(error) => {
+            let message = error.to_string();
+            eprintln!("{message}");
+            (
+                GuiArgs {
+                    config: None,
+                    hidden: false,
+                },
+                Some(message),
+            )
+        }
+    };
     let config_path = resolve_config_path(args.config.as_deref(), ConfigScope::User);
     info!(
         config = %config_path.display(),
@@ -130,24 +198,27 @@ fn main() {
         if let Err(error) = run_headless(config_path) {
             error!(error = %format_args!("{error:#}"), "SSH Tunnel Keeper headless runtime failed");
             eprintln!("SSH Tunnel Keeper runtime failed: {error:#}");
-            std::process::exit(1);
         }
         return;
     }
 
     let runtime = Arc::new(GuiRuntimeManager::new(config_path));
-    assert!(
-        GUI_CONTEXT
-            .set(GuiContext {
-                runtime: Arc::clone(&runtime),
-                gui_config_path,
-                gui_config,
-            })
-            .is_ok(),
-        "GUI context must only be initialized once"
-    );
+    if GUI_CONTEXT
+        .set(GuiContext {
+            runtime: Arc::clone(&runtime),
+            gui_config_path,
+            gui_config,
+        })
+        .is_err()
+    {
+        error!("GUI context was initialized more than once");
+        return;
+    }
     if let Err(error) = runtime.start() {
-        runtime.set_error(format!("failed to start GUI runtime thread: {error}"));
+        runtime.set_runtime_error(format!("failed to start GUI runtime thread: {error}"));
+    }
+    if let Some(error) = argument_error {
+        runtime.set_error(format!("invalid GUI arguments; using defaults:\n{error}"));
     }
     dioxus::LaunchBuilder::desktop()
         .with_cfg(desktop_config(args.hidden))
@@ -162,9 +233,15 @@ fn desktop_config(start_hidden: bool) -> Config {
         .with_min_inner_size(LogicalSize::new(620.0, 500.0))
         .with_visible(!start_hidden)
         .with_always_on_top(false);
-    let config = Config::new()
-        .with_window(window)
-        .with_icon(create_window_icon())
+    let config = Config::new().with_window(window);
+    let config = match create_window_icon() {
+        Ok(icon) => config.with_icon(icon),
+        Err(error) => {
+            error!(error = %format_args!("{error:#}"), "failed to load the GUI window icon");
+            config
+        }
+    };
+    let config = config
         .with_close_behaviour(WindowCloseBehaviour::WindowHides)
         .with_exits_when_last_window_closes(false)
         .with_tray_icon_show_window_on_click(true);
@@ -244,7 +321,8 @@ impl GuiRuntimeManager {
     fn new(config_path: PathBuf) -> Self {
         Self {
             config_path,
-            runtime_error: Arc::new(Mutex::new(None)),
+            errors: Arc::new(Mutex::new(GuiErrors::default())),
+            reload_in_progress: AtomicBool::new(false),
             state: Mutex::new(GuiRuntimeState {
                 runtime: None,
                 reload_handle: None,
@@ -255,16 +333,20 @@ impl GuiRuntimeManager {
     }
 
     fn start(&self) -> io::Result<()> {
-        let mut state = self.state.lock().expect("GUI runtime state lock poisoned");
-        state.reload_handle = None;
-        state.runtime = None;
-        state.attached_endpoint = None;
-        state.last_snapshot = None;
-        self.clear_error();
+        let previous_runtime = {
+            let mut state = lock_or_recover(&self.state);
+            state.reload_handle = None;
+            state.attached_endpoint = None;
+            state.last_snapshot = None;
+            state.runtime.take()
+        };
+        drop(previous_runtime);
+        self.clear_all_errors();
 
         let endpoint = self.configured_endpoint().map_err(io::Error::other)?;
         if let Some(snapshot) = probe_runtime(&endpoint) {
             info!(%endpoint, "GUI attached to an existing runtime");
+            let mut state = lock_or_recover(&self.state);
             state.attached_endpoint = Some(endpoint);
             state.last_snapshot = Some(snapshot);
             return Ok(());
@@ -274,126 +356,127 @@ impl GuiRuntimeManager {
         let reload_handle = reload_control.handle();
         let runtime = GuiRuntime::start(
             self.config_path.clone(),
-            Arc::clone(&self.runtime_error),
+            Arc::clone(&self.errors),
             reload_control,
         )?;
+        let mut state = lock_or_recover(&self.state);
         state.reload_handle = Some(reload_handle);
         state.runtime = Some(runtime);
         Ok(())
     }
 
     fn reload_or_restart(self: &Arc<Self>) -> io::Result<()> {
-        let attached_endpoint = self
-            .state
-            .lock()
-            .expect("GUI runtime state lock poisoned")
-            .attached_endpoint
-            .clone();
-        if let Some(endpoint) = attached_endpoint {
-            let manager = Arc::clone(self);
-            thread::Builder::new()
-                .name("stk-gui-control".to_string())
-                .spawn(move || {
-                    let result = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(anyhow::Error::from)
-                        .and_then(|runtime| {
-                            runtime.block_on(async {
-                                tokio::time::timeout(
-                                    std::time::Duration::from_secs(5),
-                                    request_runtime_reload(&endpoint),
-                                )
-                                .await
-                                .map_err(|_| {
-                                    anyhow::anyhow!("timed out requesting runtime reload")
-                                })?
-                            })
-                        });
-                    match result {
-                        Ok(()) => manager.clear_error(),
-                        Err(error) => manager.set_error(format!(
-                            "failed to reload attached runtime at {endpoint}: {error:#}"
-                        )),
-                    }
-                })?;
+        if self
+            .reload_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return Ok(());
         }
-
-        let should_restart = {
-            let state = self.state.lock().expect("GUI runtime state lock poisoned");
-            let running = state
-                .runtime
-                .as_ref()
-                .is_some_and(|runtime| !runtime.is_finished());
-            !running
-                || !state
-                    .reload_handle
-                    .as_ref()
-                    .is_some_and(ReloadHandle::request_reload)
-        };
-        if should_restart {
-            self.start()?;
+        let manager = Arc::clone(self);
+        let spawn = thread::Builder::new()
+            .name("stk-gui-reload".to_string())
+            .spawn(move || {
+                let outcome = catch_unwind(AssertUnwindSafe(|| manager.reload_or_restart_inner()));
+                match outcome {
+                    Ok(Ok(())) => manager.clear_error(),
+                    Ok(Err(error)) => {
+                        manager.set_error(format!("failed to reload runtime: {error:#}"));
+                    }
+                    Err(payload) => manager.set_error(format!(
+                        "runtime reload panicked: {}",
+                        panic_payload_message(payload.as_ref())
+                    )),
+                }
+                manager.reload_in_progress.store(false, Ordering::Release);
+            });
+        if let Err(error) = spawn {
+            self.reload_in_progress.store(false, Ordering::Release);
+            return Err(error);
         }
         Ok(())
     }
 
-    async fn status_subscription(&self) -> anyhow::Result<RuntimeSnapshotSubscription> {
-        let attached_endpoint = self
-            .state
-            .lock()
-            .expect("GUI runtime state lock poisoned")
-            .attached_endpoint
-            .clone();
-        let configured_endpoint = self.configured_endpoint()?;
-        let endpoint = attached_endpoint
-            .clone()
-            .unwrap_or_else(|| configured_endpoint.clone());
-        let primary = subscribe_status_endpoint(&endpoint).await;
-        match primary {
-            Ok(subscription) => {
-                self.clear_error();
-                Ok(subscription)
+    fn reload_or_restart_inner(&self) -> anyhow::Result<()> {
+        let attached_endpoint = lock_or_recover(&self.state).attached_endpoint.clone();
+        if let Some(endpoint) = attached_endpoint {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    request_runtime_reload(&endpoint),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("timed out requesting runtime reload at {endpoint}")
+                })??;
+                Ok(())
+            })
+        } else {
+            let reload_requested = {
+                let state = lock_or_recover(&self.state);
+                let running = state
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| !runtime.is_finished());
+                running
+                    && state
+                        .reload_handle
+                        .as_ref()
+                        .is_some_and(ReloadHandle::request_reload)
+            };
+            if reload_requested {
+                Ok(())
+            } else {
+                self.start().map_err(anyhow::Error::from)
             }
-            Err(primary_error)
-                if attached_endpoint.is_some() && configured_endpoint != endpoint =>
-            {
-                if let Ok(subscription) = subscribe_status_endpoint(&configured_endpoint).await {
-                    self.state
-                        .lock()
-                        .expect("GUI runtime state lock poisoned")
-                        .attached_endpoint = Some(configured_endpoint);
-                    self.clear_error();
-                    return Ok(subscription);
+        }
+    }
+
+    async fn status_snapshot(&self) -> anyhow::Result<RuntimeSnapshot> {
+        let attached_endpoint = lock_or_recover(&self.state).attached_endpoint.clone();
+        let Some(endpoint) = attached_endpoint else {
+            self.clear_error_kind(GuiErrorKind::Status);
+            return Ok(runtime_snapshot());
+        };
+        let configured_endpoint = self.configured_endpoint().map_err(|error| {
+            let message = format!("failed to resolve runtime control endpoint: {error:#}");
+            self.set_status_error(message.clone());
+            anyhow::anyhow!(message)
+        })?;
+        let primary = fetch_status_endpoint(&endpoint).await;
+        match primary {
+            Ok(snapshot) => {
+                self.clear_error_kind(GuiErrorKind::Status);
+                Ok(snapshot)
+            }
+            Err(primary_error) if configured_endpoint != endpoint => {
+                if let Ok(snapshot) = fetch_status_endpoint(&configured_endpoint).await {
+                    lock_or_recover(&self.state).attached_endpoint = Some(configured_endpoint);
+                    self.clear_error_kind(GuiErrorKind::Status);
+                    return Ok(snapshot);
                 }
                 let message =
-                    format!("failed to subscribe to runtime at {endpoint}: {primary_error:#}");
-                self.set_error(message.clone());
+                    format!("failed to fetch runtime status at {endpoint}: {primary_error:#}");
+                self.set_status_error(message.clone());
                 Err(anyhow::anyhow!(message))
             }
             Err(error) => {
-                let message = format!("failed to subscribe to runtime at {endpoint}: {error:#}");
-                self.set_error(message.clone());
+                let message = format!("failed to fetch runtime status at {endpoint}: {error:#}");
+                self.set_status_error(message.clone());
                 Err(anyhow::anyhow!(message))
             }
         }
     }
 
-    fn accept_stream_snapshot(&self, snapshot: RuntimeSnapshot) {
-        self.state
-            .lock()
-            .expect("GUI runtime state lock poisoned")
-            .last_snapshot = Some(snapshot);
-        self.clear_error();
+    fn accept_snapshot(&self, snapshot: RuntimeSnapshot) {
+        lock_or_recover(&self.state).last_snapshot = Some(snapshot);
     }
 
     async fn traffic_history(&self) -> Option<TrafficHistorySnapshot> {
-        let attached_endpoint = self
-            .state
-            .lock()
-            .expect("GUI runtime state lock poisoned")
-            .attached_endpoint
-            .clone();
+        let attached_endpoint = lock_or_recover(&self.state).attached_endpoint.clone();
         let Some(endpoint) = attached_endpoint else {
             return Some(traffic_history_snapshot());
         };
@@ -407,12 +490,7 @@ impl GuiRuntimeManager {
     }
 
     async fn set_connection_capture_recording(&self, recording: bool) -> anyhow::Result<()> {
-        let attached_endpoint = self
-            .state
-            .lock()
-            .expect("GUI runtime state lock poisoned")
-            .attached_endpoint
-            .clone();
+        let attached_endpoint = lock_or_recover(&self.state).attached_endpoint.clone();
         let Some(endpoint) = attached_endpoint else {
             set_connection_capture_recording(recording);
             self.clear_error();
@@ -429,12 +507,7 @@ impl GuiRuntimeManager {
     }
 
     async fn clear_captured_connections(&self) -> anyhow::Result<()> {
-        let attached_endpoint = self
-            .state
-            .lock()
-            .expect("GUI runtime state lock poisoned")
-            .attached_endpoint
-            .clone();
+        let attached_endpoint = lock_or_recover(&self.state).attached_endpoint.clone();
         let Some(endpoint) = attached_endpoint else {
             clear_captured_connections();
             self.clear_error();
@@ -451,12 +524,7 @@ impl GuiRuntimeManager {
     }
 
     async fn set_connection_capture_auto_clear_closed(&self, enabled: bool) -> anyhow::Result<()> {
-        let attached_endpoint = self
-            .state
-            .lock()
-            .expect("GUI runtime state lock poisoned")
-            .attached_endpoint
-            .clone();
+        let attached_endpoint = lock_or_recover(&self.state).attached_endpoint.clone();
         let Some(endpoint) = attached_endpoint else {
             set_connection_capture_auto_clear_closed(enabled);
             self.clear_error();
@@ -473,9 +541,7 @@ impl GuiRuntimeManager {
     }
 
     fn initial_snapshot(&self) -> RuntimeSnapshot {
-        self.state
-            .lock()
-            .expect("GUI runtime state lock poisoned")
+        lock_or_recover(&self.state)
             .last_snapshot
             .clone()
             .unwrap_or_else(runtime_snapshot)
@@ -496,15 +562,11 @@ impl GuiRuntimeManager {
 
     #[cfg(test)]
     fn is_attached(&self) -> bool {
-        self.state
-            .lock()
-            .expect("GUI runtime state lock poisoned")
-            .attached_endpoint
-            .is_some()
+        lock_or_recover(&self.state).attached_endpoint.is_some()
     }
 
     fn stop(&self) {
-        let mut state = self.state.lock().expect("GUI runtime state lock poisoned");
+        let mut state = lock_or_recover(&self.state);
         state.reload_handle = None;
         state.runtime = None;
         state.attached_endpoint = None;
@@ -512,28 +574,31 @@ impl GuiRuntimeManager {
     }
 
     fn error(&self) -> Option<String> {
-        self.runtime_error
-            .lock()
-            .expect("runtime error lock poisoned")
-            .clone()
+        lock_or_recover(&self.errors).message()
     }
 
     fn set_error(&self, error: String) {
-        let mut current = self
-            .runtime_error
-            .lock()
-            .expect("runtime error lock poisoned");
-        if current.as_deref() != Some(error.as_str()) {
-            error!(%error, "GUI runtime error");
-            *current = Some(error);
-        }
+        set_shared_error(&self.errors, GuiErrorKind::Action, error);
+    }
+
+    fn set_runtime_error(&self, error: String) {
+        set_shared_error(&self.errors, GuiErrorKind::Runtime, error);
+    }
+
+    fn set_status_error(&self, error: String) {
+        set_shared_error(&self.errors, GuiErrorKind::Status, error);
     }
 
     fn clear_error(&self) {
-        *self
-            .runtime_error
-            .lock()
-            .expect("runtime error lock poisoned") = None;
+        self.clear_error_kind(GuiErrorKind::Action);
+    }
+
+    fn clear_error_kind(&self, kind: GuiErrorKind) {
+        clear_shared_error(&self.errors, kind);
+    }
+
+    fn clear_all_errors(&self) {
+        *lock_or_recover(&self.errors) = GuiErrors::default();
     }
 }
 
@@ -554,54 +619,40 @@ fn probe_runtime(endpoint: &ControlEndpoint) -> Option<RuntimeSnapshot> {
         .ok()
 }
 
-async fn subscribe_status_endpoint(
-    endpoint: &ControlEndpoint,
-) -> anyhow::Result<RuntimeSnapshotSubscription> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        subscribe_runtime_snapshots(endpoint),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("status subscription timed out"))?
+async fn fetch_status_endpoint(endpoint: &ControlEndpoint) -> anyhow::Result<RuntimeSnapshot> {
+    tokio::time::timeout(STATUS_POLL_INTERVAL, fetch_runtime_snapshot(endpoint))
+        .await
+        .map_err(|_| anyhow::anyhow!("status request timed out"))?
 }
 
 impl GuiRuntime {
     fn start(
         config_path: PathBuf,
-        runtime_error: Arc<Mutex<Option<String>>>,
+        errors: Arc<Mutex<GuiErrors>>,
         reload_control: ReloadControl,
     ) -> io::Result<Self> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let thread = thread::Builder::new()
             .name("stk-gui-runtime".to_string())
             .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        error!(%error, "failed to create GUI Tokio runtime");
-                        *runtime_error.lock().expect("runtime error lock poisoned") =
-                            Some(format!("failed to create Tokio runtime: {error}"));
-                        return;
-                    }
-                };
-                let result = runtime.block_on(run_config_file_with_control_until_shutdown(
-                    config_path,
-                    RuntimeProfile::Foreground,
-                    reload_control,
-                    async move {
-                        let _ = shutdown_rx.await;
-                    },
-                ));
-                if let Err(error) = result {
-                    error!(
-                        error = %format_args!("{error:#}"),
-                        "GUI proxy runtime stopped with an error"
-                    );
-                    *runtime_error.lock().expect("runtime error lock poisoned") =
-                        Some(format!("{error:#}"));
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    run_gui_runtime(config_path, reload_control, shutdown_rx)
+                }));
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => set_shared_error(
+                        &errors,
+                        GuiErrorKind::Runtime,
+                        format!("GUI proxy runtime stopped: {error:#}"),
+                    ),
+                    Err(payload) => set_shared_error(
+                        &errors,
+                        GuiErrorKind::Runtime,
+                        format!(
+                            "GUI proxy runtime panicked: {}",
+                            panic_payload_message(payload.as_ref())
+                        ),
+                    ),
                 }
             })?;
         Ok(Self {
@@ -615,6 +666,63 @@ impl GuiRuntime {
     }
 }
 
+fn run_gui_runtime(
+    config_path: PathBuf,
+    reload_control: ReloadControl,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(anyhow::Error::from)?;
+    runtime.block_on(run_config_file_with_control_until_shutdown(
+        config_path,
+        RuntimeProfile::Foreground,
+        reload_control,
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    ))
+}
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn set_shared_error(errors: &Mutex<GuiErrors>, kind: GuiErrorKind, message: String) {
+    let changed = {
+        let mut errors = lock_or_recover(errors);
+        let current = errors.get_mut(kind);
+        if current.as_deref() == Some(message.as_str()) {
+            false
+        } else {
+            *current = Some(message.clone());
+            true
+        }
+    };
+    if changed {
+        error!(error_kind = ?kind, error = %message, "GUI operation failed");
+    }
+}
+
+fn clear_shared_error(errors: &Mutex<GuiErrors>, kind: GuiErrorKind) {
+    *lock_or_recover(errors).get_mut(kind) = None;
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_string())
+        })
+        .unwrap_or_else(|| "unknown panic payload".to_string())
+}
+
 impl Drop for GuiRuntime {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
@@ -626,7 +734,7 @@ impl Drop for GuiRuntime {
     }
 }
 
-fn init_system_tray(language: Language) -> SystemTray {
+fn init_system_tray(language: Language) -> anyhow::Result<SystemTray> {
     let menu = Menu::new();
     let (show_label, download_label, upload_label, reload_label, quit_label) =
         tray_labels(language);
@@ -643,23 +751,26 @@ fn init_system_tray(language: Language) -> SystemTray {
         &reload_item,
         &PredefinedMenuItem::separator(),
         &quit_item,
-    ])
-    .expect("tray menu items must be valid");
+    ])?;
 
-    let tray = init_tray_icon(menu, Some(create_tray_icon()));
+    let tray = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_menu_on_left_click(false)
+        .with_icon(create_tray_icon()?)
+        .build()?;
     #[cfg(target_os = "macos")]
     {
         tray.set_icon_as_template(true);
         configure_macos_tray_title(&tray);
     }
-    SystemTray {
+    Ok(SystemTray {
         tray,
         show_item,
         download_item,
         upload_item,
         reload_item,
         quit_item,
-    }
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -777,9 +888,9 @@ fn activate_macos_application() {
 #[cfg(not(target_os = "macos"))]
 fn activate_macos_application() {}
 
-fn create_tray_icon() -> TrayIcon {
-    let (rgba, width, height) = decode_icon(tray_icon_bytes());
-    TrayIcon::from_rgba(rgba, width, height).expect("tray icon pixels must be valid")
+fn create_tray_icon() -> anyhow::Result<TrayIcon> {
+    let (rgba, width, height) = decode_icon(tray_icon_bytes())?;
+    TrayIcon::from_rgba(rgba, width, height).map_err(anyhow::Error::from)
 }
 
 fn tray_icon_bytes() -> &'static [u8] {
@@ -794,18 +905,17 @@ fn tray_icon_bytes() -> &'static [u8] {
     }
 }
 
-fn create_window_icon() -> dioxus::desktop::tao::window::Icon {
-    let (rgba, width, height) = decode_icon(include_bytes!("../assets/stk-icon-64.png"));
-    dioxus::desktop::tao::window::Icon::from_rgba(rgba, width, height)
-        .expect("window icon pixels must be valid")
+fn create_window_icon() -> anyhow::Result<dioxus::desktop::tao::window::Icon> {
+    let (rgba, width, height) = decode_icon(include_bytes!("../assets/stk-icon-64.png"))?;
+    dioxus::desktop::tao::window::Icon::from_rgba(rgba, width, height).map_err(anyhow::Error::from)
 }
 
-fn decode_icon(bytes: &[u8]) -> (Vec<u8>, u32, u32) {
+fn decode_icon(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, u32, u32)> {
     let image = image::load_from_memory(bytes)
-        .expect("embedded icon must be a valid PNG")
+        .map_err(anyhow::Error::from)?
         .into_rgba8();
     let (width, height) = image.dimensions();
-    (image.into_raw(), width, height)
+    Ok((image.into_raw(), width, height))
 }
 
 fn current_runtime_error() -> Option<String> {
@@ -837,13 +947,13 @@ mod tests {
 
     #[test]
     fn embedded_application_icons_have_expected_dimensions() {
-        let (_, width, height) = decode_icon(include_bytes!("../assets/stk-icon-64.png"));
+        let (_, width, height) = decode_icon(include_bytes!("../assets/stk-icon-64.png")).unwrap();
         assert_eq!((width, height), (64, 64));
 
-        let (_, width, height) = decode_icon(include_bytes!("../assets/stk-icon-256.png"));
+        let (_, width, height) = decode_icon(include_bytes!("../assets/stk-icon-256.png")).unwrap();
         assert_eq!((width, height), (256, 256));
 
-        let (_, width, height) = decode_icon(tray_icon_bytes());
+        let (_, width, height) = decode_icon(tray_icon_bytes()).unwrap();
         let expected = if cfg!(target_os = "macos") {
             (22, 22)
         } else {
@@ -885,12 +995,32 @@ mod tests {
 
         thread::sleep(Duration::from_millis(50));
         manager.reload_or_restart().unwrap();
-        let reloaded_error = wait_for_runtime_error(&manager);
+        wait_for_reload_completion(&manager);
+        let reloaded_error = manager.error().expect("reload error must remain visible");
         assert!(reloaded_error.contains("either host or ssh-config-host must be configured"));
         assert!(!reloaded_error.contains("runtime is not available for reload"));
 
         manager.stop();
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn independent_gui_errors_do_not_clear_each_other() {
+        let manager = GuiRuntimeManager::new(PathBuf::from("config.yaml"));
+        manager.set_runtime_error("runtime failed".to_string());
+        manager.set_status_error("status failed".to_string());
+        manager.set_error("reload failed".to_string());
+
+        let error = manager.error().unwrap();
+        assert!(error.contains("runtime failed"));
+        assert!(error.contains("status failed"));
+        assert!(error.contains("reload failed"));
+
+        manager.clear_error();
+        let error = manager.error().unwrap();
+        assert!(error.contains("runtime failed"));
+        assert!(error.contains("status failed"));
+        assert!(!error.contains("reload failed"));
     }
 
     #[test]
@@ -937,5 +1067,15 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         panic!("GUI runtime did not report its startup error");
+    }
+
+    fn wait_for_reload_completion(manager: &GuiRuntimeManager) {
+        for _ in 0..250 {
+            if !manager.reload_in_progress.load(Ordering::Acquire) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("GUI reload worker did not complete");
     }
 }

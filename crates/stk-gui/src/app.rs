@@ -312,12 +312,37 @@ fn update_system_tray(
 
 #[component]
 pub fn App() -> Element {
-    let context = super::GUI_CONTEXT
-        .get()
-        .expect("GUI context must be initialized");
+    let Some(context) = super::GUI_CONTEXT.get() else {
+        return rsx! {
+            style { dangerous_inner_html: APP_CSS }
+            main { class: "fatal-startup-error",
+                CircleAlert { size: 24 }
+                h1 { "SSH Tunnel Keeper" }
+                p { "The GUI runtime context is unavailable. Check stk.log for startup details." }
+            }
+        };
+    };
     let initial_gui_config = context.gui_config.clone();
     let initial_language = initial_gui_config.language;
-    let system_tray = use_hook(move || super::init_system_tray(initial_language));
+    let system_tray = use_hook(move || {
+        super::init_system_tray(initial_language).map_err(|error| format!("{error:#}"))
+    });
+    let system_tray = match system_tray {
+        Ok(system_tray) => system_tray,
+        Err(error) => {
+            context
+                .runtime
+                .set_error(format!("failed to initialize the system tray: {error}"));
+            return rsx! {
+                style { dangerous_inner_html: APP_CSS }
+                main { class: "fatal-startup-error",
+                    CircleAlert { size: 24 }
+                    h1 { "SSH Tunnel Keeper" }
+                    p { "Failed to initialize the system tray: {error}" }
+                }
+            };
+        }
+    };
     let window = use_window();
     let window_for_menu = window.clone();
     let _tray_menu_handler =
@@ -364,52 +389,36 @@ pub fn App() -> Element {
         let tray_for_poll = tray_for_poll.clone();
         async move {
             let mut last_auxiliary_refresh = Instant::now() - Duration::from_secs(1);
+            let mut poll_interval = tokio::time::interval(super::STATUS_POLL_INTERVAL);
+            poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                let subscription = runtime_for_poll.status_subscription().await;
-                let mut subscription = match subscription {
-                    Ok(subscription) => subscription,
+                poll_interval.tick().await;
+                let next = match runtime_for_poll.status_snapshot().await {
+                    Ok(next) => next,
                     Err(_) => {
                         runtime_error.set(super::current_runtime_error());
-                        tokio::time::sleep(Duration::from_millis(500)).await;
                         continue;
                     }
                 };
-                loop {
-                    let next = match subscription.recv().await {
-                        Ok(Some(next)) => next,
-                        Ok(None) => {
-                            runtime_for_poll
-                                .set_error("runtime status stream disconnected".to_string());
-                            break;
-                        }
-                        Err(error) => {
-                            runtime_for_poll
-                                .set_error(format!("runtime status stream failed: {error:#}"));
-                            break;
-                        }
-                    };
-                    runtime_for_poll.accept_stream_snapshot(next.clone());
-                    let next_error = super::current_runtime_error();
-                    let previous = status.read().clone();
-                    let next_throughput = snapshot_throughput(&next);
-                    let language = gui_config.read().language;
+                runtime_for_poll.accept_snapshot(next.clone());
+                let next_error = super::current_runtime_error();
+                let previous = status.read().clone();
+                let next_throughput = snapshot_throughput(&next);
+                let language = gui_config.read().language;
 
-                    append_runtime_events(&mut events, &previous, &next);
-                    if next.config_generation != previous.config_generation {
-                        observe_configuration_change(&config_path_for_poll, &mut editor, language);
-                    }
-
-                    update_system_tray(&tray_for_poll, language, &next, next_throughput);
-                    throughput.set(next_throughput);
-                    status.set(next);
-                    runtime_error.set(next_error);
-                    if last_auxiliary_refresh.elapsed() >= Duration::from_secs(1) {
-                        logs.set(super::logging::snapshot());
-                        last_auxiliary_refresh = Instant::now();
-                    }
+                append_runtime_events(&mut events, &previous, &next);
+                if next.config_generation != previous.config_generation {
+                    observe_configuration_change(&config_path_for_poll, &mut editor, language);
                 }
-                runtime_error.set(super::current_runtime_error());
-                tokio::time::sleep(Duration::from_millis(250)).await;
+
+                update_system_tray(&tray_for_poll, language, &next, next_throughput);
+                throughput.set(next_throughput);
+                status.set(next);
+                runtime_error.set(next_error);
+                if last_auxiliary_refresh.elapsed() >= Duration::from_secs(1) {
+                    logs.set(super::logging::snapshot());
+                    last_auxiliary_refresh = Instant::now();
+                }
             }
         }
     });
@@ -553,6 +562,15 @@ pub fn App() -> Element {
                             aria_label: tr(language, "Reload configuration", "重新加载配置"),
                             onclick: move |_| super::request_gui_reload(),
                             RefreshCw { size: 17 }
+                        }
+                    }
+                }
+                if let Some(error) = error.as_deref() {
+                    div { class: "runtime-error-banner", role: "alert", title: "{error}",
+                        CircleAlert { size: 18 }
+                        div {
+                            strong { {tr(language, "Runtime error", "运行错误")} }
+                            span { "{error}" }
                         }
                     }
                 }
@@ -1207,24 +1225,17 @@ fn ConnectionsView(status: RuntimeSnapshot, language: Language) -> Element {
         .count();
     let connection_count = connections.len();
     let has_connections = connection_count > 0;
-    let runtime_for_recording = Arc::clone(
-        &super::GUI_CONTEXT
-            .get()
-            .expect("GUI context must be initialized")
-            .runtime,
-    );
-    let runtime_for_clear = Arc::clone(
-        &super::GUI_CONTEXT
-            .get()
-            .expect("GUI context must be initialized")
-            .runtime,
-    );
-    let runtime_for_auto_clear = Arc::clone(
-        &super::GUI_CONTEXT
-            .get()
-            .expect("GUI context must be initialized")
-            .runtime,
-    );
+    let Some(context) = super::GUI_CONTEXT.get() else {
+        return rsx! {
+            section { class: "inline-error", role: "alert",
+                CircleAlert { size: 18 }
+                "GUI runtime context is unavailable"
+            }
+        };
+    };
+    let runtime_for_recording = Arc::clone(&context.runtime);
+    let runtime_for_clear = Arc::clone(&context.runtime);
+    let runtime_for_auto_clear = Arc::clone(&context.runtime);
 
     rsx! {
         section { class: "connections-page",

@@ -29,7 +29,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, warn};
 
 #[cfg(unix)]
@@ -241,10 +241,7 @@ impl ControlListener {
                 #[cfg(windows)]
                 {
                     let path = named_pipe_path(name);
-                    let server = ServerOptions::new()
-                        .first_pipe_instance(true)
-                        .create(&path)
-                        .with_context(|| format!("failed to create control named pipe {path}"))?;
+                    let server = create_named_pipe_server(&path, true).await?;
                     ControlListenerInner::NamedPipe(server)
                 }
                 #[cfg(not(windows))]
@@ -274,18 +271,48 @@ impl ControlListener {
                 server.connect().await?;
                 let pipe_name = match &self.endpoint {
                     ControlEndpoint::NamedPipe(name) => named_pipe_path(name),
-                    _ => unreachable!("named pipe listener must have a named pipe endpoint"),
+                    _ => bail!("named pipe listener has a non-pipe endpoint"),
                 };
-                let connected = std::mem::replace(
-                    server,
-                    ServerOptions::new().create(&pipe_name).with_context(|| {
-                        format!("failed to create the next control named pipe {pipe_name}")
-                    })?,
-                );
+                let replacement = match create_named_pipe_server(&pipe_name, false).await {
+                    Ok(replacement) => replacement,
+                    Err(error) => {
+                        let _ = server.disconnect();
+                        return Err(error).with_context(|| {
+                            format!("failed to create the next control named pipe {pipe_name}")
+                        });
+                    }
+                };
+                let connected = std::mem::replace(server, replacement);
                 Ok((Box::new(connected), pipe_name))
             }
         }
     }
+}
+
+#[cfg(windows)]
+async fn create_named_pipe_server(
+    path: &str,
+    first_pipe_instance: bool,
+) -> anyhow::Result<NamedPipeServer> {
+    const RETRIES: usize = 40;
+    for attempt in 0..RETRIES {
+        let result = ServerOptions::new()
+            .first_pipe_instance(first_pipe_instance)
+            .create(path);
+        match result {
+            Ok(server) => return Ok(server),
+            Err(error)
+                if matches!(error.raw_os_error(), Some(5 | 231)) && attempt + 1 < RETRIES =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to create control named pipe {path}"));
+            }
+        }
+    }
+    bail!("failed to create control named pipe {path} after {RETRIES} attempts")
 }
 
 #[cfg(unix)]
@@ -351,19 +378,37 @@ pub(crate) async fn serve_control(
     mut listener: ControlListener,
     reload_handle: ReloadHandle,
 ) -> anyhow::Result<()> {
+    let mut connections = JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let reload_handle = reload_handle.clone();
-        tokio::spawn(async move {
-            let service =
-                service_fn(move |request| control_response(request, reload_handle.clone()));
-            if let Err(error) = server_http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), service)
-                .await
+        while let Some(joined) = connections.try_join_next() {
+            if let Err(error) = joined
+                && !error.is_cancelled()
             {
-                debug!(%peer, %error, "runtime control API connection closed with an error");
+                stats::record_error();
+                warn!(%error, "runtime control API connection task failed");
             }
-        });
+        }
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                let reload_handle = reload_handle.clone();
+                connections.spawn(async move {
+                    let service = service_fn(move |request| {
+                        control_response(request, reload_handle.clone())
+                    });
+                    if let Err(error) = server_http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                    {
+                        debug!(%peer, %error, "runtime control API connection closed with an error");
+                    }
+                });
+            }
+            Err(error) => {
+                stats::record_error();
+                warn!(%error, "runtime control API accept failed; retrying");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
     }
 }
 
@@ -764,7 +809,7 @@ async fn connect(endpoint: &ControlEndpoint) -> anyhow::Result<BoxedControlStrea
                         }
                     }
                 }
-                unreachable!("named pipe retry loop must return")
+                bail!("failed to connect to runtime control named pipe {path}")
             }
             #[cfg(not(windows))]
             {
@@ -890,5 +935,30 @@ mod tests {
         drop(runtime);
         server.abort();
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn named_pipe_listener_waits_for_previous_generation_connections() {
+        let name = format!("stk-control-rebind-test-{}", std::process::id());
+        let endpoint = ControlEndpoint::NamedPipe(name.clone());
+        let mut listener = ControlListener::bind(endpoint.clone()).await.unwrap();
+        let pipe_path = named_pipe_path(&name);
+        let client = ClientOptions::new().open(&pipe_path).unwrap();
+        let (server_stream, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(listener);
+
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop(server_stream);
+            drop(client);
+        });
+        let rebound = ControlListener::bind(endpoint).await.unwrap();
+
+        drop(rebound);
+        release.await.unwrap();
     }
 }

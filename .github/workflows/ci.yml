@@ -137,6 +137,14 @@ jobs:
           --release
           --locked
 
+      - name: Test Windows named-pipe reload recovery
+        if: runner.os == 'Windows'
+        run: >-
+          cargo test
+          -p stk-core
+          --locked
+          named_pipe_listener_waits_for_previous_generation_connections
+
       - name: Verify Linux AppImage packaging
         if: runner.os == 'Linux'
         shell: bash
