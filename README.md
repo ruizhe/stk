@@ -271,6 +271,8 @@ Use `override-default` for shared defaults:
 override-default:
   min-sessions: 1
   max-sessions: 3
+  session-rotation-enabled: true
+  session-rotation-interval-secs: 3600
   keep-alive-secs: 15
   probe:
     interval-secs: 5
@@ -463,6 +465,8 @@ Enabling launch at login creates a LaunchAgent on macOS, an `HKCU` Run entry on 
 ## Reliability and Statistics
 
 Each SSH host maintains a session pool. New channels are scheduled using session RTT, active channel count, capacity, and health. When a probe approaches the failure threshold, the runtime creates a replacement before preventing the suspect session from accepting new channels and allowing existing channels to drain.
+
+The built-in pool defaults are three active sessions and a maximum of ten. Both values can be changed with `min-sessions` and `max-sessions` under `override-default` or an individual host. Scheduled session rotation is enabled by default and rotates one oldest healthy session per host every hour. Rotation is staggered: STK first uses spare pool capacity to establish a replacement, then stops assigning new channels to the selected session and removes it from runtime status after its existing channels drain. Set `session-rotation-enabled: false` to disable this behavior, or change `session-rotation-interval-secs`. Proactive replacement waits when `max-sessions` does not leave spare capacity.
 
 Remote forwarding uses one owner session with warm standby sessions. When the owner becomes unreliable, STK releases the old remote listener and registers it through a healthy standby. Existing channels on the previous SSH session continue to use that session, while new connections move to the new owner.
 

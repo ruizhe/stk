@@ -4,6 +4,8 @@ endpoint = "tcp:127.0.0.1:19090"
 [override-default]
 min-sessions = 1
 max-sessions = 3
+session-rotation-enabled = true
+session-rotation-interval-secs = 3600
 keep-alive-secs = 15
 server-alive-count-max = 3
 connect-timeout-secs = 10

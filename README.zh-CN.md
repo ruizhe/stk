@@ -272,6 +272,8 @@ host 和所有转发项的 `auto` 默认为 `true`。其他 session、探针和�
 override-default:
   min-sessions: 1
   max-sessions: 3
+  session-rotation-enabled: true
+  session-rotation-interval-secs: 3600
   keep-alive-secs: 15
   probe:
     interval-secs: 5
@@ -464,6 +466,8 @@ macOS 主窗口显示时会出现在 Dock 和 Cmd+Tab；关闭窗口后切换为
 ## 可靠性与统计
 
 每个 SSH host 默认维持 session pool。新 channel 按 session RTT、活跃 channel、容量和健康状态调度；探针接近失败阈值时，runtime 会先创建 replacement，再让可疑 session 停止接收新 channel，并等待已有 channel 排空。
+
+内置默认值为 3 条活跃 session、最多 10 条 session；这两个值都可以通过 `override-default` 或单个 host 下的 `min-sessions`、`max-sessions` 修改。定时轮转默认开启，每个 host 每小时只轮转一条最老的健康 session，因此多条 session 会交错更新。STK 会先利用池中的备用容量建立 replacement，再让被选中的 session 停止接收新 channel；已有 channel 排空后，该 session 会退出并从运行状态列表中移除。可以用 `session-rotation-enabled: false` 关闭，或通过 `session-rotation-interval-secs` 修改间隔。如果 `max-sessions` 没有留下备用容量，主动轮转会等待，不会先断开旧 session。
 
 远端转发采用单 owner 加 warm standby。owner 不可靠时，STK 会释放旧 remote listener，并通过健康 standby 重新注册。没有远端 agent 时，已经建立在旧 SSH session 上的 channel 仍由原 session 处理，新的连接切换到新 owner。
 

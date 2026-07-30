@@ -262,6 +262,57 @@ impl AutoStartUiState {
     }
 }
 
+fn update_system_tray(
+    tray: &super::SystemTray,
+    language: Language,
+    snapshot: &RuntimeSnapshot,
+    rates: ThroughputPoint,
+) {
+    let state = if snapshot.running {
+        tr(language, "Running", "运行中")
+    } else {
+        tr(language, "Stopped", "已停止")
+    };
+    let download = format_rate(rates.download_bps);
+    let upload = format_rate(rates.upload_bps);
+    tray.show_item.set_text(tr(
+        language,
+        "Open SSH Tunnel Keeper",
+        "打开 SSH Tunnel Keeper",
+    ));
+    tray.download_item.set_text(match language {
+        Language::English => format!("Download  {download}"),
+        Language::Chinese => format!("下载  {download}"),
+    });
+    tray.upload_item.set_text(match language {
+        Language::English => format!("Upload  {upload}"),
+        Language::Chinese => format!("上传  {upload}"),
+    });
+    tray.reload_item.set_text(tr(
+        language,
+        "Reload configuration",
+        "重新加载配置",
+    ));
+    tray.quit_item.set_text(tr(
+        language,
+        "Quit SSH Tunnel Keeper",
+        "退出 SSH Tunnel Keeper",
+    ));
+    let tray_title = tray_throughput_title(rates.upload_bps, rates.download_bps);
+    tray.tray.set_title(Some(&tray_title));
+    #[cfg(target_os = "macos")]
+    super::style_macos_tray_title(&tray.tray, &tray_title);
+    let tooltip = match language {
+        Language::English => {
+            format!("SSH Tunnel Keeper - {state}\nUpload {upload}\nDownload {download}")
+        }
+        Language::Chinese => {
+            format!("SSH Tunnel Keeper - {state}\n上传 {upload}\n下载 {download}")
+        }
+    };
+    let _ = tray.tray.set_tooltip(Some(tooltip));
+}
+
 #[component]
 pub fn App() -> Element {
     let context = super::GUI_CONTEXT
@@ -309,9 +360,11 @@ pub fn App() -> Element {
 
     let config_path_for_poll = config_path.clone();
     let runtime_for_poll = Arc::clone(&context.runtime);
+    let tray_for_poll = system_tray.clone();
     use_future(move || {
         let config_path_for_poll = config_path_for_poll.clone();
         let runtime_for_poll = Arc::clone(&runtime_for_poll);
+        let tray_for_poll = tray_for_poll.clone();
         async move {
             let mut last_auxiliary_refresh = Instant::now() - Duration::from_secs(1);
             loop {
@@ -342,16 +395,18 @@ pub fn App() -> Element {
                     let next_error = super::current_runtime_error();
                     let previous = status.read().clone();
                     let next_throughput = snapshot_throughput(&next);
+                    let language = gui_config.read().language;
 
                     append_runtime_events(&mut events, &previous, &next);
                     if next.config_generation != previous.config_generation {
                         observe_configuration_change(
                             &config_path_for_poll,
                             &mut editor,
-                            gui_config.read().language,
+                            language,
                         );
                     }
 
+                    update_system_tray(&tray_for_poll, language, &next, next_throughput);
                     throughput.set(next_throughput);
                     status.set(next);
                     runtime_error.set(next_error);
@@ -384,47 +439,7 @@ pub fn App() -> Element {
         let rates = *throughput.read();
         let snapshot = status.read();
         let language = gui_config.read().language;
-        let state = if snapshot.running {
-            tr(language, "Running", "运行中")
-        } else {
-            tr(language, "Stopped", "已停止")
-        };
-        let download = format_rate(rates.download_bps);
-        let upload = format_rate(rates.upload_bps);
-        tray_for_effect.show_item.set_text(tr(
-            language,
-            "Open SSH Tunnel Keeper",
-            "打开 SSH Tunnel Keeper",
-        ));
-        tray_for_effect.download_item.set_text(match language {
-            Language::English => format!("Download  {download}"),
-            Language::Chinese => format!("下载  {download}"),
-        });
-        tray_for_effect.upload_item.set_text(match language {
-            Language::English => format!("Upload  {upload}"),
-            Language::Chinese => format!("上传  {upload}"),
-        });
-        tray_for_effect
-            .reload_item
-            .set_text(tr(language, "Reload configuration", "重新加载配置"));
-        tray_for_effect.quit_item.set_text(tr(
-            language,
-            "Quit SSH Tunnel Keeper",
-            "退出 SSH Tunnel Keeper",
-        ));
-        let tray_title = tray_throughput_title(rates.upload_bps, rates.download_bps);
-        tray_for_effect.tray.set_title(Some(&tray_title));
-        #[cfg(target_os = "macos")]
-        super::style_macos_tray_title(&tray_for_effect.tray, &tray_title);
-        let tooltip = match language {
-            Language::English => {
-                format!("SSH Tunnel Keeper - {state}\nUpload {upload}\nDownload {download}")
-            }
-            Language::Chinese => {
-                format!("SSH Tunnel Keeper - {state}\n上传 {upload}\n下载 {download}")
-            }
-        };
-        let _ = tray_for_effect.tray.set_tooltip(Some(tooltip));
+        update_system_tray(&tray_for_effect, language, &snapshot, rates);
     });
 
     let active = *active_view.read();

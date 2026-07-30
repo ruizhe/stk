@@ -248,6 +248,10 @@ pub struct OverrideDefaultConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_sessions: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_rotation_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_rotation_interval_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_channels_per_session: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_alive_count_max: Option<u32>,
@@ -307,6 +311,10 @@ pub struct HostConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_sessions: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_rotation_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_rotation_interval_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_channels_per_session: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_alive_count_max: Option<u32>,
@@ -363,6 +371,14 @@ impl HostConfig {
                 .max_sessions
                 .or(defaults.max_sessions)
                 .unwrap_or_else(default_max_sessions),
+            session_rotation_enabled: self
+                .session_rotation_enabled
+                .or(defaults.session_rotation_enabled)
+                .unwrap_or_else(default_session_rotation_enabled),
+            session_rotation_interval_secs: self
+                .session_rotation_interval_secs
+                .or(defaults.session_rotation_interval_secs)
+                .unwrap_or_else(default_session_rotation_interval_secs),
             max_channels_per_session: self
                 .max_channels_per_session
                 .or(defaults.max_channels_per_session)
@@ -427,6 +443,8 @@ pub(crate) struct ResolvedHostConfig {
     pub keep_alive_secs: Option<u64>,
     pub min_sessions: usize,
     pub max_sessions: usize,
+    pub session_rotation_enabled: bool,
+    pub session_rotation_interval_secs: u64,
     pub max_channels_per_session: usize,
     pub server_alive_count_max: Option<u32>,
     pub connect_timeout_secs: Option<u64>,
@@ -467,6 +485,8 @@ impl ResolvedHostConfig {
             keep_alive_secs: self.keep_alive_secs,
             min_sessions_per_host: self.min_sessions,
             max_sessions_per_host: self.max_sessions,
+            session_rotation_enabled: self.session_rotation_enabled,
+            session_rotation_interval_secs: self.session_rotation_interval_secs,
             max_channels_per_session: self.max_channels_per_session,
             server_alive_count_max: self.server_alive_count_max,
             connect_timeout_secs: self.connect_timeout_secs,
@@ -782,6 +802,8 @@ pub(crate) struct SshPoolConfig {
     pub keep_alive_secs: Option<u64>,
     pub min_sessions_per_host: usize,
     pub max_sessions_per_host: usize,
+    pub session_rotation_enabled: bool,
+    pub session_rotation_interval_secs: u64,
     pub max_channels_per_session: usize,
     pub server_alive_count_max: Option<u32>,
     pub connect_timeout_secs: Option<u64>,
@@ -883,6 +905,7 @@ fn validate_host(
         || host.restart_max_secs == 0
         || host.session_spawn_cooldown_millis == 0
         || host.session_drain_timeout_secs == 0
+        || host.session_rotation_interval_secs == 0
         || host.connect_timeout_secs == Some(0)
     {
         return Err(invalid(
@@ -1060,6 +1083,8 @@ fn default_hosts() -> BTreeMap<String, HostConfig> {
             keep_alive_secs: None,
             min_sessions: None,
             max_sessions: None,
+            session_rotation_enabled: None,
+            session_rotation_interval_secs: None,
             max_channels_per_session: None,
             server_alive_count_max: None,
             connect_timeout_secs: None,
@@ -1093,11 +1118,19 @@ fn is_true(value: &bool) -> bool {
 }
 
 fn default_min_sessions() -> usize {
-    2
+    3
 }
 
 fn default_max_sessions() -> usize {
-    4
+    10
+}
+
+fn default_session_rotation_enabled() -> bool {
+    true
+}
+
+fn default_session_rotation_interval_secs() -> u64 {
+    60 * 60
 }
 
 fn default_max_channels_per_session() -> usize {
@@ -1243,6 +1276,8 @@ mod tests {
 override-default:
   inherit-ssh-config-forwards: false
   min-sessions: 1
+  session-rotation-enabled: false
+  session-rotation-interval-secs: 120
   probe:
     interval-secs: 20
   proxy:
@@ -1262,6 +1297,8 @@ hosts:
     host: overridden.example
     inherit-ssh-config-forwards: true
     min-sessions: 3
+    session-rotation-enabled: true
+    session-rotation-interval-secs: 60
     probe:
       interval-secs: 5
     local-proxies:
@@ -1279,7 +1316,9 @@ hosts:
         let inherited = config.hosts["inherited"].resolve(&config.override_default);
         assert!(!inherited.inherit_ssh_config_forwards);
         assert_eq!(inherited.min_sessions, 1);
-        assert_eq!(inherited.max_sessions, 4);
+        assert_eq!(inherited.max_sessions, 10);
+        assert!(!inherited.session_rotation_enabled);
+        assert_eq!(inherited.session_rotation_interval_secs, 120);
         assert_eq!(inherited.probe.interval_secs, 20);
         assert!(!inherited.local_proxies[0].auto);
         assert!(inherited.local_proxies[0].mixed);
@@ -1288,7 +1327,9 @@ hosts:
         let overridden = config.hosts["overridden"].resolve(&config.override_default);
         assert!(overridden.inherit_ssh_config_forwards);
         assert_eq!(overridden.min_sessions, 3);
-        assert_eq!(overridden.max_sessions, 4);
+        assert_eq!(overridden.max_sessions, 10);
+        assert!(overridden.session_rotation_enabled);
+        assert_eq!(overridden.session_rotation_interval_secs, 60);
         assert_eq!(overridden.probe.interval_secs, 5);
         assert!(overridden.local_proxies[0].auto);
         assert!(!overridden.local_proxies[0].mixed);
@@ -1401,8 +1442,10 @@ hosts:
         assert!(host.inherit_ssh_config_forwards);
         assert!(host.local_proxies[0].auto);
         assert!(host.local_forwards[0].auto);
-        assert_eq!(host.min_sessions, 2);
-        assert_eq!(host.max_sessions, 4);
+        assert_eq!(host.min_sessions, 3);
+        assert_eq!(host.max_sessions, 10);
+        assert!(host.session_rotation_enabled);
+        assert_eq!(host.session_rotation_interval_secs, 3_600);
         assert_eq!(host.max_channels_per_session, 64);
         assert_eq!(host.restart_initial_millis, 500);
         assert_eq!(host.restart_max_secs, 30);
@@ -1571,6 +1614,13 @@ hosts:
         let host = default_host_mut(&mut config);
         host.min_sessions = Some(3);
         host.max_sessions = Some(2);
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidHostConfig { .. }
+        ));
+
+        let mut config = AppConfig::default();
+        default_host_mut(&mut config).session_rotation_interval_secs = Some(0);
         assert!(matches!(
             config.validate().unwrap_err(),
             ConfigError::InvalidHostConfig { .. }

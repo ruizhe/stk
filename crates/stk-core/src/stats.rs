@@ -1593,6 +1593,7 @@ pub(crate) fn register_ssh_session(registration: SshSessionRegistration) {
         .expect("runtime details lock poisoned")
         .sessions
         .insert(registration.id, detail);
+    notify_runtime_status_change();
 }
 
 pub(crate) fn update_ssh_session_state(session_id: u64, update: SshSessionStateUpdate) {
@@ -1602,18 +1603,19 @@ pub(crate) fn update_ssh_session_state(session_id: u64, update: SshSessionStateU
     };
     let now = unix_time_ms();
     let became_offline;
+    let changed;
     {
         let mut state = session
             .state
             .lock()
             .expect("SSH session detail lock poisoned");
-        if state.status != update.status
+        changed = state.status != update.status
             || state.startup_ms != update.startup_ms
             || state.rtt_ms != update.rtt_ms
             || state.retiring != update.retiring
             || state.remote_forward_owner != update.remote_forward_owner
-            || state.last_error != update.last_error
-        {
+            || state.last_error != update.last_error;
+        if changed {
             session.last_activity_unix_ms.store(now, Ordering::Relaxed);
         }
         if update.status == SshSessionRuntimeStatus::Healthy
@@ -1635,6 +1637,25 @@ pub(crate) fn update_ssh_session_state(session_id: u64, update: SshSessionStateU
     if became_offline {
         prune_offline_sessions(&session.registration.host_name);
     }
+    if changed {
+        notify_runtime_status_change();
+    }
+}
+
+pub(crate) fn remove_ssh_session(session_id: u64) {
+    let removed = remove_ssh_session_detail(
+        &mut RUNTIME_DETAILS
+            .lock()
+            .expect("runtime details lock poisoned"),
+        session_id,
+    );
+    if removed {
+        notify_runtime_status_change();
+    }
+}
+
+fn remove_ssh_session_detail(details: &mut RuntimeDetails, session_id: u64) -> bool {
+    details.sessions.remove(&session_id).is_some()
 }
 
 pub(crate) fn record_ssh_session_probe(session_id: u64) {
@@ -2490,6 +2511,24 @@ mod tests {
         assert_eq!(closed.uptime_ms, 2_000);
         assert_eq!(closed.upload_bps, 0);
         assert_eq!(closed.download_bps, 0);
+    }
+
+    #[test]
+    fn removed_ssh_session_is_deleted_from_runtime_details() {
+        let mut details = RuntimeDetails::default();
+        details.sessions.insert(
+            42,
+            Arc::new(SshSessionDetail::new(SshSessionRegistration {
+                id: 42,
+                host_name: "removed-session-host".to_string(),
+                ssh_alias: "removed-session-alias".to_string(),
+                address: "127.0.0.1:22".to_string(),
+            })),
+        );
+
+        assert!(remove_ssh_session_detail(&mut details, 42));
+        assert!(!details.sessions.contains_key(&42));
+        assert!(!remove_ssh_session_detail(&mut details, 42));
     }
 
     #[test]

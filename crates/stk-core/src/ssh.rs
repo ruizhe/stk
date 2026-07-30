@@ -939,6 +939,17 @@ struct SessionExit {
     error: String,
 }
 
+struct ScheduledSessionRotation {
+    candidate_session_id: u64,
+    replacement_session_id: Option<u64>,
+}
+
+enum ScheduledRotationProgress {
+    Waiting,
+    Activated,
+    Cancelled,
+}
+
 async fn manage_ssh_sessions(
     outbound: String,
     upstream: SshHostConfig,
@@ -951,9 +962,14 @@ async fn manage_ssh_sessions(
     let max_backoff = Duration::from_secs(pool.restart_max_secs);
     let spawn_cooldown = Duration::from_millis(pool.session_spawn_cooldown_millis);
     let drain_timeout = Duration::from_secs(pool.session_drain_timeout_secs);
+    let rotation_interval = pool
+        .session_rotation_enabled
+        .then(|| Duration::from_secs(pool.session_rotation_interval_secs));
     let mut backoff = initial_backoff;
     let mut next_spawn_at = Instant::now();
     let mut next_owner_attempt = Instant::now();
+    let mut next_rotation_at = rotation_interval.map(|interval| Instant::now() + interval);
+    let mut scheduled_rotation = None;
     let mut tasks = JoinSet::new();
     let mut ticker = interval(Duration::from_millis(100));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -972,6 +988,18 @@ async fn manage_ssh_sessions(
                 match joined {
                     Some(Ok(exit)) => {
                         node.sessions.write().await.retain(|session| session.id != exit.id);
+                        if scheduled_rotation.as_ref().is_some_and(|rotation: &ScheduledSessionRotation| {
+                            rotation.candidate_session_id == exit.id
+                        }) {
+                            scheduled_rotation = None;
+                        } else if let Some(rotation) = scheduled_rotation.as_mut()
+                            && rotation.replacement_session_id == Some(exit.id)
+                        {
+                            rotation.replacement_session_id = None;
+                        }
+                        if exit.retired {
+                            stats::remove_ssh_session(exit.id);
+                        }
                         let mut owner = node.remote_owner.write().await;
                         if *owner == Some(exit.id) {
                             *owner = None;
@@ -991,13 +1019,21 @@ async fn manage_ssh_sessions(
                             next_spawn_at = Instant::now() + backoff;
                             backoff = next_backoff(backoff, max_backoff);
                         }
-                        warn!(
-                            host_name = %outbound,
-                            ssh_session_id = exit.id,
-                            retired = exit.retired,
-                            %exit.error,
-                            "native SSH session left the pool"
-                        );
+                        if exit.retired {
+                            info!(
+                                host_name = %outbound,
+                                ssh_session_id = exit.id,
+                                %exit.error,
+                                "retired native SSH session left the pool"
+                            );
+                        } else {
+                            warn!(
+                                host_name = %outbound,
+                                ssh_session_id = exit.id,
+                                %exit.error,
+                                "native SSH session left the pool"
+                            );
+                        }
                     }
                     Some(Err(error)) => {
                         warn!(%error, "SSH session task failed");
@@ -1048,12 +1084,67 @@ async fn manage_ssh_sessions(
                     retirement_pending |= session.retire_requested.load(Ordering::Relaxed);
                 }
 
+                let now = Instant::now();
+                if scheduled_rotation.is_some()
+                    && healthy_non_retiring < pool.min_sessions_per_host
+                {
+                    scheduled_rotation = None;
+                    debug!(
+                        host_name = %outbound,
+                        "scheduled SSH session rotation deferred while pool health recovers"
+                    );
+                }
+
+                if let Some(rotation) = scheduled_rotation.as_ref() {
+                    match advance_scheduled_session_rotation(&node, rotation).await {
+                        ScheduledRotationProgress::Waiting => {}
+                        ScheduledRotationProgress::Activated => {
+                            scheduled_rotation = None;
+                            retirement_pending = true;
+                            healthy_non_retiring = healthy_non_retiring.saturating_sub(1);
+                        }
+                        ScheduledRotationProgress::Cancelled => {
+                            scheduled_rotation = None;
+                        }
+                    }
+                }
+
+                if next_rotation_at.is_some_and(|next| now >= next)
+                    && scheduled_rotation.is_none()
+                    && !retirement_pending
+                    && healthy_non_retiring >= pool.min_sessions_per_host
+                    && active_count < pool.max_sessions_per_host
+                    && let Some(candidate_session_id) = oldest_healthy_session_id(&node).await
+                {
+                    scheduled_rotation = Some(ScheduledSessionRotation {
+                        candidate_session_id,
+                        replacement_session_id: None,
+                    });
+                    next_rotation_at = rotation_interval.map(|interval| now + interval);
+                    info!(
+                        host_name = %outbound,
+                        ssh_session_id = candidate_session_id,
+                        "scheduled replacement for SSH session rotation"
+                    );
+                }
+
                 let needs_minimum = active_count < pool.min_sessions_per_host;
                 let needs_replacement = retirement_pending
                     && healthy_non_retiring < pool.min_sessions_per_host
                     && active_count < pool.max_sessions_per_host;
-                if (needs_minimum || needs_replacement) && Instant::now() >= next_spawn_at {
+                let needs_scheduled_replacement = scheduled_rotation
+                    .as_ref()
+                    .is_some_and(|rotation| rotation.replacement_session_id.is_none())
+                    && active_count < pool.max_sessions_per_host;
+                if (needs_minimum || needs_replacement || needs_scheduled_replacement)
+                    && Instant::now() >= next_spawn_at
+                {
                     let session_id = stats::next_ssh_session_id();
+                    if needs_scheduled_replacement
+                        && let Some(rotation) = scheduled_rotation.as_mut()
+                    {
+                        rotation.replacement_session_id = Some(session_id);
+                    }
                     spawn_managed_session(
                         &mut tasks,
                         session_id,
@@ -1084,6 +1175,62 @@ async fn manage_ssh_sessions(
             }
         }
     }
+}
+
+async fn oldest_healthy_session_id(node: &Arc<NativeSshNode>) -> Option<u64> {
+    let sessions = node.sessions.read().await.clone();
+    let mut candidate = None;
+    for session in sessions {
+        if session.retire_requested.load(Ordering::Relaxed) {
+            continue;
+        }
+        if session.state.read().await.status != SshSessionStatus::Healthy {
+            continue;
+        }
+        if candidate
+            .as_ref()
+            .is_none_or(|oldest: &Arc<ManagedSshSession>| session.id < oldest.id)
+        {
+            candidate = Some(session);
+        }
+    }
+    candidate.map(|session| session.id)
+}
+
+async fn advance_scheduled_session_rotation(
+    node: &Arc<NativeSshNode>,
+    rotation: &ScheduledSessionRotation,
+) -> ScheduledRotationProgress {
+    let Some(replacement_session_id) = rotation.replacement_session_id else {
+        return ScheduledRotationProgress::Waiting;
+    };
+    let sessions = node.sessions.read().await.clone();
+    let Some(candidate) = sessions
+        .iter()
+        .find(|session| session.id == rotation.candidate_session_id)
+    else {
+        return ScheduledRotationProgress::Cancelled;
+    };
+    let Some(replacement) = sessions
+        .iter()
+        .find(|session| session.id == replacement_session_id)
+    else {
+        return ScheduledRotationProgress::Waiting;
+    };
+    if replacement.retire_requested.load(Ordering::Relaxed)
+        || replacement.state.read().await.status != SshSessionStatus::Healthy
+    {
+        return ScheduledRotationProgress::Waiting;
+    }
+
+    candidate.retire_requested.store(true, Ordering::Release);
+    info!(
+        ssh_host = %node.name,
+        ssh_session_id = candidate.id,
+        replacement_ssh_session_id = replacement.id,
+        "replacement SSH session is ready; retiring rotated session"
+    );
+    ScheduledRotationProgress::Activated
 }
 
 async fn spawn_managed_session(
@@ -2374,6 +2521,8 @@ mod tests {
             keep_alive_secs: Some(5),
             min_sessions_per_host: 1,
             max_sessions_per_host: 2,
+            session_rotation_enabled: false,
+            session_rotation_interval_secs: 3_600,
             max_channels_per_session: 8,
             server_alive_count_max: Some(2),
             connect_timeout_secs: Some(2),
@@ -2542,6 +2691,8 @@ mod tests {
                 keep_alive_secs: Some(5),
                 min_sessions_per_host: 1,
                 max_sessions_per_host: 2,
+                session_rotation_enabled: false,
+                session_rotation_interval_secs: 3_600,
                 max_channels_per_session: 8,
                 server_alive_count_max: Some(2),
                 connect_timeout_secs: Some(2),
@@ -2613,6 +2764,108 @@ mod tests {
         drop(pool);
         let _ = std::fs::remove_file(key_path);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduled_rotation_replaces_one_healthy_session() {
+        let (ssh_address, server) = start_test_ssh_server().await;
+        let key_path = write_test_key("scheduled-rotation");
+        let mut config = test_pool_config(ssh_address, &key_path, 1, 2, 8, Vec::new());
+        config.session_rotation_enabled = true;
+        config.session_rotation_interval_secs = 1;
+        config.session_drain_timeout_secs = 1;
+        config.hosts[0].name = "scheduled-rotation".to_string();
+
+        let pool = SshPoolDialer::start(
+            "scheduled-rotation",
+            config,
+            ProbeConfig {
+                enabled: false,
+                ..ProbeConfig::default()
+            },
+        )
+        .unwrap();
+        let node = Arc::clone(&pool.nodes[0]);
+        wait_for_healthy_sessions(&node, 1).await;
+        let original = node.sessions.read().await[0].id;
+
+        let replacement = timeout(Duration::from_secs(4), async {
+            loop {
+                let sessions = node.sessions.read().await.clone();
+                if !sessions.iter().any(|session| session.id == original) {
+                    let mut replacement = None;
+                    for session in sessions {
+                        if session.state.read().await.status == SshSessionStatus::Healthy
+                            && !session.retire_requested.load(AtomicOrdering::Relaxed)
+                        {
+                            replacement = Some(session.id);
+                            break;
+                        }
+                    }
+                    if let Some(replacement) = replacement {
+                        break replacement;
+                    }
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduled SSH session rotation did not complete");
+
+        assert_ne!(replacement, original);
+        drop(pool);
+        let _ = std::fs::remove_file(key_path);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn scheduled_rotation_waits_for_a_healthy_replacement() {
+        let candidate = Arc::new(ManagedSshSession {
+            id: 1,
+            state: Arc::new(RwLock::new(SshSessionState {
+                status: SshSessionStatus::Healthy,
+                ..SshSessionState::default()
+            })),
+            handle: Arc::new(RwLock::new(None)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            retire_requested: AtomicBool::new(false),
+        });
+        let replacement = Arc::new(ManagedSshSession {
+            id: 2,
+            state: Arc::new(RwLock::new(SshSessionState::default())),
+            handle: Arc::new(RwLock::new(None)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            retire_requested: AtomicBool::new(false),
+        });
+        let node = Arc::new(NativeSshNode {
+            name: "rotation-order".to_string(),
+            state: Arc::new(RwLock::new(SshNodeState::default())),
+            sessions: Arc::new(RwLock::new(vec![
+                Arc::clone(&candidate),
+                Arc::clone(&replacement),
+            ])),
+            remote_owner: Arc::new(RwLock::new(None)),
+            channel_open_timeout: Duration::from_secs(1),
+            max_channels_per_session: 8,
+        });
+        let rotation = ScheduledSessionRotation {
+            candidate_session_id: candidate.id,
+            replacement_session_id: Some(replacement.id),
+        };
+
+        assert!(matches!(
+            advance_scheduled_session_rotation(&node, &rotation).await,
+            ScheduledRotationProgress::Waiting
+        ));
+        assert!(!candidate.retire_requested.load(Ordering::Relaxed));
+
+        replacement.state.write().await.status = SshSessionStatus::Healthy;
+        assert!(matches!(
+            advance_scheduled_session_rotation(&node, &rotation).await,
+            ScheduledRotationProgress::Activated
+        ));
+        assert!(candidate.retire_requested.load(Ordering::Relaxed));
+        assert!(!replacement.retire_requested.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
@@ -2968,6 +3221,8 @@ mod tests {
             keep_alive_secs: Some(5),
             min_sessions_per_host: min_sessions,
             max_sessions_per_host: max_sessions,
+            session_rotation_enabled: false,
+            session_rotation_interval_secs: 3_600,
             max_channels_per_session: max_channels,
             server_alive_count_max: Some(2),
             connect_timeout_secs: Some(1),

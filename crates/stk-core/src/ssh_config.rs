@@ -1152,6 +1152,8 @@ mod tests {
             keep_alive_secs: None,
             min_sessions_per_host: 1,
             max_sessions_per_host: 1,
+            session_rotation_enabled: false,
+            session_rotation_interval_secs: 3_600,
             max_channels_per_session: 8,
             server_alive_count_max: None,
             connect_timeout_secs: None,
