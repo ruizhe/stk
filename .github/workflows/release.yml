@@ -169,7 +169,14 @@ jobs:
           ./scripts/build-linux-appimage.sh \
             crates/stk-gui/target/release/stk-gui \
             "$appimage"
+          "$appimage" --appimage-offset >/dev/null
           APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --help >/dev/null
+          docker run --rm \
+            -e APPIMAGE_EXTRACT_AND_RUN=1 \
+            -v "$PWD/$appimage:/opt/stk.AppImage:ro" \
+            -w /tmp \
+            archlinux:base \
+            /opt/stk.AppImage --help >/dev/null
           sha256sum "$appimage" > "$appimage.sha256"
 
       - name: Create CLI release archive

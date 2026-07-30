@@ -45,6 +45,8 @@ ICON_FILE="$APP_DIR/usr/share/icons/hicolor/256x256/apps/ssh-tunnel-keeper.png"
 LINUXDEPLOY="$TOOLS_DIR/linuxdeploy-$TOOL_ARCH.AppImage"
 GTK_PLUGIN="$TOOLS_DIR/linuxdeploy-plugin-gtk.sh"
 APPRUN="$TOOLS_DIR/AppRun-$TOOL_ARCH"
+APPIMAGETOOL="$TOOLS_DIR/appimagetool-$TOOL_ARCH-1.9.1.AppImage"
+APPIMAGE_RUNTIME="$TOOLS_DIR/runtime-$TOOL_ARCH-20251108"
 
 download_tool() {
     url=$1
@@ -78,6 +80,24 @@ download_tool \
 download_tool \
     "https://github.com/AppImage/AppImageKit/releases/download/continuous/AppRun-$TOOL_ARCH" \
     "$APPRUN"
+download_tool \
+    "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-$TOOL_ARCH.AppImage" \
+    "$APPIMAGETOOL"
+download_tool \
+    "https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-$TOOL_ARCH" \
+    "$APPIMAGE_RUNTIME"
+
+case "$TOOL_ARCH" in
+    x86_64)
+        APPIMAGE_RUNTIME_SHA256=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+        ;;
+esac
+
+runtime_sha256=$(sha256sum "$APPIMAGE_RUNTIME" | awk '{print $1}')
+if [ "$runtime_sha256" != "$APPIMAGE_RUNTIME_SHA256" ]; then
+    echo "AppImage runtime checksum mismatch: $APPIMAGE_RUNTIME" >&2
+    exit 1
+fi
 
 rm -rf "$APP_DIR"
 mkdir -p \
@@ -133,17 +153,27 @@ PATH="$TOOLS_DIR:$PATH"
 export PATH
 export ARCH="$TOOL_ARCH"
 export DEPLOY_GTK_VERSION=3
-export OUTPUT
 
 "$LINUXDEPLOY" \
     --appimage-extract-and-run \
     --verbosity 2 \
     --appdir "$APP_DIR" \
-    --plugin gtk \
-    --output appimage
+    --plugin gtk
+
+"$APPIMAGETOOL" \
+    --appimage-extract-and-run \
+    --runtime-file "$APPIMAGE_RUNTIME" \
+    "$APP_DIR" \
+    "$OUTPUT"
 
 if [ ! -x "$OUTPUT" ]; then
-    echo "linuxdeploy did not create the expected AppImage: $OUTPUT" >&2
+    echo "appimagetool did not create the expected AppImage: $OUTPUT" >&2
+    exit 1
+fi
+
+runtime_size=$(wc -c < "$APPIMAGE_RUNTIME" | tr -d ' ')
+if ! cmp -s -n "$runtime_size" "$APPIMAGE_RUNTIME" "$OUTPUT"; then
+    echo "generated AppImage does not contain the selected static runtime" >&2
     exit 1
 fi
 

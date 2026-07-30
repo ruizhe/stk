@@ -93,7 +93,7 @@ chmod +x ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage
 ./ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage
 ```
 
-Some Linux distributions require the FUSE 2 compatibility package to mount AppImages. When FUSE is unavailable, start the same package with `APPIMAGE_EXTRACT_AND_RUN=1 ./ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage`.
+The AppImage uses a statically linked runtime, so the host does not need to provide `libfuse.so.2`. Direct mounting still requires a usable `/dev/fuse` device and a `fusermount` or `fusermount3` helper. In containers or other restricted environments where FUSE mounting is unavailable, start the same package with `APPIMAGE_EXTRACT_AND_RUN=1 ./ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage`.
 
 Building the raw Linux GUI executable from source still requires the development packages:
 

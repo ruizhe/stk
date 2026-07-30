@@ -93,7 +93,7 @@ chmod +x ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage
 ./ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage
 ```
 
-部分 Linux 发行版需要安装 FUSE 2 兼容包才能挂载 AppImage。如果系统没有 FUSE，也可以用 `APPIMAGE_EXTRACT_AND_RUN=1 ./ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage` 启动同一个文件。
+AppImage 使用静态链接的 runtime，因此宿主机不需要提供 `libfuse.so.2`。直接挂载仍需要可用的 `/dev/fuse` 设备以及 `fusermount` 或 `fusermount3` 辅助程序；在容器或其他不能使用 FUSE 挂载的受限环境中，可以用 `APPIMAGE_EXTRACT_AND_RUN=1 ./ssh-tunnel-keeper-vX.Y.Z-linux-x86_64.AppImage` 启动同一个文件。
 
 从源码构建裸 Linux GUI 可执行文件时仍然需要安装开发包：
 
