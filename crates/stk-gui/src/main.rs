@@ -16,8 +16,10 @@ use std::{
     sync::{
         Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread::{self, JoinHandle},
+    time::Instant,
 };
 use stk_core::{
     AppConfig, ConfigScope, ControlConfig, ControlEndpoint, RuntimeProfile,
@@ -35,6 +37,8 @@ use stk_core::{
     },
 };
 use tokio::sync::oneshot;
+#[cfg(target_os = "macos")]
+use tracing::debug;
 use tracing::{error, info, warn};
 
 mod app;
@@ -88,6 +92,9 @@ struct GuiRuntimeManager {
     errors: Arc<Mutex<GuiErrors>>,
     reload_in_progress: AtomicBool,
     state: Mutex<GuiRuntimeState>,
+    status_monitor: Mutex<Option<GuiStatusMonitor>>,
+    #[cfg(target_os = "macos")]
+    system_tray: Mutex<Option<MacosSystemTray>>,
 }
 
 struct GuiRuntimeState {
@@ -95,6 +102,17 @@ struct GuiRuntimeState {
     reload_handle: Option<ReloadHandle>,
     attached_endpoint: Option<ControlEndpoint>,
     last_snapshot: Option<RuntimeSnapshot>,
+}
+
+struct GuiStatusMonitor {
+    shutdown: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct MacosSystemTray {
+    tray: Arc<dispatch2::MainThreadBound<SystemTray>>,
 }
 
 #[derive(Debug, Default)]
@@ -216,6 +234,9 @@ fn main() {
     }
     if let Err(error) = runtime.start() {
         runtime.set_runtime_error(format!("failed to start GUI runtime thread: {error}"));
+    }
+    if let Err(error) = runtime.start_status_monitor() {
+        runtime.set_status_error(format!("failed to start GUI status monitor: {error}"));
     }
     if let Some(error) = argument_error {
         runtime.set_error(format!("invalid GUI arguments; using defaults:\n{error}"));
@@ -355,7 +376,19 @@ impl GuiRuntimeManager {
                 attached_endpoint: None,
                 last_snapshot: None,
             }),
+            status_monitor: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            system_tray: Mutex::new(None),
         }
+    }
+
+    fn start_status_monitor(self: &Arc<Self>) -> io::Result<()> {
+        let mut monitor = lock_or_recover(&self.status_monitor);
+        if monitor.is_some() {
+            return Ok(());
+        }
+        *monitor = Some(GuiStatusMonitor::start(Arc::downgrade(self))?);
+        Ok(())
     }
 
     fn start(&self) -> io::Result<()> {
@@ -501,6 +534,44 @@ impl GuiRuntimeManager {
         lock_or_recover(&self.state).last_snapshot = Some(snapshot);
     }
 
+    fn cached_snapshot(&self) -> RuntimeSnapshot {
+        lock_or_recover(&self.state)
+            .last_snapshot
+            .clone()
+            .unwrap_or_else(runtime_snapshot)
+    }
+
+    fn register_system_tray(&self, tray: SystemTray) {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(main_thread) = objc2_foundation::MainThreadMarker::new() else {
+                self.set_status_error(
+                    "failed to register the macOS tray outside the main thread".to_string(),
+                );
+                return;
+            };
+            let updater = MacosSystemTray {
+                tray: Arc::new(dispatch2::MainThreadBound::new(tray, main_thread)),
+            };
+            let snapshot = self.cached_snapshot();
+            updater.update_throughput(snapshot.upload_bps, snapshot.download_bps);
+            *lock_or_recover(&self.system_tray) = Some(updater);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        let _ = tray;
+    }
+
+    fn publish_system_tray_throughput(&self, snapshot: &RuntimeSnapshot) {
+        #[cfg(target_os = "macos")]
+        if let Some(tray) = lock_or_recover(&self.system_tray).clone() {
+            tray.update_throughput(snapshot.upload_bps, snapshot.download_bps);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        let _ = snapshot;
+    }
+
     async fn traffic_history(&self) -> Option<TrafficHistorySnapshot> {
         let attached_endpoint = lock_or_recover(&self.state).attached_endpoint.clone();
         let Some(endpoint) = attached_endpoint else {
@@ -567,10 +638,7 @@ impl GuiRuntimeManager {
     }
 
     fn initial_snapshot(&self) -> RuntimeSnapshot {
-        lock_or_recover(&self.state)
-            .last_snapshot
-            .clone()
-            .unwrap_or_else(runtime_snapshot)
+        self.cached_snapshot()
     }
 
     fn initial_traffic_history(&self) -> TrafficHistorySnapshot {
@@ -592,6 +660,12 @@ impl GuiRuntimeManager {
     }
 
     fn stop(&self) {
+        let monitor = lock_or_recover(&self.status_monitor).take();
+        drop(monitor);
+        #[cfg(target_os = "macos")]
+        {
+            lock_or_recover(&self.system_tray).take();
+        }
         let mut state = lock_or_recover(&self.state);
         state.reload_handle = None;
         state.runtime = None;
@@ -649,6 +723,87 @@ async fn fetch_status_endpoint(endpoint: &ControlEndpoint) -> anyhow::Result<Run
     tokio::time::timeout(STATUS_POLL_INTERVAL, fetch_runtime_snapshot(endpoint))
         .await
         .map_err(|_| anyhow::anyhow!("status request timed out"))?
+}
+
+impl GuiStatusMonitor {
+    fn start(manager: std::sync::Weak<GuiRuntimeManager>) -> io::Result<Self> {
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name("stk-gui-status".to_string())
+            .spawn(move || run_gui_status_monitor(manager, shutdown_rx))?;
+        Ok(Self {
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for GuiStatusMonitor {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            error!("GUI status monitor panicked during shutdown");
+        }
+    }
+}
+
+fn run_gui_status_monitor(
+    manager: std::sync::Weak<GuiRuntimeManager>,
+    shutdown: mpsc::Receiver<()>,
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            if let Some(manager) = manager.upgrade() {
+                manager.set_status_error(format!("failed to create GUI status runtime: {error}"));
+            }
+            return;
+        }
+    };
+
+    loop {
+        let cycle_started = Instant::now();
+        let Some(manager) = manager.upgrade() else {
+            break;
+        };
+        if let Ok(snapshot) = runtime.block_on(manager.status_snapshot()) {
+            manager.accept_snapshot(snapshot.clone());
+            manager.publish_system_tray_throughput(&snapshot);
+        }
+        drop(manager);
+
+        let wait = STATUS_POLL_INTERVAL.saturating_sub(cycle_started.elapsed());
+        match shutdown.recv_timeout(wait) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MacosSystemTray {
+    fn update_throughput(&self, upload_bps: u64, download_bps: u64) {
+        let tray = Arc::clone(&self.tray);
+        dispatch2::DispatchQueue::main().exec_async(move || {
+            let Some(main_thread) = objc2_foundation::MainThreadMarker::new() else {
+                error!("macOS tray throughput update ran outside the main thread");
+                return;
+            };
+            app::update_system_tray_throughput(
+                tray.get(main_thread),
+                upload_bps as f64,
+                download_bps as f64,
+            );
+            debug!(upload_bps, download_bps, "native tray throughput refreshed");
+        });
+    }
 }
 
 impl GuiRuntime {

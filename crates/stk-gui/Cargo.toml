@@ -26,6 +26,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 stk-core = { path = "../stk-core" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+dispatch2 = "0.3.1"
 objc2-app-kit = {
   version = "0.3.2",
   default-features = false,

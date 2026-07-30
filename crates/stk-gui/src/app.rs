@@ -295,10 +295,7 @@ fn update_system_tray(
         "Quit SSH Tunnel Keeper",
         "退出 SSH Tunnel Keeper",
     ));
-    let tray_title = tray_throughput_title(rates.upload_bps, rates.download_bps);
-    tray.tray.set_title(Some(&tray_title));
-    #[cfg(target_os = "macos")]
-    super::style_macos_tray_title(&tray.tray, &tray_title);
+    update_system_tray_throughput(tray, rates.upload_bps, rates.download_bps);
     let tooltip = match language {
         Language::English => {
             format!("SSH Tunnel Keeper - {state}\nUpload {upload}\nDownload {download}")
@@ -308,6 +305,17 @@ fn update_system_tray(
         }
     };
     let _ = tray.tray.set_tooltip(Some(tooltip));
+}
+
+pub(super) fn update_system_tray_throughput(
+    tray: &super::SystemTray,
+    upload_bps: f64,
+    download_bps: f64,
+) {
+    let tray_title = tray_throughput_title(upload_bps, download_bps);
+    tray.tray.set_title(Some(&tray_title));
+    #[cfg(target_os = "macos")]
+    super::style_macos_tray_title(&tray.tray, &tray_title);
 }
 
 #[component]
@@ -343,6 +351,9 @@ pub fn App() -> Element {
             };
         }
     };
+    let runtime_for_tray = Arc::clone(&context.runtime);
+    let tray_for_runtime = system_tray.clone();
+    use_hook(move || runtime_for_tray.register_system_tray(tray_for_runtime));
     let window = use_window();
     let window_for_menu = window.clone();
     let _tray_menu_handler =
@@ -393,14 +404,7 @@ pub fn App() -> Element {
             poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 poll_interval.tick().await;
-                let next = match runtime_for_poll.status_snapshot().await {
-                    Ok(next) => next,
-                    Err(_) => {
-                        runtime_error.set(super::current_runtime_error());
-                        continue;
-                    }
-                };
-                runtime_for_poll.accept_snapshot(next.clone());
+                let next = runtime_for_poll.cached_snapshot();
                 let next_error = super::current_runtime_error();
                 let previous = status.read().clone();
                 let next_throughput = snapshot_throughput(&next);
