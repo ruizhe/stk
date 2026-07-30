@@ -236,6 +236,9 @@ stk env curl https://api.ipify.org
 stk env -p production curl https://api.ipify.org
 stk env -p production/mixed-ssh@socks5h curl https://api.ipify.org
 stk env -p production -s http curl https://api.ipify.org
+stk env -p production -w curl https://api.ipify.org
+stk env -p production -r -P 1080 curl https://api.ipify.org
+stk env -p production -l -P 1081 curl https://api.ipify.org
 ```
 
 可以在配置中定义简短且可复用的 profile：
@@ -255,12 +258,14 @@ env:
       inherit: [no-proxy]
 ```
 
-不提供子命令时，`stk env` 会打印计算出的环境变量。增加 `--live` 后还会查询 control endpoint，只有所选 tunnel 当前处于 listening 状态才会继续。默认会选择第一个启用的 host 和 local proxy，也包括从 OpenSSH `DynamicForward` 继承的代理。mixed listener 默认使用 `http`，可以通过 `-s socks5h` 或 `-s socks5` 覆盖；只支持 SOCKS 的 listener 仍默认使用 `socks5h`。
+不提供子命令时，`stk env` 会打印计算出的环境变量。`-w/--http`、`-r/--socks5h` 和 `-l/--socks5` 是 `-s/--scheme` 的互斥快捷参数；同时指定多个快捷参数，或将快捷参数与 `-s` 同时使用，都会直接报错。默认会选择第一个启用的 host 和 local proxy，也包括从 OpenSSH `DynamicForward` 继承的代理。mixed listener 默认使用 `http`，只支持 SOCKS 的 listener 默认使用 `socks5h`。
+
+`-P/--port` 会在 host、tunnel 和 scheme 选择完成后，无条件覆盖最终代理 URL 的端口。它不会按端口查找配置，不要求该端口属于所选 tunnel，也不会检查端口是否正在监听。地址部分仍来自所选 listener 并进行客户端标准化，因此 `0.0.0.0:1080 -P 8080` 会得到 `127.0.0.1:8080`，`[::]:1080 -P 8080` 会得到 `[::1]:8080`。只有显式增加 `--live` 时，STK 才会在 runtime 中检查覆盖后的最终地址，而不是原配置端口。
 
 选择优先级为：
 
 ```text
-自动选择 < env.default < STK_PROXY_PROFILE < -p/--proxy < --host/--tunnel/--scheme
+自动选择 < env.default < STK_PROXY_PROFILE < -p/--proxy < -H/--host 和 -t/--tunnel < -s/--scheme 或 -w/-r/-l < -P/--port
 ```
 
 `inject` 和 `inherit` 用来控制传递给子进程的代理相关环境变量。可用变量组包括 `all-proxy`、`http-proxy` 和 `https-proxy`，`inherit` 还支持 `no-proxy`。每个变量组同时表示大小写形式，例如 `http-proxy` 同时对应 `HTTP_PROXY` 和 `http_proxy`。

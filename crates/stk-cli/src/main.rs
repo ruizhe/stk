@@ -706,6 +706,28 @@ mod tests {
     }
 
     #[test]
+    fn env_scheme_shortcuts_are_mutually_exclusive_and_validate_ports() {
+        for arguments in [
+            vec!["stk", "env", "-w", "-r", "curl"],
+            vec!["stk", "env", "-r", "-l", "curl"],
+            vec!["stk", "env", "-s", "http", "-w", "curl"],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+
+        for arguments in [
+            vec!["stk", "env", "-w", "-P", "8080", "curl"],
+            vec!["stk", "env", "-r", "-P", "1080", "curl"],
+            vec!["stk", "env", "-l", "-P", "1081", "curl"],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_ok());
+        }
+
+        assert!(Cli::try_parse_from(["stk", "env", "-P", "0", "curl"]).is_err());
+        assert!(Cli::try_parse_from(["stk", "env", "-P", "65536", "curl"]).is_err());
+    }
+
+    #[test]
     fn serve_defaults_to_user_scope_and_accepts_system_scope() {
         let user = Cli::try_parse_from(["stk", "serve"]).unwrap();
         let Some(Command::Serve(user)) = user.command else {

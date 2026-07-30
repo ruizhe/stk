@@ -235,6 +235,9 @@ stk env curl https://api.ipify.org
 stk env -p production curl https://api.ipify.org
 stk env -p production/mixed-ssh@socks5h curl https://api.ipify.org
 stk env -p production -s http curl https://api.ipify.org
+stk env -p production -w curl https://api.ipify.org
+stk env -p production -r -P 1080 curl https://api.ipify.org
+stk env -p production -l -P 1081 curl https://api.ipify.org
 ```
 
 Define short, reusable profiles in the configuration:
@@ -254,12 +257,14 @@ env:
       inherit: [no-proxy]
 ```
 
-Without a child command, `stk env` prints the computed variables. `--live` additionally queries the control endpoint and fails unless the selected tunnel is currently listening. Selection defaults to the first enabled host and local proxy, including inherited OpenSSH `DynamicForward` entries. A mixed listener defaults to `http`; use `-s socks5h` or `-s socks5` to override it. A SOCKS-only listener still defaults to `socks5h`.
+Without a child command, `stk env` prints the computed variables. `-w/--http`, `-r/--socks5h`, and `-l/--socks5` are mutually exclusive shortcuts for `-s/--scheme`; combining any of them with another explicit scheme option is an error. Selection defaults to the first enabled host and local proxy, including inherited OpenSSH `DynamicForward` entries. A mixed listener defaults to `http`, while a SOCKS-only listener defaults to `socks5h`.
+
+`-P/--port` unconditionally replaces the port in the final proxy URL after host, tunnel, and scheme selection. It does not search configuration by port, require the port to belong to the selected tunnel, or check whether it is listening. The selected listener's normalized address is retained, so `0.0.0.0:1080 -P 8080` becomes `127.0.0.1:8080` and `[::]:1080 -P 8080` becomes `[::1]:8080`. When `--live` is explicitly supplied, STK queries the runtime for the final port-overridden endpoint instead of the original configured port.
 
 Selection precedence is:
 
 ```text
-automatic selection < env.default < STK_PROXY_PROFILE < -p/--proxy < --host/--tunnel/--scheme
+automatic selection < env.default < STK_PROXY_PROFILE < -p/--proxy < -H/--host and -t/--tunnel < -s/--scheme or -w/-r/-l < -P/--port
 ```
 
 `inject` and `inherit` control the proxy-related environment variables passed to the child process. The available groups are `all-proxy`, `http-proxy`, and `https-proxy`; `inherit` also accepts `no-proxy`. Each group covers both uppercase and lowercase names, for example `http-proxy` means both `HTTP_PROXY` and `http_proxy`.

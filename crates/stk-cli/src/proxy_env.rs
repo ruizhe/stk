@@ -31,9 +31,39 @@ pub(super) struct EnvArgs {
         short,
         long,
         value_enum,
+        group = "scheme_choice",
         help = "Override the proxy scheme used by the child command"
     )]
     scheme: Option<EnvSchemeArg>,
+    #[arg(
+        short = 'w',
+        long = "http",
+        group = "scheme_choice",
+        help = "Use HTTP proxy URLs for the child command"
+    )]
+    http: bool,
+    #[arg(
+        short = 'r',
+        long = "socks5h",
+        group = "scheme_choice",
+        help = "Use SOCKS5 proxy URLs with remote DNS resolution"
+    )]
+    socks5h: bool,
+    #[arg(
+        short = 'l',
+        long = "socks5",
+        group = "scheme_choice",
+        help = "Use SOCKS5 proxy URLs with local DNS resolution"
+    )]
+    socks5: bool,
+    #[arg(
+        short = 'P',
+        long,
+        value_name = "PORT",
+        value_parser = clap::value_parser!(u16).range(1..),
+        help = "Override the port in the final proxy URL without matching configuration"
+    )]
+    port: Option<u16>,
     #[arg(
         short,
         long,
@@ -44,7 +74,7 @@ pub(super) struct EnvArgs {
     system: bool,
     #[arg(
         long,
-        help = "Require the selected local proxy to be listening in the running runtime"
+        help = "Require the selected or port-overridden proxy endpoint to be listening in the runtime"
     )]
     live: bool,
     #[arg(
@@ -80,6 +110,7 @@ struct ProxySelection {
     host: Option<String>,
     tunnel: Option<String>,
     scheme: Option<ProxyEnvScheme>,
+    port: Option<u16>,
     inject: Option<BTreeSet<ProxyEnvVariable>>,
     inherit: Option<BTreeSet<ProxyEnvVariable>>,
 }
@@ -90,6 +121,7 @@ impl From<EnvProfileConfig> for ProxySelection {
             host: profile.host,
             tunnel: profile.tunnel,
             scheme: profile.scheme,
+            port: None,
             inject: profile.inject,
             inherit: profile.inherit,
         }
@@ -100,6 +132,8 @@ impl From<EnvProfileConfig> for ProxySelection {
 struct ProxyEnvironmentPlan {
     candidate: LocalProxyCandidate,
     scheme: ProxyEnvScheme,
+    address: SocketAddr,
+    port_overridden: bool,
     url: String,
     set: BTreeMap<String, String>,
     remove: Vec<&'static str>,
@@ -119,7 +153,7 @@ pub(super) async fn run(args: EnvArgs) -> anyhow::Result<()> {
     let plan = build_proxy_environment_plan(&config, &selection)?;
 
     if args.live {
-        require_live_proxy(&config, scope, &plan.candidate).await?;
+        require_live_proxy(&config, scope, &plan).await?;
     }
 
     if args.command.is_empty() {
@@ -181,10 +215,33 @@ fn requested_proxy_selection_with_environment(
     if let Some(tunnel) = &args.tunnel {
         selection.tunnel = Some(non_empty_value("tunnel", tunnel)?);
     }
-    if let Some(scheme) = args.scheme {
-        selection.scheme = Some(scheme.into());
+    if let Some(scheme) = command_line_scheme(args)? {
+        selection.scheme = Some(scheme);
     }
+    selection.port = args.port;
     Ok(selection)
+}
+
+fn command_line_scheme(args: &EnvArgs) -> anyhow::Result<Option<ProxyEnvScheme>> {
+    let mut schemes = Vec::new();
+    if let Some(scheme) = args.scheme {
+        schemes.push(scheme.into());
+    }
+    if args.http {
+        schemes.push(ProxyEnvScheme::Http);
+    }
+    if args.socks5h {
+        schemes.push(ProxyEnvScheme::Socks5h);
+    }
+    if args.socks5 {
+        schemes.push(ProxyEnvScheme::Socks5);
+    }
+    if schemes.len() > 1 {
+        anyhow::bail!(
+            "-s/--scheme, -w/--http, -r/--socks5h, and -l/--socks5 are mutually exclusive"
+        );
+    }
+    Ok(schemes.into_iter().next())
 }
 
 fn selection_from_profile_or_selector(
@@ -301,8 +358,11 @@ fn build_proxy_environment_plan(
 
     let candidate = (*compatible[0]).clone();
     let scheme = resolve_proxy_scheme(candidate.protocol, requested_scheme);
-    let listen = proxy_connect_address(candidate.listen);
-    let url = format!("{}://{listen}", proxy_scheme_name(scheme));
+    let mut address = proxy_connect_address(candidate.listen);
+    if let Some(port) = selection.port {
+        address.set_port(port);
+    }
+    let url = format!("{}://{address}", proxy_scheme_name(scheme));
     let mut set = BTreeMap::new();
     let inject = selection.inject.as_ref().unwrap_or(&config.env.inject);
     let inherit = selection.inherit.as_ref().unwrap_or(&config.env.inherit);
@@ -336,6 +396,8 @@ fn build_proxy_environment_plan(
     Ok(ProxyEnvironmentPlan {
         candidate,
         scheme,
+        address,
+        port_overridden: selection.port.is_some(),
         url,
         set,
         remove,
@@ -403,37 +465,63 @@ fn format_proxy_selection(selection: &ProxySelection) -> String {
 async fn require_live_proxy(
     config: &AppConfig,
     scope: ConfigScope,
-    candidate: &LocalProxyCandidate,
+    plan: &ProxyEnvironmentPlan,
 ) -> anyhow::Result<()> {
     let endpoint = ControlEndpoint::from_config(&config.control, scope)?;
     let snapshot = fetch_runtime_snapshot(&endpoint)
         .await
         .with_context(|| format!("failed to query runtime at {endpoint}"))?;
-    let tunnel = snapshot
+    let host = snapshot
         .hosts
         .iter()
-        .find(|host| host.name == candidate.host)
-        .and_then(|host| {
-            host.tunnels.iter().find(|tunnel| {
-                tunnel.kind == TunnelKind::LocalProxy && tunnel.name == candidate.tunnel
-            })
+        .find(|host| host.name == plan.candidate.host)
+        .with_context(|| format!("runtime does not contain SSH host {}", plan.candidate.host))?;
+    let tunnel = if plan.port_overridden {
+        host.tunnels.iter().find(|tunnel| {
+            tunnel.kind == TunnelKind::LocalProxy
+                && tunnel
+                    .listen
+                    .parse::<SocketAddr>()
+                    .ok()
+                    .map(proxy_connect_address)
+                    == Some(plan.address)
         })
-        .with_context(|| {
+    } else {
+        host.tunnels.iter().find(|tunnel| {
+            tunnel.kind == TunnelKind::LocalProxy && tunnel.name == plan.candidate.tunnel
+        })
+    }
+    .with_context(|| {
+        if plan.port_overridden {
+            format!(
+                "runtime does not contain a local proxy for host {} at {}",
+                plan.candidate.host, plan.address
+            )
+        } else {
             format!(
                 "runtime does not contain local proxy {}/{}",
-                candidate.host, candidate.tunnel
+                plan.candidate.host, plan.candidate.tunnel
             )
-        })?;
+        }
+    })?;
     if tunnel.status != TunnelRuntimeStatus::Listening {
         let detail = tunnel
             .last_error
             .as_deref()
             .map(|error| format!(": {error}"))
             .unwrap_or_default();
+        if plan.port_overridden {
+            anyhow::bail!(
+                "local proxy endpoint {} for host {} is {}{detail}",
+                plan.address,
+                plan.candidate.host,
+                tunnel_status_label(tunnel.status)
+            );
+        }
         anyhow::bail!(
             "local proxy {}/{} is {}{detail}",
-            candidate.host,
-            candidate.tunnel,
+            plan.candidate.host,
+            plan.candidate.tunnel,
             tunnel_status_label(tunnel.status)
         );
     }
@@ -473,6 +561,10 @@ mod tests {
             host: None,
             tunnel: None,
             scheme: None,
+            http: false,
+            socks5h: false,
+            socks5: false,
+            port: None,
             config: None,
             system: false,
             live: false,
@@ -555,12 +647,40 @@ hosts:
 
         args.proxy = Some("corp".to_string());
         args.tunnel = Some("web".to_string());
-        args.scheme = Some(EnvSchemeArg::Http);
+        args.http = true;
+        args.port = Some(9080);
         let from_arguments =
             requested_proxy_selection_with_environment(&config, &args, Some("web")).unwrap();
         assert_eq!(from_arguments.host.as_deref(), Some("alpha"));
         assert_eq!(from_arguments.tunnel.as_deref(), Some("web"));
         assert_eq!(from_arguments.scheme, Some(ProxyEnvScheme::Http));
+        assert_eq!(from_arguments.port, Some(9080));
+    }
+
+    #[test]
+    fn scheme_shortcuts_map_to_their_explicit_schemes() {
+        let config = env_test_config();
+        for (set_shortcut, expected) in [
+            ("http", ProxyEnvScheme::Http),
+            ("socks5h", ProxyEnvScheme::Socks5h),
+            ("socks5", ProxyEnvScheme::Socks5),
+        ] {
+            let mut args = env_args();
+            match set_shortcut {
+                "http" => args.http = true,
+                "socks5h" => args.socks5h = true,
+                "socks5" => args.socks5 = true,
+                _ => unreachable!(),
+            }
+            let selection =
+                requested_proxy_selection_with_environment(&config, &args, None).unwrap();
+            assert_eq!(selection.scheme, Some(expected));
+        }
+
+        let mut conflicting = env_args();
+        conflicting.scheme = Some(EnvSchemeArg::Http);
+        conflicting.socks5h = true;
+        assert!(requested_proxy_selection_with_environment(&config, &conflicting, None).is_err());
     }
 
     #[test]
@@ -606,6 +726,39 @@ hosts:
         )
         .unwrap();
         assert_eq!(socks_only.url, "socks5h://127.0.0.1:2080");
+    }
+
+    #[test]
+    fn port_override_replaces_the_final_port_without_selecting_by_port() {
+        let config = env_test_config();
+        let ipv4 = build_proxy_environment_plan(
+            &config,
+            &ProxySelection {
+                host: Some("alpha".to_string()),
+                tunnel: Some("socks".to_string()),
+                scheme: Some(ProxyEnvScheme::Socks5h),
+                port: Some(6553),
+                ..ProxySelection::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ipv4.candidate.listen, "0.0.0.0:1080".parse().unwrap());
+        assert_eq!(ipv4.address, "127.0.0.1:6553".parse().unwrap());
+        assert_eq!(ipv4.url, "socks5h://127.0.0.1:6553");
+        assert!(ipv4.port_overridden);
+
+        let ipv6 = build_proxy_environment_plan(
+            &config,
+            &ProxySelection {
+                host: Some("alpha".to_string()),
+                tunnel: Some("web".to_string()),
+                port: Some(9080),
+                ..ProxySelection::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ipv6.address, "[::1]:9080".parse().unwrap());
+        assert_eq!(ipv6.url, "http://[::1]:9080");
     }
 
     #[test]
