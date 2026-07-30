@@ -94,6 +94,8 @@ download_tool \
 case "$TOOL_ARCH" in
     x86_64)
         APPIMAGE_RUNTIME_SHA256=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+        APPIMAGE_RUNTIME_DIGEST_OFFSET=932096
+        APPIMAGE_RUNTIME_DIGEST_SIZE=16
         ;;
 esac
 
@@ -176,7 +178,16 @@ if [ ! -x "$OUTPUT" ]; then
 fi
 
 runtime_size=$(wc -c < "$APPIMAGE_RUNTIME" | tr -d ' ')
-if ! cmp -s -n "$runtime_size" "$APPIMAGE_RUNTIME" "$OUTPUT"; then
+runtime_tail_offset=$((APPIMAGE_RUNTIME_DIGEST_OFFSET + APPIMAGE_RUNTIME_DIGEST_SIZE))
+runtime_tail_size=$((runtime_size - runtime_tail_offset))
+
+# appimagetool writes the completed AppImage MD5 into the runtime's
+# .digest_md5 section. Everything before and after that field must still
+# match the pinned static runtime exactly.
+if ! cmp -s -n "$APPIMAGE_RUNTIME_DIGEST_OFFSET" "$APPIMAGE_RUNTIME" "$OUTPUT" || \
+    ! cmp -s -i "$runtime_tail_offset" -n "$runtime_tail_size" \
+        "$APPIMAGE_RUNTIME" "$OUTPUT"
+then
     echo "generated AppImage does not contain the selected static runtime" >&2
     exit 1
 fi
