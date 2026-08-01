@@ -48,6 +48,29 @@ use tokio::{
 use tracing::{Instrument, debug, info, info_span, warn};
 
 const MAX_CONCURRENT_SESSION_STARTS_PER_HOST: usize = 2;
+const SESSION_SCALE_UP_UTILIZATION_NUMERATOR: usize = 3;
+const SESSION_SCALE_UTILIZATION_DENOMINATOR: usize = 4;
+const SESSION_SCALE_DOWN_UTILIZATION_NUMERATOR: usize = 1;
+
+#[cfg(not(test))]
+const SESSION_MANAGER_TICK_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const SESSION_MANAGER_TICK_INTERVAL: Duration = Duration::from_millis(20);
+
+#[cfg(not(test))]
+const SESSION_SCALE_UP_SUSTAINED_INTERVAL: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const SESSION_SCALE_UP_SUSTAINED_INTERVAL: Duration = Duration::from_millis(40);
+
+#[cfg(not(test))]
+const SESSION_SCALE_DOWN_IDLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+#[cfg(test)]
+const SESSION_SCALE_DOWN_IDLE_INTERVAL: Duration = Duration::from_millis(200);
+
+#[cfg(not(test))]
+const SESSION_SCALE_DOWN_STEP_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const SESSION_SCALE_DOWN_STEP_INTERVAL: Duration = Duration::from_millis(40);
 
 fn initial_session_start_count(minimum: usize) -> usize {
     minimum.min(MAX_CONCURRENT_SESSION_STARTS_PER_HOST)
@@ -55,6 +78,33 @@ fn initial_session_start_count(minimum: usize) -> usize {
 
 fn can_start_another_session(connecting: usize) -> bool {
     connecting < MAX_CONCURRENT_SESSION_STARTS_PER_HOST
+}
+
+fn session_pool_is_under_pressure(
+    in_flight: usize,
+    healthy_sessions: usize,
+    max_channels_per_session: usize,
+) -> bool {
+    healthy_sessions > 0
+        && (in_flight as u128).saturating_mul(SESSION_SCALE_UTILIZATION_DENOMINATOR as u128)
+            >= (healthy_sessions as u128)
+                .saturating_mul(max_channels_per_session as u128)
+                .saturating_mul(SESSION_SCALE_UP_UTILIZATION_NUMERATOR as u128)
+}
+
+fn session_pool_can_scale_down(
+    in_flight: usize,
+    healthy_sessions: usize,
+    minimum_sessions: usize,
+    max_channels_per_session: usize,
+) -> bool {
+    if healthy_sessions <= minimum_sessions {
+        return false;
+    }
+    let capacity_after_scale_down = (healthy_sessions - 1).saturating_mul(max_channels_per_session);
+    (in_flight as u128).saturating_mul(SESSION_SCALE_UTILIZATION_DENOMINATOR as u128)
+        <= (capacity_after_scale_down as u128)
+            .saturating_mul(SESSION_SCALE_DOWN_UTILIZATION_NUMERATOR as u128)
 }
 
 #[cfg(test)]
@@ -1003,8 +1053,12 @@ async fn manage_ssh_sessions(
     let mut next_owner_attempt = Instant::now();
     let mut next_rotation_at = rotation_interval.map(|interval| Instant::now() + interval);
     let mut scheduled_rotation = None;
+    let mut desired_sessions = pool.min_sessions_per_host;
+    let mut high_pressure_since = None;
+    let mut low_pressure_since = None;
+    let mut next_scale_down_at = None;
     let mut tasks = JoinSet::new();
-    let mut ticker = interval(Duration::from_millis(100));
+    let mut ticker = interval(SESSION_MANAGER_TICK_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     for _ in 0..initial_session_start_count(pool.min_sessions_per_host) {
@@ -1098,16 +1152,24 @@ async fn manage_ssh_sessions(
                 let mut active_count = 0_usize;
                 let mut healthy_non_retiring = 0_usize;
                 let mut connecting_non_retiring = 0_usize;
+                let mut active_non_retiring = 0_usize;
+                let mut healthy_in_flight = 0_usize;
                 let mut retirement_pending = false;
                 for session in &sessions {
                     let state = session.state.read().await;
                     if state.status != SshSessionStatus::Offline {
                         active_count += 1;
+                        if !session.retire_requested.load(Ordering::Relaxed) {
+                            active_non_retiring += 1;
+                        }
                     }
                     if state.status == SshSessionStatus::Healthy
                         && !session.retire_requested.load(Ordering::Relaxed)
                     {
                         healthy_non_retiring += 1;
+                        healthy_in_flight = healthy_in_flight.saturating_add(
+                            session.in_flight.load(Ordering::Relaxed),
+                        );
                     }
                     if state.status == SshSessionStatus::Connecting
                         && !session.retire_requested.load(Ordering::Relaxed)
@@ -1142,6 +1204,31 @@ async fn manage_ssh_sessions(
                     }
                 }
 
+                let under_pressure = session_pool_is_under_pressure(
+                    healthy_in_flight,
+                    healthy_non_retiring,
+                    pool.max_channels_per_session,
+                );
+                let can_scale_down = session_pool_can_scale_down(
+                    healthy_in_flight,
+                    healthy_non_retiring,
+                    pool.min_sessions_per_host,
+                    pool.max_channels_per_session,
+                );
+                if under_pressure {
+                    high_pressure_since.get_or_insert(now);
+                    low_pressure_since = None;
+                    next_scale_down_at = None;
+                } else {
+                    high_pressure_since = None;
+                    if can_scale_down {
+                        low_pressure_since.get_or_insert(now);
+                    } else {
+                        low_pressure_since = None;
+                        next_scale_down_at = None;
+                    }
+                }
+
                 if next_rotation_at.is_some_and(|next| now >= next)
                     && scheduled_rotation.is_none()
                     && !retirement_pending
@@ -1161,23 +1248,38 @@ async fn manage_ssh_sessions(
                     );
                 }
 
-                let needs_minimum = active_count < pool.min_sessions_per_host;
-                let needs_replacement = retirement_pending
-                    && healthy_non_retiring < pool.min_sessions_per_host
+                let needs_desired_capacity = active_non_retiring < desired_sessions
                     && active_count < pool.max_sessions_per_host;
                 let needs_scheduled_replacement = scheduled_rotation
                     .as_ref()
                     .is_some_and(|rotation| rotation.replacement_session_id.is_none())
                     && active_count < pool.max_sessions_per_host;
-                if (needs_minimum || needs_replacement || needs_scheduled_replacement)
+                let needs_elastic_capacity = scheduled_rotation.is_none()
+                    && !needs_desired_capacity
+                    && !needs_scheduled_replacement
+                    && under_pressure
+                    && high_pressure_since.is_some_and(|since| {
+                        now.saturating_duration_since(since)
+                            >= SESSION_SCALE_UP_SUSTAINED_INTERVAL
+                    })
+                    && connecting_non_retiring == 0
+                    && active_count < pool.max_sessions_per_host;
+                if (needs_desired_capacity
+                    || needs_scheduled_replacement
+                    || needs_elastic_capacity)
                     && can_start_another_session(connecting_non_retiring)
-                    && Instant::now() >= next_spawn_at
+                    && now >= next_spawn_at
                 {
                     let session_id = stats::next_ssh_session_id();
                     if needs_scheduled_replacement
                         && let Some(rotation) = scheduled_rotation.as_mut()
                     {
                         rotation.replacement_session_id = Some(session_id);
+                    }
+                    if needs_elastic_capacity {
+                        desired_sessions = desired_sessions
+                            .saturating_add(1)
+                            .min(pool.max_sessions_per_host);
                     }
                     spawn_managed_session(
                         &mut tasks,
@@ -1189,19 +1291,62 @@ async fn manage_ssh_sessions(
                         &node,
                     )
                     .await;
-                    next_spawn_at = Instant::now() + spawn_cooldown;
+                    next_spawn_at = now + spawn_cooldown;
+                    if needs_elastic_capacity {
+                        high_pressure_since = None;
+                        info!(
+                            host_name = %outbound,
+                            ssh_session_id = session_id,
+                            active_channels = healthy_in_flight,
+                            healthy_sessions = healthy_non_retiring,
+                            max_sessions = pool.max_sessions_per_host,
+                            "scaling up SSH session pool for sustained channel pressure"
+                        );
+                    }
+                }
+
+                let scale_down_ready = scheduled_rotation.is_none()
+                    && !retirement_pending
+                    && connecting_non_retiring == 0
+                    && desired_sessions > pool.min_sessions_per_host
+                    && low_pressure_since.is_some_and(|since| {
+                        now.saturating_duration_since(since)
+                            >= SESSION_SCALE_DOWN_IDLE_INTERVAL
+                    })
+                    && next_scale_down_at.is_none_or(|next| now >= next);
+                if scale_down_ready
+                    && let Some(session_id) = newest_idle_elastic_session_id(
+                        &node,
+                        pool.min_sessions_per_host,
+                    ).await
+                    && let Some(session) = sessions.iter().find(|session| session.id == session_id)
+                {
+                    session.retire_requested.store(true, Ordering::Release);
+                    retirement_pending = true;
+                    desired_sessions = desired_sessions
+                        .saturating_sub(1)
+                        .max(pool.min_sessions_per_host);
+                    next_scale_down_at = Some(now + SESSION_SCALE_DOWN_STEP_INTERVAL);
+                    info!(
+                        host_name = %outbound,
+                        ssh_session_id = session_id,
+                        active_channels = healthy_in_flight,
+                        healthy_sessions = healthy_non_retiring,
+                        minimum_sessions = pool.min_sessions_per_host,
+                        "retiring idle elastic SSH session"
+                    );
                 }
 
                 let forced_turnover = retirement_pending
                     && active_count >= pool.max_sessions_per_host
-                    && healthy_non_retiring < pool.min_sessions_per_host
+                    && active_non_retiring < desired_sessions
                     && connecting_non_retiring == 0;
                 drain_replaced_sessions(
                     &node,
                     if forced_turnover {
                         0
                     } else {
-                        pool.min_sessions_per_host
+                        desired_sessions
                     },
                     drain_timeout,
                 )
@@ -1209,6 +1354,33 @@ async fn manage_ssh_sessions(
             }
         }
     }
+}
+
+async fn newest_idle_elastic_session_id(
+    node: &Arc<NativeSshNode>,
+    minimum_sessions: usize,
+) -> Option<u64> {
+    let owner = *node.remote_owner.read().await;
+    let sessions = node.sessions.read().await.clone();
+    let mut healthy_non_retiring = 0_usize;
+    let mut candidate = None;
+    for session in sessions {
+        if session.retire_requested.load(Ordering::Relaxed)
+            || session.state.read().await.status != SshSessionStatus::Healthy
+        {
+            continue;
+        }
+        healthy_non_retiring += 1;
+        if owner != Some(session.id)
+            && session.in_flight.load(Ordering::Relaxed) == 0
+            && candidate.is_none_or(|current| session.id > current)
+        {
+            candidate = Some(session.id);
+        }
+    }
+    (healthy_non_retiring > minimum_sessions)
+        .then_some(candidate)
+        .flatten()
 }
 
 async fn oldest_healthy_session_id(node: &Arc<NativeSshNode>) -> Option<u64> {
@@ -2107,14 +2279,26 @@ async fn drain_replaced_sessions(
         return;
     }
 
+    let mut draining_in_progress = false;
+    for session in &sessions {
+        if session.state.read().await.status == SshSessionStatus::Draining {
+            draining_in_progress = true;
+            break;
+        }
+    }
+
     for session in sessions {
         if !session.retire_requested.load(Ordering::Relaxed) || owner == Some(session.id) {
             continue;
         }
         let mut state = session.state.write().await;
         if state.status != SshSessionStatus::Draining {
+            if draining_in_progress {
+                continue;
+            }
             state.status = SshSessionStatus::Draining;
             state.drain_started = Some(Instant::now());
+            draining_in_progress = true;
             info!(
                 ssh_host = %node.name,
                 ssh_session_id = session.id,
@@ -2390,6 +2574,17 @@ mod tests {
         assert_eq!(initial_session_start_count(10), 2);
         assert!(can_start_another_session(1));
         assert!(!can_start_another_session(2));
+    }
+
+    #[test]
+    fn elastic_session_pool_uses_hysteresis() {
+        assert!(!session_pool_is_under_pressure(2, 1, 4));
+        assert!(session_pool_is_under_pressure(3, 1, 4));
+        assert!(session_pool_is_under_pressure(6, 2, 4));
+
+        assert!(!session_pool_can_scale_down(2, 2, 1, 4));
+        assert!(session_pool_can_scale_down(1, 2, 1, 4));
+        assert!(!session_pool_can_scale_down(0, 1, 1, 4));
     }
 
     #[test]
@@ -2861,6 +3056,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unhealthy_session_is_replaced_without_reducing_target_capacity() {
+        let (ssh_address, server) = start_test_ssh_server().await;
+        let key_path = write_test_key("health-replacement");
+        let pool = SshPoolDialer::start(
+            "health-replacement",
+            test_pool_config(ssh_address, &key_path, 2, 3, 8, Vec::new()),
+            ProbeConfig {
+                enabled: false,
+                ..ProbeConfig::default()
+            },
+        )
+        .unwrap();
+        let node = Arc::clone(&pool.nodes[0]);
+        wait_for_healthy_sessions(&node, 2).await;
+        let original = node.sessions.read().await[0].clone();
+
+        mark_session_probe_failure(&original, "test health failure", true).await;
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let sessions = node.sessions.read().await.clone();
+                let mut healthy = 0_usize;
+                let mut original_present = false;
+                for session in sessions {
+                    original_present |= session.id == original.id;
+                    if session.state.read().await.status == SshSessionStatus::Healthy
+                        && !session.retire_requested.load(AtomicOrdering::Relaxed)
+                    {
+                        healthy += 1;
+                    }
+                }
+                if !original_present && healthy == 2 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("unhealthy SSH session was not replaced at the target pool size");
+
+        drop(pool);
+        let _ = std::fs::remove_file(key_path);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn scheduled_rotation_waits_for_a_healthy_replacement() {
         let candidate = Arc::new(ManagedSshSession {
             id: 1,
@@ -2908,6 +3149,68 @@ mod tests {
         ));
         assert!(candidate.retire_requested.load(Ordering::Relaxed));
         assert!(!replacement.retire_requested.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn health_replacements_wait_for_capacity_and_drain_serially() {
+        let session = |id, status, retiring| {
+            Arc::new(ManagedSshSession {
+                id,
+                state: Arc::new(RwLock::new(SshSessionState {
+                    status,
+                    ..SshSessionState::default()
+                })),
+                handle: Arc::new(RwLock::new(None)),
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                retire_requested: AtomicBool::new(retiring),
+            })
+        };
+        let first_unhealthy = session(1, SshSessionStatus::Suspect, true);
+        let second_unhealthy = session(2, SshSessionStatus::Suspect, true);
+        let first_replacement = session(3, SshSessionStatus::Healthy, false);
+        let second_replacement = session(4, SshSessionStatus::Connecting, false);
+        let node = Arc::new(NativeSshNode {
+            name: "serialized-health-replacement".to_string(),
+            state: Arc::new(RwLock::new(SshNodeState::default())),
+            sessions: Arc::new(RwLock::new(vec![
+                Arc::clone(&first_unhealthy),
+                Arc::clone(&second_unhealthy),
+                first_replacement,
+                Arc::clone(&second_replacement),
+            ])),
+            remote_owner: Arc::new(RwLock::new(None)),
+            channel_open_timeout: Duration::from_secs(1),
+            max_channels_per_session: 8,
+        });
+
+        drain_replaced_sessions(&node, 2, Duration::from_secs(10)).await;
+        assert_eq!(
+            [Arc::clone(&first_unhealthy), Arc::clone(&second_unhealthy)]
+                .into_iter()
+                .filter(|session| {
+                    session
+                        .state
+                        .try_read()
+                        .is_ok_and(|state| state.status == SshSessionStatus::Draining)
+                })
+                .count(),
+            0
+        );
+
+        second_replacement.state.write().await.status = SshSessionStatus::Healthy;
+        drain_replaced_sessions(&node, 2, Duration::from_secs(10)).await;
+        assert_eq!(
+            [first_unhealthy, second_unhealthy]
+                .into_iter()
+                .filter(|session| {
+                    session
+                        .state
+                        .try_read()
+                        .is_ok_and(|state| state.status == SshSessionStatus::Draining)
+                })
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2989,6 +3292,88 @@ mod tests {
 
         drop(first);
         drop(second);
+        drop(pool);
+        let _ = std::fs::remove_file(key_path);
+        target_task.await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn native_ssh_pool_scales_with_pressure_and_returns_to_minimum() {
+        let (target, target_task) = start_persistent_echo_server(3).await;
+        let (ssh_address, server) = start_test_ssh_server().await;
+        let key_path = write_test_key("elastic-session-pool");
+        let pool = SshPoolDialer::start(
+            "elastic-session-pool",
+            test_pool_config(ssh_address, &key_path, 1, 3, 1, Vec::new()),
+            ProbeConfig {
+                enabled: false,
+                ..ProbeConfig::default()
+            },
+        )
+        .unwrap();
+        let node = Arc::clone(&pool.nodes[0]);
+        wait_for_healthy_sessions(&node, 1).await;
+
+        let first = pool
+            .dial(DialContext {
+                host_name: "elastic-session-pool".to_string(),
+                target: TargetAddr::Socket(target),
+                connection_id: None,
+            })
+            .await
+            .unwrap();
+        wait_for_healthy_sessions(&node, 2).await;
+
+        let second = pool
+            .dial(DialContext {
+                host_name: "elastic-session-pool".to_string(),
+                target: TargetAddr::Socket(target),
+                connection_id: None,
+            })
+            .await
+            .unwrap();
+        wait_for_healthy_sessions(&node, 3).await;
+
+        let third = pool
+            .dial(DialContext {
+                host_name: "elastic-session-pool".to_string(),
+                target: TargetAddr::Socket(target),
+                connection_id: None,
+            })
+            .await
+            .unwrap();
+
+        let sessions = node.sessions.read().await.clone();
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(
+            sessions
+                .iter()
+                .filter(|session| session.in_flight.load(AtomicOrdering::Relaxed) == 1)
+                .count(),
+            3
+        );
+        sleep(Duration::from_millis(100)).await;
+        assert!(node.sessions.read().await.len() <= 3);
+
+        drop(first);
+        drop(second);
+        drop(third);
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let sessions = node.sessions.read().await.clone();
+                if sessions.len() == 1
+                    && sessions[0].state.read().await.status == SshSessionStatus::Healthy
+                    && !sessions[0].retire_requested.load(AtomicOrdering::Relaxed)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("elastic SSH session pool did not return to its minimum size");
+
         drop(pool);
         let _ = std::fs::remove_file(key_path);
         target_task.await.unwrap();

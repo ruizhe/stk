@@ -540,9 +540,15 @@ macOS 主窗口显示时会出现在 Dock 和 Cmd+Tab；关闭窗口后切换为
 
 ## 可靠性与统计
 
-每个 SSH host 默认维持 session pool。新 channel 按 session RTT、活跃 channel、容量和健康状态调度；探针接近失败阈值时，runtime 会先创建 replacement，再让可疑 session 停止接收新 channel，并等待已有 channel 排空。
+每个 SSH host 默认维持 session pool。新 channel 会按 session RTT、活跃 channel、容量和健康状态自动调度，因此同一 host 的并发请求会分散到合适的健康 session，而不是固定使用一条连接。
 
-内置默认值为 3 条活跃 session、最多 10 条 session；这两个值都可以通过 `override-default` 或单个 host 下的 `min-sessions`、`max-sessions` 修改。定时轮转默认开启，每个 host 每小时只轮转一条最老的健康 session，因此多条 session 会交错更新。STK 会先利用池中的备用容量建立 replacement，再让被选中的 session 停止接收新 channel；已有 channel 排空后，该 session 会退出并从运行状态列表中移除。可以用 `session-rotation-enabled: false` 关闭，或通过 `session-rotation-interval-secs` 修改间隔。如果 `max-sessions` 没有留下备用容量，主动轮转会等待，不会先断开旧 session。
+`min-sessions` 是始终维持的常驻基线，`max-sessions` 是压力扩容上限。内置默认值为 3 条常驻 session、最多 10 条 session；这两个值都可以通过 `override-default` 或单个 host 修改。配置较大的 `min-sessions`（例如 10）时，STK 不会主动降到内置默认值。健康 session 的 channel 利用率达到 75% 并持续 2 秒后，池会在建连冷却和并发握手限制下逐条扩容，直到压力缓解或达到 `max-sessions`。负载下降到缩容后一条 session 容量的 25% 以下并持续空闲 5 分钟后，额外 session 会每 30 秒优雅排空一条，且永远不会低于 `min-sessions`。
+
+探针接近失败阈值时，runtime 仍会请求创建 replacement，可疑 session 会立即停止接收新 channel，并在目标池容量恢复后等待已有 channel 排空。质量替换会保持当前目标池容量，也受建连冷却、指数退避和每 host 最多两个并发 SSH 握手的限制，避免弱网下形成重连风暴。
+
+定时轮转默认开启，每个 host 每小时只轮转一条最老的健康 session，因此多条 session 会交错更新。STK 会先利用池中的备用容量建立 replacement，再让被选中的 session 停止接收新 channel；已有 channel 排空后，该 session 会退出并从运行状态列表中移除。可以用 `session-rotation-enabled: false` 关闭，或通过 `session-rotation-interval-secs` 修改间隔。如果 `max-sessions` 没有留下备用容量，主动轮转会等待，不会先断开旧 session。
+
+为控制移动设备功耗，session 管理循环每秒检查一次容量，扩容要求持续高水位且一次只增加一条，缩容使用较长空闲窗口。`min-sessions` 中的每条常驻连接仍需要 keepalive 和质量探测，因此该值越大，基础网络活动和功耗也会相应增加。上述池管理逻辑位于跨平台 core，在 macOS、Linux 和 Windows 上一致。
 
 远端转发采用单 owner 加 warm standby。owner 不可靠时，STK 会释放旧 remote listener，并通过健康 standby 重新注册。没有远端 agent 时，已经建立在旧 SSH session 上的 channel 仍由原 session 处理，新的连接切换到新 owner。
 
