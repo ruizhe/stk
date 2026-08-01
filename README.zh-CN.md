@@ -275,7 +275,7 @@ env:
 
 ### GUI 快速启动器
 
-GUI 在概览页顶部显示紧凑的浏览器和应用入口。点击浏览器主图标会使用选中的代理启动普通模式，点击右侧小箭头会使用同一代理直接启动隐身模式；普通应用只有一个启动按钮。入口不可用时会置灰，鼠标提示会说明是命令不存在、代理尚未监听还是配置选择无效。
+GUI 在概览页顶部显示紧凑的浏览器和应用入口。点击浏览器主图标会使用选中的代理启动普通模式，点击右侧小箭头会打开菜单，可选择使用同一代理的普通模式或隐身模式；普通应用只有一个启动按钮。入口不可用时会置灰，鼠标提示会说明是命令不存在、代理尚未监听还是配置选择无效。
 
 浏览器与普通应用分别配置：
 
@@ -325,7 +325,7 @@ launchers:
 
 `proxy` 可以是 `env.profiles` 中的名称、`HOST/TUNNEL@SCHEME`、`direct`、`inherit` 或 `default`。`default` 表示继续使用上一级默认值；优先级为入口、浏览器/应用分组、`launchers.default-proxy`、`env.default`，最后自动选择第一个兼容的本地代理。`direct` 会清理继承的代理环境变量，`inherit` 保留当前进程环境。
 
-内置 Chromium 和 Firefox 启动器使用 STK 独立的持久浏览器 profile，避免修改用户原有浏览器配置。自定义浏览器和应用的 `proxy-args` 支持 `{proxy-url}`、`{proxy-scheme}`、`{proxy-host}`、`{proxy-port}`；浏览器还支持 `{profile-dir}`。`icon` 在当前版本中显示最多两个字符，适合填写简称。
+内置 Chromium 启动器默认复用浏览器原有的默认 profile，只有显式配置 `profile-dir` 时才使用指定目录。STK 只追加选中的代理参数，隐身启动时再追加浏览器的隐身参数；用户配置的 `args`、`normal-args` 和 `private-args` 保持不变。Firefox 为了在不修改用户默认配置的情况下可靠应用单次启动代理，仍需使用 STK 管理的 profile。自定义浏览器和应用的 `proxy-args` 支持 `{proxy-url}`、`{proxy-scheme}`、`{proxy-host}`、`{proxy-port}`；浏览器还支持 `{profile-dir}`。`icon` 在当前版本中显示最多两个字符，适合填写简称。
 
 ## 四类转发
 

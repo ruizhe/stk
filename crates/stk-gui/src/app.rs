@@ -981,14 +981,16 @@ fn QuickLauncherBar(
 ) -> Element {
     let launching = use_signal(|| None::<String>);
     let mut notice = use_signal(|| None::<LauncherNotice>);
+    let mut open_menu = use_signal(|| None::<String>);
 
     let current_catalog = catalog.read().clone();
     let current_notice = notice.read().clone();
     let busy = launching.read().is_some();
+    let any_menu_open = open_menu.read().is_some();
     let config_path_for_refresh = config_path.clone();
 
     rsx! {
-        section { class: "quick-launcher",
+        section { class: if any_menu_open { "quick-launcher menu-open" } else { "quick-launcher" },
             header { class: "quick-launcher-header",
                 div { class: "quick-launcher-heading",
                     span { class: "eyebrow", {tr(language, "Quick access", "快速入口")} }
@@ -1015,6 +1017,7 @@ fn QuickLauncherBar(
                         onclick: move |_| {
                             catalog.set(LauncherCatalog::load(&config_path_for_refresh));
                             notice.set(None);
+                            open_menu.set(None);
                         },
                         RefreshCw { size: 14 }
                     }
@@ -1046,6 +1049,7 @@ fn QuickLauncherBar(
                             language,
                             launching,
                             notice,
+                            open_menu,
                         }
                     }
                 }
@@ -1062,10 +1066,12 @@ fn LauncherTile(
     language: Language,
     launching: Signal<Option<String>>,
     notice: Signal<Option<LauncherNotice>>,
+    mut open_menu: Signal<Option<String>>,
 ) -> Element {
     let unavailable = item.unavailable_reason(&status);
     let disabled = busy || unavailable.is_some();
     let is_browser = item.is_browser();
+    let menu_open = open_menu.read().as_deref() == Some(item.id.as_str());
     let proxy_summary = item.proxy_summary();
     let normal_title = unavailable.clone().unwrap_or_else(|| {
         match language {
@@ -1078,41 +1084,113 @@ fn LauncherTile(
         Language::Chinese => format!("使用 {} 以隐身模式启动 {}", proxy_summary, item.name),
     });
     let normal_item = item.clone();
+    let menu_normal_item = item.clone();
     let private_item = item.clone();
+    let menu_launcher_id = item.id.clone();
     let item_name = item.name.clone();
+    let menu_icon_text = item.icon_text.clone();
+    let menu_private_icon_text = item.icon_text.clone();
+    let normal_mode_label = tr(language, "Normal mode", "普通模式");
+    let normal_mode_description = match language {
+        Language::English => format!("Start {} with the configured proxy", item.name),
+        Language::Chinese => format!("使用已配置的代理启动 {}", item.name),
+    };
+    let private_mode_label = tr(language, "Private mode", "隐身模式");
+    let private_mode_description = match language {
+        Language::English => format!("Start {} privately with the configured proxy", item.name),
+        Language::Chinese => format!("使用已配置的代理以隐身模式启动 {}", item.name),
+    };
 
     rsx! {
         div {
             class: if unavailable.is_some() { "launcher-tile unavailable" } else { "launcher-tile" },
+            onmouseleave: move |_| open_menu.set(None),
             div { class: if is_browser { "launcher-button-group browser" } else { "launcher-button-group" },
                 button {
                     class: "launcher-main-button",
                     title: "{normal_title}",
                     aria_label: "{normal_title}",
                     disabled,
-                    onclick: move |_| launch_launcher(
-                        normal_item.clone(),
-                        LaunchMode::Normal,
-                        language,
-                        launching,
-                        notice,
-                    ),
+                    onclick: move |_| {
+                        open_menu.set(None);
+                        launch_launcher(
+                            normal_item.clone(),
+                            LaunchMode::Normal,
+                            language,
+                            launching,
+                            notice,
+                        );
+                    },
                     span { class: "launcher-icon-text", "{item.icon_text}" }
                 }
                 if is_browser {
                     button {
-                        class: "launcher-private-button",
-                        title: "{private_title}",
-                        aria_label: "{private_title}",
+                        class: "launcher-menu-button",
+                        title: tr(language, "Choose launch mode", "选择启动模式"),
+                        aria_label: tr(language, "Choose launch mode", "选择启动模式"),
+                        aria_haspopup: "menu",
+                        aria_expanded: menu_open,
                         disabled,
-                        onclick: move |_| launch_launcher(
-                            private_item.clone(),
-                            LaunchMode::Private,
-                            language,
-                            launching,
-                            notice,
-                        ),
+                        onclick: move |_| {
+                            let is_open = open_menu.read().as_deref()
+                                == Some(menu_launcher_id.as_str());
+                            if is_open {
+                                open_menu.set(None);
+                            } else {
+                                open_menu.set(Some(menu_launcher_id.clone()));
+                            }
+                        },
                         ChevronDown { size: 11 }
+                    }
+                    if menu_open {
+                        div { class: "launcher-mode-menu", role: "menu",
+                            button {
+                                class: "launcher-mode-menu-item",
+                                role: "menuitem",
+                                title: "{normal_title}",
+                                disabled,
+                                onclick: move |_| {
+                                    open_menu.set(None);
+                                    launch_launcher(
+                                        menu_normal_item.clone(),
+                                        LaunchMode::Normal,
+                                        language,
+                                        launching,
+                                        notice,
+                                    );
+                                },
+                                span { class: "launcher-mode-menu-icon", aria_hidden: "true",
+                                    "{menu_icon_text}"
+                                }
+                                span { class: "launcher-mode-menu-copy",
+                                    strong { "{normal_mode_label}" }
+                                    small { "{normal_mode_description}" }
+                                }
+                            }
+                            button {
+                                class: "launcher-mode-menu-item",
+                                role: "menuitem",
+                                title: "{private_title}",
+                                disabled,
+                                onclick: move |_| {
+                                    open_menu.set(None);
+                                    launch_launcher(
+                                        private_item.clone(),
+                                        LaunchMode::Private,
+                                        language,
+                                        launching,
+                                        notice,
+                                    );
+                                },
+                                span { class: "launcher-mode-menu-icon", aria_hidden: "true",
+                                    "{menu_private_icon_text}"
+                                }
+                                span { class: "launcher-mode-menu-copy",
+                                    strong { "{private_mode_label}" }
+                                    small { "{private_mode_description}" }
+                                }
+                            }
+                        }
                     }
                 }
             }

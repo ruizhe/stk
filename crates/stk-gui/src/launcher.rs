@@ -11,9 +11,7 @@ use std::{
 };
 use stk_core::{
     AppConfig, ApplicationLauncherEntryConfig, BrowserEngine, BrowserLauncherEntryConfig,
-    ConfigScope, EnvProfileConfig, LocalProxyCandidate, ProxyEnvScheme, ProxyEnvVariable,
-    config::ProxyProtocol,
-    default_config_directory,
+    EnvProfileConfig, LocalProxyCandidate, ProxyEnvScheme, ProxyEnvVariable, config::ProxyProtocol,
     stats::{RuntimeSnapshot, TunnelKind, TunnelRuntimeStatus},
 };
 
@@ -126,22 +124,18 @@ impl LauncherItem {
         proxy: &LauncherProxyPlan,
     ) -> anyhow::Result<LaunchPlan> {
         let mut args = self.args.iter().map(OsString::from).collect::<Vec<_>>();
-        let profile_dir = if self.is_browser() {
-            Some(self.resolved_profile_directory(proxy))
-        } else {
-            None
-        };
+        let configured_profile_dir = self.profile_dir.as_deref().map(expand_path);
         match self.kind {
             LauncherKind::Browser(BrowserEngine::Chromium) => {
-                let profile_dir = profile_dir.as_ref().expect("browser has a profile directory");
-                fs::create_dir_all(profile_dir).with_context(|| {
-                    format!("failed to create browser profile {}", profile_dir.display())
-                })?;
-                args.push(format!("--user-data-dir={}", profile_dir.display()).into());
+                if let Some(profile_dir) = configured_profile_dir.as_ref() {
+                    fs::create_dir_all(profile_dir).with_context(|| {
+                        format!("failed to create browser profile {}", profile_dir.display())
+                    })?;
+                    args.push(format!("--user-data-dir={}", profile_dir.display()).into());
+                }
                 if let LauncherProxyPlan::Stk(plan) = proxy {
                     args.push(format!("--proxy-server={}", chromium_proxy_url(plan)).into());
                 }
-                args.push("--new-window".into());
                 match mode {
                     LaunchMode::Normal => {
                         args.extend(self.normal_args.iter().map(OsString::from));
@@ -153,26 +147,24 @@ impl LauncherItem {
                 }
             }
             LauncherKind::Browser(BrowserEngine::Firefox) => {
-                let profile_dir = profile_dir.as_ref().expect("browser has a profile directory");
-                prepare_firefox_profile(profile_dir, proxy)?;
+                let profile_dir = configured_profile_dir
+                    .unwrap_or_else(|| self.default_managed_profile_directory(proxy));
+                prepare_firefox_profile(&profile_dir, proxy)?;
                 args.push("-no-remote".into());
                 args.push("-profile".into());
                 args.push(profile_dir.as_os_str().to_os_string());
                 match mode {
                     LaunchMode::Normal => {
-                        args.push("-new-window".into());
-                        args.push("about:blank".into());
                         args.extend(self.normal_args.iter().map(OsString::from));
                     }
                     LaunchMode::Private => {
                         args.push("-private-window".into());
-                        args.push("about:blank".into());
                         args.extend(self.private_args.iter().map(OsString::from));
                     }
                 }
             }
             LauncherKind::Browser(BrowserEngine::Custom) => {
-                let profile_dir = profile_dir.as_deref();
+                let profile_dir = configured_profile_dir.as_deref();
                 if let Some(profile_dir) = profile_dir {
                     fs::create_dir_all(profile_dir).with_context(|| {
                         format!(
@@ -216,11 +208,8 @@ impl LauncherItem {
         })
     }
 
-    fn resolved_profile_directory(&self, proxy: &LauncherProxyPlan) -> PathBuf {
-        if let Some(configured) = self.profile_dir.as_deref() {
-            return expand_path(configured);
-        }
-        default_config_directory(ConfigScope::User)
+    fn default_managed_profile_directory(&self, proxy: &LauncherProxyPlan) -> PathBuf {
+        stk_core::default_config_directory(stk_core::ConfigScope::User)
             .join("browser-data")
             .join(sanitize_path_segment(&self.id))
             .join(proxy.profile_key())
@@ -982,6 +971,26 @@ fn launcher_icon_text(configured: Option<&str>, name: &str) -> String {
 mod tests {
     use super::*;
 
+    fn test_browser_item(engine: BrowserEngine, profile_dir: Option<String>) -> LauncherItem {
+        LauncherItem {
+            id: "browser:test".to_string(),
+            name: "Test Browser".to_string(),
+            icon_text: "TB".to_string(),
+            kind: LauncherKind::Browser(engine),
+            command: PathBuf::from("/bin/echo"),
+            args: vec!["--user-argument".to_string()],
+            normal_args: vec!["--normal-argument".to_string()],
+            private_args: vec!["--private-argument".to_string()],
+            proxy_args: Vec::new(),
+            profile_dir,
+            working_directory: None,
+            environment: BTreeMap::new(),
+            unset_environment: Vec::new(),
+            proxy: Ok(LauncherProxyPlan::Inherit),
+            order: 0,
+        }
+    }
+
     fn launcher_test_config() -> AppConfig {
         AppConfig::from_yaml_str(
             r#"
@@ -1052,5 +1061,60 @@ hosts:
         )
         .unwrap();
         assert_eq!(arguments, [OsString::from("--proxy=http://127.0.0.1:7890")]);
+    }
+
+    #[test]
+    fn chromium_reuses_default_profile_and_only_appends_mode_and_proxy_arguments() {
+        let config = launcher_test_config();
+        let proxy = resolve_launcher_proxy(&config, Some("web")).unwrap();
+        let item = test_browser_item(BrowserEngine::Chromium, None);
+
+        let normal = item
+            .build_launch_plan(LaunchMode::Normal, &proxy)
+            .unwrap();
+        assert_eq!(
+            normal.args,
+            [
+                OsString::from("--user-argument"),
+                OsString::from("--proxy-server=http://127.0.0.1:7890"),
+                OsString::from("--normal-argument"),
+            ]
+        );
+
+        let private = item
+            .build_launch_plan(LaunchMode::Private, &proxy)
+            .unwrap();
+        assert_eq!(
+            private.args,
+            [
+                OsString::from("--user-argument"),
+                OsString::from("--proxy-server=http://127.0.0.1:7890"),
+                OsString::from("--incognito"),
+                OsString::from("--private-argument"),
+            ]
+        );
+    }
+
+    #[test]
+    fn chromium_uses_profile_directory_only_when_explicitly_configured() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile_dir = directory.path().join("profile");
+        let item = test_browser_item(
+            BrowserEngine::Chromium,
+            Some(profile_dir.to_string_lossy().into_owned()),
+        );
+
+        let plan = item
+            .build_launch_plan(LaunchMode::Normal, &LauncherProxyPlan::Inherit)
+            .unwrap();
+        assert_eq!(
+            plan.args,
+            [
+                OsString::from("--user-argument"),
+                OsString::from(format!("--user-data-dir={}", profile_dir.display())),
+                OsString::from("--normal-argument"),
+            ]
+        );
+        assert!(profile_dir.is_dir());
     }
 }

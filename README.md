@@ -274,7 +274,7 @@ When no policy is configured, STK inherits none of the existing proxy variables,
 
 ### GUI Quick Launchers
 
-The top of the GUI overview contains a compact row of browser and application launchers. Clicking a browser's main icon starts its normal mode with the selected proxy; clicking the small arrow starts private mode with the same proxy. Applications have one launch button. Unavailable entries are disabled, and their tooltip identifies a missing executable, a proxy that is not listening, or an invalid proxy selection.
+The top of the GUI overview contains a compact row of browser and application launchers. Clicking a browser's main icon starts its normal mode with the selected proxy; clicking the small arrow opens a menu for normal or private mode with the same proxy. Applications have one launch button. Unavailable entries are disabled, and their tooltip identifies a missing executable, a proxy that is not listening, or an invalid proxy selection.
 
 Browsers and ordinary applications are configured separately:
 
@@ -324,7 +324,7 @@ Every entry also accepts `enabled`, `show-in-overview`, and `order`. Browser `ar
 
 `proxy` accepts an `env.profiles` name, `HOST/TUNNEL@SCHEME`, `direct`, `inherit`, or `default`. `default` continues to the next fallback. Selection precedence is entry, browser/application section, `launchers.default-proxy`, `env.default`, and finally the first compatible local proxy. `direct` removes inherited proxy environment variables, while `inherit` preserves the current process environment.
 
-Built-in Chromium and Firefox launchers use STK-managed persistent profiles so that the user's existing browser configuration is not modified. `proxy-args` templates for custom browsers and applications support `{proxy-url}`, `{proxy-scheme}`, `{proxy-host}`, and `{proxy-port}`; browser templates also support `{profile-dir}`. In this version, `icon` renders up to two characters and is intended for a short label.
+Built-in Chromium launchers reuse the browser's default profile unless `profile-dir` is explicitly configured. STK only appends the selected proxy argument and, for private launches, the browser's private-mode argument; configured `args`, `normal-args`, and `private-args` remain unchanged. Firefox still needs an STK-managed profile to apply a reliable per-launch proxy without modifying the user's default Firefox settings. `proxy-args` templates for custom browsers and applications support `{proxy-url}`, `{proxy-scheme}`, `{proxy-host}`, and `{proxy-port}`; browser templates also support `{profile-dir}`. In this version, `icon` renders up to two characters and is intended for a short label.
 
 ## Forwarding Modes
 
