@@ -14,7 +14,7 @@ resolver = "3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
-version = "0.1.11"
+version = "0.1.12"
 
 [workspace.dependencies]
 anyhow = "1.0.103"
