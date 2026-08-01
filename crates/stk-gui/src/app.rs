@@ -276,27 +276,17 @@ fn update_system_tray(
     };
     let download = format_rate(rates.download_bps);
     let upload = format_rate(rates.upload_bps);
-    tray.show_item.set_text(tr(
-        language,
-        "Open SSH Tunnel Keeper",
-        "打开 SSH Tunnel Keeper",
-    ));
-    tray.download_item.set_text(match language {
+    let show_label = tr(language, "Open SSH Tunnel Keeper", "打开 SSH Tunnel Keeper").to_string();
+    let download_label = match language {
         Language::English => format!("Download  {download}"),
         Language::Chinese => format!("下载  {download}"),
-    });
-    tray.upload_item.set_text(match language {
+    };
+    let upload_label = match language {
         Language::English => format!("Upload  {upload}"),
         Language::Chinese => format!("上传  {upload}"),
-    });
-    tray.reload_item
-        .set_text(tr(language, "Reload configuration", "重新加载配置"));
-    tray.quit_item.set_text(tr(
-        language,
-        "Quit SSH Tunnel Keeper",
-        "退出 SSH Tunnel Keeper",
-    ));
-    update_system_tray_throughput(tray, rates.upload_bps, rates.download_bps);
+    };
+    let reload_label = tr(language, "Reload configuration", "重新加载配置").to_string();
+    let quit_label = tr(language, "Quit SSH Tunnel Keeper", "退出 SSH Tunnel Keeper").to_string();
     let tooltip = match language {
         Language::English => {
             format!("SSH Tunnel Keeper - {state}\nUpload {upload}\nDownload {download}")
@@ -305,7 +295,36 @@ fn update_system_tray(
             format!("SSH Tunnel Keeper - {state}\n上传 {upload}\n下载 {download}")
         }
     };
-    let _ = tray.tray.set_tooltip(Some(tooltip));
+
+    {
+        let mut display = tray.display_state.borrow_mut();
+        if display.show_label.as_ref() != Some(&show_label) {
+            tray.show_item.set_text(&show_label);
+            display.show_label = Some(show_label);
+        }
+        if display.download_label.as_ref() != Some(&download_label) {
+            tray.download_item.set_text(&download_label);
+            display.download_label = Some(download_label);
+        }
+        if display.upload_label.as_ref() != Some(&upload_label) {
+            tray.upload_item.set_text(&upload_label);
+            display.upload_label = Some(upload_label);
+        }
+        if display.reload_label.as_ref() != Some(&reload_label) {
+            tray.reload_item.set_text(&reload_label);
+            display.reload_label = Some(reload_label);
+        }
+        if display.quit_label.as_ref() != Some(&quit_label) {
+            tray.quit_item.set_text(&quit_label);
+            display.quit_label = Some(quit_label);
+        }
+        if display.tooltip.as_ref() != Some(&tooltip) {
+            let _ = tray.tray.set_tooltip(Some(&tooltip));
+            display.tooltip = Some(tooltip);
+        }
+    }
+
+    update_system_tray_throughput(tray, rates.upload_bps, rates.download_bps);
 }
 
 pub(super) fn update_system_tray_throughput(
@@ -314,6 +333,13 @@ pub(super) fn update_system_tray_throughput(
     download_bps: f64,
 ) {
     let tray_title = tray_throughput_title(upload_bps, download_bps);
+    {
+        let mut display = tray.display_state.borrow_mut();
+        if display.title.as_ref() == Some(&tray_title) {
+            return;
+        }
+        display.title = Some(tray_title.clone());
+    }
     tray.tray.set_title(Some(&tray_title));
     #[cfg(target_os = "macos")]
     super::style_macos_tray_title(&tray.tray, &tray_title);
@@ -425,11 +451,9 @@ fn AppContent() -> Element {
 
     let config_path_for_poll = config_path.clone();
     let runtime_for_poll = Arc::clone(&context.runtime);
-    let tray_for_poll = system_tray.clone();
     use_future(move || {
         let config_path_for_poll = config_path_for_poll.clone();
         let runtime_for_poll = Arc::clone(&runtime_for_poll);
-        let tray_for_poll = tray_for_poll.clone();
         async move {
             let mut last_auxiliary_refresh = Instant::now() - Duration::from_secs(1);
             let mut poll_interval = tokio::time::interval(super::STATUS_POLL_INTERVAL);
@@ -447,9 +471,6 @@ fn AppContent() -> Element {
                     observe_configuration_change(&config_path_for_poll, &mut editor, language);
                 }
 
-                if let Some(tray) = tray_for_poll.as_ref() {
-                    update_system_tray(tray, language, &next, next_throughput);
-                }
                 throughput.set(next_throughput);
                 status.set(next);
                 runtime_error.set(next_error);

@@ -47,6 +47,16 @@ use tokio::{
 };
 use tracing::{Instrument, debug, info, info_span, warn};
 
+const MAX_CONCURRENT_SESSION_STARTS_PER_HOST: usize = 2;
+
+fn initial_session_start_count(minimum: usize) -> usize {
+    minimum.min(MAX_CONCURRENT_SESSION_STARTS_PER_HOST)
+}
+
+fn can_start_another_session(connecting: usize) -> bool {
+    connecting < MAX_CONCURRENT_SESSION_STARTS_PER_HOST
+}
+
 #[cfg(test)]
 use crate::inbound::SOCKS5_REPLY_SUCCEEDED;
 #[cfg(test)]
@@ -997,7 +1007,7 @@ async fn manage_ssh_sessions(
     let mut ticker = interval(Duration::from_millis(100));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    for _ in 0..pool.min_sessions_per_host {
+    for _ in 0..initial_session_start_count(pool.min_sessions_per_host) {
         let session_id = stats::next_ssh_session_id();
         spawn_managed_session(
             &mut tasks, session_id, &outbound, &upstream, &plan, probe, &node,
@@ -1160,6 +1170,7 @@ async fn manage_ssh_sessions(
                     .is_some_and(|rotation| rotation.replacement_session_id.is_none())
                     && active_count < pool.max_sessions_per_host;
                 if (needs_minimum || needs_replacement || needs_scheduled_replacement)
+                    && can_start_another_session(connecting_non_retiring)
                     && Instant::now() >= next_spawn_at
                 {
                     let session_id = stats::next_ssh_session_id();
@@ -2371,6 +2382,14 @@ mod tests {
             next_backoff(Duration::from_secs(20), Duration::from_secs(30)),
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn ssh_session_start_concurrency_is_bounded_per_host() {
+        assert_eq!(initial_session_start_count(1), 1);
+        assert_eq!(initial_session_start_count(10), 2);
+        assert!(can_start_another_session(1));
+        assert!(!can_start_another_session(2));
     }
 
     #[test]

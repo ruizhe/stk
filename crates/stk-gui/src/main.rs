@@ -10,9 +10,11 @@ use dioxus::desktop::{Config, LogicalSize, WindowBuilder, WindowCloseBehaviour};
 use std::env;
 use std::{
     any::Any,
+    cell::RefCell,
     io,
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
+    rc::Rc,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -85,6 +87,18 @@ struct SystemTray {
     upload_item: MenuItem,
     reload_item: MenuItem,
     quit_item: PredefinedMenuItem,
+    display_state: Rc<RefCell<SystemTrayDisplayState>>,
+}
+
+#[derive(Debug, Default)]
+struct SystemTrayDisplayState {
+    show_label: Option<String>,
+    download_label: Option<String>,
+    upload_label: Option<String>,
+    reload_label: Option<String>,
+    quit_label: Option<String>,
+    title: Option<String>,
+    tooltip: Option<String>,
 }
 
 struct GuiRuntimeManager {
@@ -113,6 +127,32 @@ struct GuiStatusMonitor {
 #[derive(Clone)]
 struct MacosSystemTray {
     tray: Arc<dispatch2::MainThreadBound<SystemTray>>,
+    updates: Arc<Mutex<MacosTrayUpdateQueue>>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct MacosTrayUpdateQueue {
+    pending: Option<(u64, u64)>,
+    scheduled: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosTrayUpdateQueue {
+    fn request(&mut self, rates: (u64, u64)) -> bool {
+        self.pending = Some(rates);
+        if self.scheduled {
+            false
+        } else {
+            self.scheduled = true;
+            true
+        }
+    }
+
+    fn take(&mut self) -> Option<(u64, u64)> {
+        self.scheduled = false;
+        self.pending.take()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -245,28 +285,6 @@ fn main() {
     runtime.stop();
 }
 
-#[cfg(target_os = "macos")]
-fn launch_desktop(config: Config) {
-    use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
-
-    let process_info = NSProcessInfo::processInfo();
-    let reason = NSString::from_str("Keep SSH tunnels and tray throughput updates responsive");
-    let activity = process_info.beginActivityWithOptions_reason(
-        NSActivityOptions::UserInitiatedAllowingIdleSystemSleep,
-        &reason,
-    );
-
-    dioxus::LaunchBuilder::desktop()
-        .with_cfg(config)
-        .launch(App);
-
-    // The token was returned by this NSProcessInfo instance and remains valid here.
-    unsafe {
-        process_info.endActivity(&activity);
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
 fn launch_desktop(config: Config) {
     dioxus::LaunchBuilder::desktop()
         .with_cfg(config)
@@ -552,6 +570,7 @@ impl GuiRuntimeManager {
             };
             let updater = MacosSystemTray {
                 tray: Arc::new(dispatch2::MainThreadBound::new(tray, main_thread)),
+                updates: Arc::new(Mutex::new(MacosTrayUpdateQueue::default())),
             };
             let snapshot = self.cached_snapshot();
             updater.update_throughput(snapshot.upload_bps, snapshot.download_bps);
@@ -790,8 +809,17 @@ fn run_gui_status_monitor(
 #[cfg(target_os = "macos")]
 impl MacosSystemTray {
     fn update_throughput(&self, upload_bps: u64, download_bps: u64) {
+        let should_schedule = lock_or_recover(&self.updates).request((upload_bps, download_bps));
+        if !should_schedule {
+            return;
+        }
+
         let tray = Arc::clone(&self.tray);
+        let updates = Arc::clone(&self.updates);
         dispatch2::DispatchQueue::main().exec_async(move || {
+            let Some((upload_bps, download_bps)) = lock_or_recover(&updates).take() else {
+                return;
+            };
             let Some(main_thread) = objc2_foundation::MainThreadMarker::new() else {
                 error!("macOS tray throughput update ran outside the main thread");
                 return;
@@ -951,6 +979,7 @@ fn init_system_tray(language: Language) -> anyhow::Result<SystemTray> {
         upload_item,
         reload_item,
         quit_item,
+        display_state: Rc::new(RefCell::new(SystemTrayDisplayState::default())),
     })
 }
 
@@ -1202,6 +1231,17 @@ mod tests {
         assert!(error.contains("runtime failed"));
         assert!(error.contains("status failed"));
         assert!(!error.contains("reload failed"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_tray_updates_are_coalesced_until_the_main_queue_consumes_them() {
+        let mut updates = MacosTrayUpdateQueue::default();
+
+        assert!(updates.request((1, 2)));
+        assert!(!updates.request((3, 4)));
+        assert_eq!(updates.take(), Some((3, 4)));
+        assert!(updates.request((5, 6)));
     }
 
     #[test]

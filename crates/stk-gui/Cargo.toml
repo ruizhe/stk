@@ -50,7 +50,6 @@ objc2-foundation = {
   features = [
     "std",
     "NSAttributedString",
-    "NSProcessInfo",
     "NSRange",
     "NSString",
     "NSValue"
