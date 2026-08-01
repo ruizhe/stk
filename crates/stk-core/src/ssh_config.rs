@@ -1435,7 +1435,11 @@ mod tests {
     fn included_host_scope_does_not_leak_into_the_parent_config() {
         let directory = temp_dir("include-scope");
         let included_path = directory.join("included.conf");
-        fs::write(&included_path, "Host other\n  HostName other.internal\n").unwrap();
+        fs::write(
+            &included_path,
+            "Host other\n  HostName other.internal\n  User other-user\n",
+        )
+        .unwrap();
         let config_path = directory.join("config");
         fs::write(
             &config_path,
@@ -1459,6 +1463,7 @@ mod tests {
 
         assert_eq!(target.target.port, 2222);
         assert_eq!(other.target.host, "other.internal");
+        assert_eq!(other.target.username, "other-user");
         assert_eq!(other.target.port, DEFAULT_SSH_PORT);
     }
 
@@ -1498,7 +1503,7 @@ mod tests {
         let config_path = directory.join("config");
         fs::write(
             &config_path,
-            "Host target\n  HostName target.internal\n  ProxyJump jump-a,jump-b\nHost jump-a\n  HostName 192.0.2.1\n  User first\nHost jump-b\n  HostName 192.0.2.2\n  User second\n",
+            "Host target\n  HostName target.internal\n  User target-user\n  ProxyJump jump-a,jump-b\nHost jump-a\n  HostName 192.0.2.1\n  User first\nHost jump-b\n  HostName 192.0.2.2\n  User second\n",
         )
         .unwrap();
         let config_path = config_path.to_string_lossy().into_owned();
@@ -1514,7 +1519,7 @@ mod tests {
 
         fs::write(
             directory.join("cycle"),
-            "Host target\n  ProxyJump jump\nHost jump\n  ProxyJump target\n",
+            "Host target\n  User target-user\n  ProxyJump jump\nHost jump\n  User jump-user\n  ProxyJump target\n",
         )
         .unwrap();
         let error = resolve_ssh_plan(
@@ -1586,7 +1591,9 @@ mod tests {
         let directory = temp_dir("home");
         let old_home = env::var_os("HOME");
         unsafe { env::set_var("HOME", &directory) };
-        let plan = resolve_ssh_plan(&upstream("example.test"), &pool()).unwrap();
+        let mut default_target = upstream("example.test");
+        default_target.username = Some("test-user".to_string());
+        let plan = resolve_ssh_plan(&default_target, &pool()).unwrap();
         assert_eq!(plan.config_path, Some(directory.join(".ssh/config")));
 
         fs::create_dir_all(directory.join(".ssh")).unwrap();
