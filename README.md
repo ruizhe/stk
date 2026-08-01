@@ -40,6 +40,7 @@ STK provides three components:
 - 250 ms sampling, a trailing one-second rate window, immediate change notifications, and a one-second stable heartbeat.
 - Up to 24 hours of minute-level traffic history, with an interactive one-hour overview in the GUI.
 - Opt-in connection capture with a browser Network-style page, manual clearing, and optional terminal-state cleanup.
+- Quick browser and custom application launchers on the GUI overview, including proxied normal and private browser modes.
 - YAML, JSON, and TOML configuration with native file-system notification based reloads.
 - Linux, Windows, and macOS support.
 
@@ -270,6 +271,60 @@ automatic selection < env.default < STK_PROXY_PROFILE < -p/--proxy < -H/--host a
 `inject` and `inherit` control the proxy-related environment variables passed to the child process. The available groups are `all-proxy`, `http-proxy`, and `https-proxy`; `inherit` also accepts `no-proxy`. Each group covers both uppercase and lowercase names, for example `http-proxy` means both `HTTP_PROXY` and `http_proxy`.
 
 When no policy is configured, STK inherits none of the existing proxy variables, injects `ALL_PROXY`, `HTTP_PROXY`, and `HTTPS_PROXY` in both cases with the selected proxy URL, and removes `NO_PROXY/no_proxy`. A profile can independently replace the global `inject` and `inherit` lists; an omitted profile list uses the global list, while an explicit empty list disables that behavior. Injection takes precedence if a group appears in both lists. Other process environment variables such as `PATH` and `HOME` continue to be inherited normally. `STK_PROXY_HOST`, `STK_PROXY_TUNNEL`, `STK_PROXY_SCHEME`, and `STK_PROXY_URL` are always set.
+
+### GUI Quick Launchers
+
+The top of the GUI overview contains a compact row of browser and application launchers. Clicking a browser's main icon starts its normal mode with the selected proxy; clicking the small arrow starts private mode with the same proxy. Applications have one launch button. Unavailable entries are disabled, and their tooltip identifies a missing executable, a proxy that is not listening, or an invalid proxy selection.
+
+Browsers and ordinary applications are configured separately:
+
+```yaml
+launchers:
+  # Used when the browser/application sections do not select another profile.
+  default-proxy: production
+
+  browsers:
+    auto-discover: true
+    default-proxy: default
+    entries:
+      chrome:
+        detect: chrome
+        name: Chrome
+        icon: GC
+        proxy: default
+        normal-args: [https://api.ipify.org]
+        private-args: [https://api.ipify.org]
+
+      company-browser:
+        engine: custom
+        command: /opt/company-browser/bin/browser
+        args: [--new-window]
+        private-args: [--private]
+        proxy-args: ["--proxy-server={proxy-url}"]
+        profile-dir: ~/.config/stk/company-browser
+
+  applications:
+    default-proxy: production
+    entries:
+      editor:
+        name: Code
+        command: code
+        args: [~/work/project]
+        icon: VS
+        proxy: default
+        working-directory: ~/work/project
+        env:
+          STK_LAUNCHED: "1"
+        unset-env: [NO_PROXY, no_proxy]
+```
+
+Automatic discovery covers Chrome, Firefox, Edge, Brave, Chromium, Vivaldi, and Opera. It checks `/Applications` and `~/Applications` on macOS, `PATH` on Linux, and common installation directories plus `PATH` on Windows. Discovery runs only when the GUI loads a configuration, observes a new configuration generation, or the user clicks refresh. There is no periodic scan or ongoing monitoring of launched applications.
+
+Every entry also accepts `enabled`, `show-in-overview`, and `order`. Browser `args` apply to both modes, with `normal-args` and `private-args` appended only to the corresponding mode. Application entries support `args`, `working-directory`, `env`, and `unset-env`.
+
+`proxy` accepts an `env.profiles` name, `HOST/TUNNEL@SCHEME`, `direct`, `inherit`, or `default`. `default` continues to the next fallback. Selection precedence is entry, browser/application section, `launchers.default-proxy`, `env.default`, and finally the first compatible local proxy. `direct` removes inherited proxy environment variables, while `inherit` preserves the current process environment.
+
+Built-in Chromium and Firefox launchers use STK-managed persistent profiles so that the user's existing browser configuration is not modified. `proxy-args` templates for custom browsers and applications support `{proxy-url}`, `{proxy-scheme}`, `{proxy-host}`, and `{proxy-port}`; browser templates also support `{profile-dir}`. In this version, `icon` renders up to two characters and is intended for a short label.
 
 ## Forwarding Modes
 

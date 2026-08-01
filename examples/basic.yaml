@@ -6,6 +6,20 @@ env:
       tunnel: primary
       scheme: http
 
+launchers:
+  default-proxy: main
+  browsers:
+    entries:
+      chrome:
+        detect: chrome
+        icon: GC
+  applications:
+    entries:
+      editor:
+        name: Code
+        command: code
+        icon: VS
+
 hosts:
   main:
     ssh-config-host: localhost

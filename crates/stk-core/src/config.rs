@@ -42,6 +42,8 @@ pub enum ConfigError {
     InvalidControlEndpoint(String),
     #[error("invalid proxy environment configuration: {0}")]
     InvalidEnvConfig(String),
+    #[error("invalid launcher configuration: {0}")]
+    InvalidLauncherConfig(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +86,8 @@ pub struct AppConfig {
     pub control: ControlConfig,
     #[serde(default, skip_serializing_if = "EnvConfig::is_empty")]
     pub env: EnvConfig,
+    #[serde(default, skip_serializing_if = "LauncherConfig::is_empty")]
+    pub launchers: LauncherConfig,
     #[serde(default, skip_serializing_if = "OverrideDefaultConfig::is_empty")]
     pub override_default: OverrideDefaultConfig,
     #[serde(default = "default_hosts", deserialize_with = "deserialize_hosts")]
@@ -183,6 +187,7 @@ impl AppConfig {
                 .map_err(|error| ConfigError::InvalidControlEndpoint(error.to_string()))?;
         }
         self.env.validate()?;
+        self.launchers.validate(&self.env)?;
         if self.hosts.is_empty() {
             return Err(ConfigError::EmptyHosts);
         }
@@ -235,10 +240,342 @@ impl Default for AppConfig {
         Self {
             control: ControlConfig::default(),
             env: EnvConfig::default(),
+            launchers: LauncherConfig::default(),
             override_default: OverrideDefaultConfig::default(),
             hosts: default_hosts(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct LauncherConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "BrowserLauncherConfig::is_empty")]
+    pub browsers: BrowserLauncherConfig,
+    #[serde(default, skip_serializing_if = "ApplicationLauncherConfig::is_empty")]
+    pub applications: ApplicationLauncherConfig,
+}
+
+impl LauncherConfig {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn validate(&self, env: &EnvConfig) -> Result<(), ConfigError> {
+        validate_launcher_proxy(
+            "launchers.default-proxy",
+            self.default_proxy.as_deref(),
+            env,
+        )?;
+        self.browsers.validate(env)?;
+        self.applications.validate(env)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct BrowserLauncherConfig {
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub auto_discover: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub entries: BTreeMap<String, BrowserLauncherEntryConfig>,
+}
+
+impl Default for BrowserLauncherConfig {
+    fn default() -> Self {
+        Self {
+            auto_discover: true,
+            default_proxy: None,
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+impl BrowserLauncherConfig {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn validate(&self, env: &EnvConfig) -> Result<(), ConfigError> {
+        validate_launcher_proxy(
+            "launchers.browsers.default-proxy",
+            self.default_proxy.as_deref(),
+            env,
+        )?;
+        for (id, browser) in &self.entries {
+            validate_launcher_id("browser", id)?;
+            if !browser.enabled {
+                continue;
+            }
+            if browser.command.as_deref().is_none_or(str::is_empty)
+                && browser.detect.as_deref().is_none_or(str::is_empty)
+            {
+                return Err(ConfigError::InvalidLauncherConfig(format!(
+                    "browser {id} must configure command or detect"
+                )));
+            }
+            validate_optional_non_empty(&format!("browser {id} name"), browser.name.as_deref())?;
+            validate_optional_non_empty(
+                &format!("browser {id} command"),
+                browser.command.as_deref(),
+            )?;
+            validate_optional_non_empty(
+                &format!("browser {id} detect"),
+                browser.detect.as_deref(),
+            )?;
+            if let Some(detect) = browser.detect.as_deref()
+                && !matches!(
+                    detect,
+                    "chrome" | "firefox" | "edge" | "brave" | "chromium" | "vivaldi" | "opera"
+                )
+            {
+                return Err(ConfigError::InvalidLauncherConfig(format!(
+                    "browser {id} has unsupported detect value {detect}"
+                )));
+            }
+            if browser.detect.is_none() && browser.engine.is_none() {
+                return Err(ConfigError::InvalidLauncherConfig(format!(
+                    "browser {id} must configure engine when detect is not configured"
+                )));
+            }
+            validate_optional_non_empty(
+                &format!("browser {id} profile-dir"),
+                browser.profile_dir.as_deref(),
+            )?;
+            validate_launcher_proxy(
+                &format!("browser {id} proxy"),
+                browser.proxy.as_deref(),
+                env,
+            )?;
+            if browser.engine == Some(BrowserEngine::Custom) && browser.private_args.is_empty() {
+                return Err(ConfigError::InvalidLauncherConfig(format!(
+                    "custom browser {id} must configure private-args"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BrowserEngine {
+    Chromium,
+    Firefox,
+    Custom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct BrowserLauncherEntryConfig {
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub show_in_overview: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<BrowserEngine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detect: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub normal_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub private_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+}
+
+impl Default for BrowserLauncherEntryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            show_in_overview: true,
+            order: None,
+            name: None,
+            engine: None,
+            detect: None,
+            command: None,
+            args: Vec::new(),
+            normal_args: Vec::new(),
+            private_args: Vec::new(),
+            proxy_args: Vec::new(),
+            proxy: None,
+            profile_dir: None,
+            icon: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ApplicationLauncherConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub entries: BTreeMap<String, ApplicationLauncherEntryConfig>,
+}
+
+impl ApplicationLauncherConfig {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn validate(&self, env: &EnvConfig) -> Result<(), ConfigError> {
+        validate_launcher_proxy(
+            "launchers.applications.default-proxy",
+            self.default_proxy.as_deref(),
+            env,
+        )?;
+        for (id, application) in &self.entries {
+            validate_launcher_id("application", id)?;
+            if !application.enabled {
+                continue;
+            }
+            if application.command.trim().is_empty() {
+                return Err(ConfigError::InvalidLauncherConfig(format!(
+                    "application {id} command must not be empty"
+                )));
+            }
+            validate_optional_non_empty(
+                &format!("application {id} name"),
+                application.name.as_deref(),
+            )?;
+            validate_optional_non_empty(
+                &format!("application {id} working-directory"),
+                application.working_directory.as_deref(),
+            )?;
+            validate_launcher_proxy(
+                &format!("application {id} proxy"),
+                application.proxy.as_deref(),
+                env,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ApplicationLauncherEntryConfig {
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub show_in_overview: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unset_env: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+}
+
+impl Default for ApplicationLauncherEntryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            show_in_overview: true,
+            order: None,
+            name: None,
+            command: String::new(),
+            args: Vec::new(),
+            proxy_args: Vec::new(),
+            proxy: None,
+            working_directory: None,
+            env: BTreeMap::new(),
+            unset_env: Vec::new(),
+            icon: None,
+        }
+    }
+}
+
+fn validate_launcher_id(kind: &str, id: &str) -> Result<(), ConfigError> {
+    if id.trim().is_empty() {
+        return Err(ConfigError::InvalidLauncherConfig(format!(
+            "{kind} id must not be empty"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_non_empty(field: &str, value: Option<&str>) -> Result<(), ConfigError> {
+    if value.is_some_and(|value| value.trim().is_empty()) {
+        return Err(ConfigError::InvalidLauncherConfig(format!(
+            "{field} must not be empty"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_launcher_proxy(
+    field: &str,
+    value: Option<&str>,
+    env: &EnvConfig,
+) -> Result<(), ConfigError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ConfigError::InvalidLauncherConfig(format!(
+            "{field} must not be empty"
+        )));
+    }
+    if matches!(value, "default" | "direct" | "inherit") || env.profiles.contains_key(value) {
+        return Ok(());
+    }
+    let (location, scheme) = value
+        .rsplit_once('@')
+        .map_or((value, None), |(location, scheme)| (location, Some(scheme)));
+    if let Some(scheme) = scheme
+        && !matches!(scheme, "auto" | "http" | "socks5" | "socks5h")
+    {
+        return Err(ConfigError::InvalidLauncherConfig(format!(
+            "{field} has unsupported proxy scheme {scheme}"
+        )));
+    }
+    if location.is_empty()
+        || location.contains('@')
+        || location.matches('/').count() > 1
+        || location
+            .split_once('/')
+            .is_some_and(|(host, tunnel)| host.is_empty() || tunnel.is_empty())
+    {
+        return Err(ConfigError::InvalidLauncherConfig(format!(
+            "{field} must be a profile or HOST/TUNNEL@SCHEME selector"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1450,6 +1787,85 @@ mod tests {
             let parsed = AppConfig::from_str(&serialized, format).unwrap();
             assert_eq!(parsed, expected);
         }
+    }
+
+    #[test]
+    fn launcher_configuration_round_trips_all_formats() {
+        let mut expected = AppConfig::default();
+        expected.env.profiles.insert(
+            "desktop".to_string(),
+            EnvProfileConfig {
+                host: Some("default".to_string()),
+                tunnel: Some("local-proxy-127.0.0.1:7890".to_string()),
+                scheme: Some(ProxyEnvScheme::Http),
+                inject: None,
+                inherit: None,
+            },
+        );
+        expected.launchers.default_proxy = Some("desktop".to_string());
+        expected.launchers.browsers.entries.insert(
+            "chrome".to_string(),
+            BrowserLauncherEntryConfig {
+                detect: Some("chrome".to_string()),
+                icon: Some("GC".to_string()),
+                ..BrowserLauncherEntryConfig::default()
+            },
+        );
+        expected.launchers.applications.entries.insert(
+            "editor".to_string(),
+            ApplicationLauncherEntryConfig {
+                name: Some("Code".to_string()),
+                command: "code".to_string(),
+                args: vec![".".to_string()],
+                icon: Some("VS".to_string()),
+                ..ApplicationLauncherEntryConfig::default()
+            },
+        );
+        expected.validate().unwrap();
+
+        for format in [ConfigFormat::Yaml, ConfigFormat::Json, ConfigFormat::Toml] {
+            let serialized = expected.to_string(format).unwrap();
+            let parsed = AppConfig::from_str(&serialized, format).unwrap();
+            assert_eq!(parsed, expected);
+        }
+    }
+
+    #[test]
+    fn launcher_validation_rejects_invalid_browser_and_proxy_selectors() {
+        let mut config = AppConfig::default();
+        config.launchers.browsers.entries.insert(
+            "custom".to_string(),
+            BrowserLauncherEntryConfig {
+                engine: Some(BrowserEngine::Custom),
+                command: Some("browser".to_string()),
+                ..BrowserLauncherEntryConfig::default()
+            },
+        );
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidLauncherConfig(_)
+        ));
+
+        config.launchers.browsers.entries.clear();
+        config.launchers.browsers.entries.insert(
+            "custom".to_string(),
+            BrowserLauncherEntryConfig {
+                command: Some("browser".to_string()),
+                private_args: vec!["--private".to_string()],
+                ..BrowserLauncherEntryConfig::default()
+            },
+        );
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidLauncherConfig(_)
+        ));
+
+        config.launchers.browsers.entries.clear();
+        config.launchers.default_proxy = Some("host/tunnel@http@http".to_string());
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidLauncherConfig(_)
+        ));
     }
 
     #[test]

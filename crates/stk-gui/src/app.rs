@@ -2,8 +2,9 @@ use anyhow::Context as _;
 use dioxus::desktop::{use_tray_menu_event_handler, use_window};
 use dioxus::prelude::*;
 use lucide_dioxus::{
-    Activity, ArrowDown, ArrowUp, CircleAlert, CircleCheck, CircleDot, Clock, FileText, Languages,
-    Network, RefreshCw, Router, Save, ScrollText, Search, Server, Square, Trash2, Unplug,
+    Activity, ArrowDown, ArrowUp, ChevronDown, CircleAlert, CircleCheck, CircleDot, Clock,
+    FileText, Languages, Network, RefreshCw, Router, Save, ScrollText, Search, Server, Square,
+    Trash2, Unplug,
 };
 use std::{
     collections::VecDeque,
@@ -29,6 +30,7 @@ use tracing::{info, warn};
 
 use super::{
     gui_config::{GuiConfig, Language},
+    launcher::{LaunchMode, LauncherCatalog, LauncherItem},
     logging::{GuiLogEntry, GuiLogLevel},
 };
 
@@ -431,6 +433,7 @@ fn AppContent() -> Element {
     let initial_throughput = snapshot_throughput(&initial_snapshot);
     let initial_history = context.runtime.initial_traffic_history().points;
     let editor_path = config_path.clone();
+    let launcher_config_path = config_path.clone();
 
     let mut active_view = use_signal(|| View::Overview);
     let mut gui_config = use_signal(move || initial_gui_config);
@@ -447,6 +450,8 @@ fn AppContent() -> Element {
     });
     let mut logs = use_signal(super::logging::snapshot);
     let mut editor = use_signal(move || ConfigEditorState::load(&editor_path, initial_language));
+    let mut launchers =
+        use_signal(move || LauncherCatalog::load(&launcher_config_path));
     let auto_start = use_signal(AutoStartUiState::load);
 
     let config_path_for_poll = config_path.clone();
@@ -469,6 +474,7 @@ fn AppContent() -> Element {
                 append_runtime_events(&mut events, &previous, &next);
                 if next.config_generation != previous.config_generation {
                     observe_configuration_change(&config_path_for_poll, &mut editor, language);
+                    launchers.set(LauncherCatalog::load(&config_path_for_poll));
                 }
 
                 throughput.set(next_throughput);
@@ -639,6 +645,8 @@ fn AppContent() -> Element {
                     match active {
                         View::Overview => rsx! {
                             Overview {
+                                config_path: config_path.clone(),
+                                launcher_catalog: launchers,
                                 status: snapshot,
                                 throughput: current_throughput,
                                 history: history_points,
@@ -713,6 +721,8 @@ fn RuntimeBadge(running: bool, failed: bool, language: Language) -> Element {
 
 #[component]
 fn Overview(
+    config_path: PathBuf,
+    launcher_catalog: Signal<LauncherCatalog>,
     status: RuntimeSnapshot,
     throughput: ThroughputPoint,
     history: Vec<TrafficHistoryPoint>,
@@ -758,6 +768,12 @@ fn Overview(
 
     rsx! {
         section { class: "overview-page",
+            QuickLauncherBar {
+                config_path,
+                catalog: launcher_catalog,
+                status: status.clone(),
+                language,
+            }
             section { class: "traffic-panel",
                 div { class: "overview-traffic-summary",
                     section { class: "current-speed-section",
@@ -948,6 +964,202 @@ fn Overview(
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LauncherNotice {
+    success: bool,
+    message: String,
+}
+
+#[component]
+fn QuickLauncherBar(
+    config_path: PathBuf,
+    mut catalog: Signal<LauncherCatalog>,
+    status: RuntimeSnapshot,
+    language: Language,
+) -> Element {
+    let launching = use_signal(|| None::<String>);
+    let mut notice = use_signal(|| None::<LauncherNotice>);
+
+    let current_catalog = catalog.read().clone();
+    let current_notice = notice.read().clone();
+    let busy = launching.read().is_some();
+    let config_path_for_refresh = config_path.clone();
+
+    rsx! {
+        section { class: "quick-launcher",
+            header { class: "quick-launcher-header",
+                div { class: "quick-launcher-heading",
+                    span { class: "eyebrow", {tr(language, "Quick access", "快速入口")} }
+                    h2 { {tr(language, "Browsers and applications", "浏览器与应用")} }
+                }
+                div { class: "quick-launcher-status",
+                    if let Some(current_notice) = current_notice.as_ref() {
+                        span {
+                            class: if current_notice.success { "launcher-notice success" } else { "launcher-notice error" },
+                            title: "{current_notice.message}",
+                            if current_notice.success {
+                                CircleCheck { size: 13 }
+                            } else {
+                                CircleAlert { size: 13 }
+                            }
+                            "{current_notice.message}"
+                        }
+                    }
+                    button {
+                        class: "quick-launcher-refresh",
+                        title: tr(language, "Detect browsers and reload launchers", "重新探测浏览器并加载启动器"),
+                        aria_label: tr(language, "Refresh launchers", "刷新启动器"),
+                        disabled: busy,
+                        onclick: move |_| {
+                            catalog.set(LauncherCatalog::load(&config_path_for_refresh));
+                            notice.set(None);
+                        },
+                        RefreshCw { size: 14 }
+                    }
+                }
+            }
+            if let Some(error) = current_catalog.error.as_deref() {
+                div { class: "quick-launcher-message error", role: "alert", title: "{error}",
+                    CircleAlert { size: 14 }
+                    span { "{error}" }
+                }
+            } else if current_catalog.items.is_empty() {
+                div { class: "quick-launcher-message",
+                    span {
+                        {tr(
+                            language,
+                            "No browser was detected and no application launcher is configured.",
+                            "未探测到浏览器，也没有配置应用启动器。",
+                        )}
+                    }
+                }
+            } else {
+                div { class: "quick-launcher-items",
+                    for item in current_catalog.items.iter() {
+                        LauncherTile {
+                            key: "{item.id}",
+                            item: item.clone(),
+                            status: status.clone(),
+                            busy,
+                            language,
+                            launching,
+                            notice,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn LauncherTile(
+    item: LauncherItem,
+    status: RuntimeSnapshot,
+    busy: bool,
+    language: Language,
+    launching: Signal<Option<String>>,
+    notice: Signal<Option<LauncherNotice>>,
+) -> Element {
+    let unavailable = item.unavailable_reason(&status);
+    let disabled = busy || unavailable.is_some();
+    let is_browser = item.is_browser();
+    let proxy_summary = item.proxy_summary();
+    let normal_title = unavailable.clone().unwrap_or_else(|| {
+        match language {
+            Language::English => format!("Launch {} with {}", item.name, proxy_summary),
+            Language::Chinese => format!("使用 {} 启动 {}", proxy_summary, item.name),
+        }
+    });
+    let private_title = unavailable.clone().unwrap_or_else(|| match language {
+        Language::English => format!("Launch {} in private mode with {}", item.name, proxy_summary),
+        Language::Chinese => format!("使用 {} 以隐身模式启动 {}", proxy_summary, item.name),
+    });
+    let normal_item = item.clone();
+    let private_item = item.clone();
+    let item_name = item.name.clone();
+
+    rsx! {
+        div {
+            class: if unavailable.is_some() { "launcher-tile unavailable" } else { "launcher-tile" },
+            div { class: if is_browser { "launcher-button-group browser" } else { "launcher-button-group" },
+                button {
+                    class: "launcher-main-button",
+                    title: "{normal_title}",
+                    aria_label: "{normal_title}",
+                    disabled,
+                    onclick: move |_| launch_launcher(
+                        normal_item.clone(),
+                        LaunchMode::Normal,
+                        language,
+                        launching,
+                        notice,
+                    ),
+                    span { class: "launcher-icon-text", "{item.icon_text}" }
+                }
+                if is_browser {
+                    button {
+                        class: "launcher-private-button",
+                        title: "{private_title}",
+                        aria_label: "{private_title}",
+                        disabled,
+                        onclick: move |_| launch_launcher(
+                            private_item.clone(),
+                            LaunchMode::Private,
+                            language,
+                            launching,
+                            notice,
+                        ),
+                        ChevronDown { size: 11 }
+                    }
+                }
+            }
+            span { class: "launcher-name", title: "{item_name}", "{item_name}" }
+        }
+    }
+}
+
+fn launch_launcher(
+    item: LauncherItem,
+    mode: LaunchMode,
+    language: Language,
+    mut launching: Signal<Option<String>>,
+    mut notice: Signal<Option<LauncherNotice>>,
+) {
+    let id = item.id.clone();
+    let name = item.name.clone();
+    launching.set(Some(id));
+    notice.set(None);
+    spawn(async move {
+        let result = tokio::task::spawn_blocking(move || item.launch(mode)).await;
+        launching.set(None);
+        let notice_message = match result {
+            Ok(Ok(())) => LauncherNotice {
+                success: true,
+                message: match language {
+                    Language::English => format!("Started {name}"),
+                    Language::Chinese => format!("已启动 {name}"),
+                },
+            },
+            Ok(Err(error)) => LauncherNotice {
+                success: false,
+                message: match language {
+                    Language::English => format!("Failed to start {name}: {error:#}"),
+                    Language::Chinese => format!("启动 {name} 失败：{error:#}"),
+                },
+            },
+            Err(error) => LauncherNotice {
+                success: false,
+                message: match language {
+                    Language::English => format!("Launcher task for {name} failed: {error}"),
+                    Language::Chinese => format!("{name} 的启动任务失败：{error}"),
+                },
+            },
+        };
+        notice.set(Some(notice_message));
+    });
 }
 
 #[component]

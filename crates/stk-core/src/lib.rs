@@ -11,8 +11,9 @@ mod ssh_config;
 pub mod stats;
 
 pub use config::{
-    AppConfig, ConfigError, ControlConfig, EnvConfig, EnvProfileConfig, LocalProxyCandidate,
-    ProxyEnvScheme, ProxyEnvVariable,
+    AppConfig, ApplicationLauncherConfig, ApplicationLauncherEntryConfig, BrowserEngine,
+    BrowserLauncherConfig, BrowserLauncherEntryConfig, ConfigError, ControlConfig, EnvConfig,
+    EnvProfileConfig, LauncherConfig, LocalProxyCandidate, ProxyEnvScheme, ProxyEnvVariable,
 };
 pub use config_path::{
     ConfigScope, default_config_directory, default_config_path, resolve_config_path,

@@ -40,6 +40,7 @@ STK 同时提供：
 - 250 ms 采样、最近 1 秒滚动速率、状态变化即时推送和 1 秒稳定心跳。
 - 最近 24 小时分钟级流量历史；GUI 概览展示最近 1 小时交互曲线。
 - 类似浏览器 Network 面板的按需连接捕获、清理和终态连接自动清理。
+- GUI 概览页快速启动浏览器和自定义应用；浏览器支持带代理的普通与隐身模式。
 - YAML、JSON、TOML 配置，以及基于文件系统通知的动态加载。
 - Linux、Windows 和 macOS 支持。
 
@@ -271,6 +272,60 @@ env:
 `inject` 和 `inherit` 用来控制传递给子进程的代理相关环境变量。可用变量组包括 `all-proxy`、`http-proxy` 和 `https-proxy`，`inherit` 还支持 `no-proxy`。每个变量组同时表示大小写形式，例如 `http-proxy` 同时对应 `HTTP_PROXY` 和 `http_proxy`。
 
 未配置策略时，STK 默认不继承任何已有代理变量，将选中代理的 URL 同时注入大小写形式的 `ALL_PROXY`、`HTTP_PROXY` 和 `HTTPS_PROXY`，并清理 `NO_PROXY/no_proxy`。profile 可以分别完整覆盖全局的 `inject` 和 `inherit` 列表；profile 中省略某个列表时继续使用全局列表，显式配置空列表则禁用对应行为。同一个变量组同时出现在两个列表中时，注入优先。`PATH`、`HOME` 等普通进程环境变量仍会正常继承。`STK_PROXY_HOST`、`STK_PROXY_TUNNEL`、`STK_PROXY_SCHEME` 和 `STK_PROXY_URL` 始终会被设置。
+
+### GUI 快速启动器
+
+GUI 在概览页顶部显示紧凑的浏览器和应用入口。点击浏览器主图标会使用选中的代理启动普通模式，点击右侧小箭头会使用同一代理直接启动隐身模式；普通应用只有一个启动按钮。入口不可用时会置灰，鼠标提示会说明是命令不存在、代理尚未监听还是配置选择无效。
+
+浏览器与普通应用分别配置：
+
+```yaml
+launchers:
+  # browsers/applications 没有单独指定时使用这个 profile。
+  default-proxy: production
+
+  browsers:
+    auto-discover: true
+    default-proxy: default
+    entries:
+      chrome:
+        detect: chrome
+        name: Chrome
+        icon: GC
+        proxy: default
+        normal-args: [https://api.ipify.org]
+        private-args: [https://api.ipify.org]
+
+      company-browser:
+        engine: custom
+        command: /opt/company-browser/bin/browser
+        args: [--new-window]
+        private-args: [--private]
+        proxy-args: ["--proxy-server={proxy-url}"]
+        profile-dir: ~/.config/stk/company-browser
+
+  applications:
+    default-proxy: production
+    entries:
+      editor:
+        name: Code
+        command: code
+        args: [~/work/project]
+        icon: VS
+        proxy: default
+        working-directory: ~/work/project
+        env:
+          STK_LAUNCHED: "1"
+        unset-env: [NO_PROXY, no_proxy]
+```
+
+自动探测支持 Chrome、Firefox、Edge、Brave、Chromium、Vivaldi 和 Opera，并检查 macOS 的 `/Applications` 与 `~/Applications`、Linux 的 `PATH`，以及 Windows 的常见安装目录和 `PATH`。探测只在 GUI 加载配置、配置代次变化或用户点击刷新按钮时发生，不运行定时扫描，也不会持续监控已启动的应用。
+
+每个入口还支持 `enabled`、`show-in-overview` 和 `order`。浏览器的 `args` 会应用于两种模式，`normal-args` 与 `private-args` 只追加到对应模式；应用入口支持 `args`、`working-directory`、`env` 和 `unset-env`。
+
+`proxy` 可以是 `env.profiles` 中的名称、`HOST/TUNNEL@SCHEME`、`direct`、`inherit` 或 `default`。`default` 表示继续使用上一级默认值；优先级为入口、浏览器/应用分组、`launchers.default-proxy`、`env.default`，最后自动选择第一个兼容的本地代理。`direct` 会清理继承的代理环境变量，`inherit` 保留当前进程环境。
+
+内置 Chromium 和 Firefox 启动器使用 STK 独立的持久浏览器 profile，避免修改用户原有浏览器配置。自定义浏览器和应用的 `proxy-args` 支持 `{proxy-url}`、`{proxy-scheme}`、`{proxy-host}`、`{proxy-port}`；浏览器还支持 `{profile-dir}`。`icon` 在当前版本中显示最多两个字符，适合填写简称。
 
 ## 四类转发
 

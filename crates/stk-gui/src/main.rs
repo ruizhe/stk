@@ -46,6 +46,7 @@ use tracing::{error, info, warn};
 mod app;
 mod autostart;
 mod gui_config;
+mod launcher;
 mod logging;
 
 use app::App;

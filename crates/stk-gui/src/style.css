@@ -399,6 +399,210 @@ textarea:focus-visible {
     margin: 0 auto;
 }
 
+.quick-launcher {
+    margin-bottom: 12px;
+    overflow: hidden;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+}
+
+.quick-launcher-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    min-height: 42px;
+    padding: 7px 10px 7px 14px;
+    background: var(--surface-muted);
+    border-bottom: 1px solid var(--border);
+}
+
+.quick-launcher-heading {
+    min-width: 0;
+}
+
+.quick-launcher-heading h2 {
+    margin: 1px 0 0;
+    overflow: hidden;
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 650;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.quick-launcher-status {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+.launcher-notice {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 5px;
+    overflow: hidden;
+    font-size: 10px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.launcher-notice svg {
+    flex: 0 0 auto;
+}
+
+.launcher-notice.success {
+    color: var(--green);
+}
+
+.launcher-notice.error {
+    color: var(--red);
+}
+
+.quick-launcher-refresh {
+    display: grid;
+    place-items: center;
+    flex: 0 0 27px;
+    width: 27px;
+    height: 27px;
+    padding: 0;
+    color: var(--text-muted);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    cursor: pointer;
+}
+
+.quick-launcher-refresh:hover:not(:disabled) {
+    color: var(--text);
+    background: var(--surface-strong);
+    border-color: var(--border-strong);
+}
+
+.quick-launcher-refresh:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+
+.quick-launcher-items {
+    display: flex;
+    max-height: 132px;
+    flex-wrap: wrap;
+    align-content: flex-start;
+    gap: 7px;
+    overflow-y: auto;
+    padding: 9px 11px 8px;
+}
+
+.launcher-tile {
+    display: flex;
+    width: 58px;
+    min-width: 0;
+    flex: 0 0 58px;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+}
+
+.launcher-button-group {
+    display: flex;
+    height: 38px;
+    align-items: stretch;
+    justify-content: center;
+}
+
+.launcher-main-button,
+.launcher-private-button {
+    display: grid;
+    place-items: center;
+    height: 38px;
+    padding: 0;
+    color: var(--text);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    cursor: pointer;
+}
+
+.launcher-main-button {
+    width: 46px;
+    border-radius: 6px;
+}
+
+.launcher-button-group.browser .launcher-main-button {
+    width: 36px;
+    border-right: 0;
+    border-radius: 6px 0 0 6px;
+}
+
+.launcher-private-button {
+    width: 15px;
+    color: var(--text-muted);
+    border-radius: 0 6px 6px 0;
+}
+
+.launcher-main-button:hover:not(:disabled),
+.launcher-private-button:hover:not(:disabled) {
+    color: var(--green);
+    background: var(--green-soft);
+    border-color: #91c8ad;
+}
+
+.launcher-main-button:disabled,
+.launcher-private-button:disabled {
+    cursor: default;
+}
+
+.launcher-icon-text {
+    max-width: 32px;
+    overflow: hidden;
+    font-size: 12px;
+    font-weight: 750;
+    letter-spacing: -0.2px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.launcher-name {
+    width: 100%;
+    overflow: hidden;
+    color: var(--text-muted);
+    font-size: 9px;
+    line-height: 1.15;
+    text-align: center;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.launcher-tile.unavailable {
+    opacity: 0.48;
+}
+
+.quick-launcher-message {
+    display: flex;
+    min-height: 54px;
+    align-items: center;
+    gap: 7px;
+    padding: 10px 14px;
+    color: var(--text-muted);
+    font-size: 10px;
+}
+
+.quick-launcher-message.error {
+    color: var(--red);
+    background: var(--red-soft);
+}
+
+.quick-launcher-message span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .runtime-summary {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));

@@ -126,6 +126,7 @@ impl Engine {
         let AppConfig {
             control,
             env: _,
+            launchers: _,
             override_default,
             hosts,
         } = self.config;
