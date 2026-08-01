@@ -11,7 +11,8 @@ use std::{
 };
 use stk_core::{
     AppConfig, ApplicationLauncherEntryConfig, BrowserEngine, BrowserLauncherEntryConfig,
-    EnvProfileConfig, LocalProxyCandidate, ProxyEnvScheme, ProxyEnvVariable, config::ProxyProtocol,
+    EnvProfileConfig, LocalProxyCandidate, ProxyEnvScheme, ProxyEnvVariable,
+    config::ProxyProtocol,
     stats::{RuntimeSnapshot, TunnelKind, TunnelRuntimeStatus},
 };
 
@@ -167,13 +168,14 @@ impl LauncherItem {
                 let profile_dir = configured_profile_dir.as_deref();
                 if let Some(profile_dir) = profile_dir {
                     fs::create_dir_all(profile_dir).with_context(|| {
-                        format!(
-                            "failed to create browser profile {}",
-                            profile_dir.display()
-                        )
+                        format!("failed to create browser profile {}", profile_dir.display())
                     })?;
                 }
-                args.extend(expand_proxy_arguments(&self.proxy_args, proxy, profile_dir)?);
+                args.extend(expand_proxy_arguments(
+                    &self.proxy_args,
+                    proxy,
+                    profile_dir,
+                )?);
                 args.extend(match mode {
                     LaunchMode::Normal => self.normal_args.iter().map(OsString::from),
                     LaunchMode::Private => self.private_args.iter().map(OsString::from),
@@ -199,10 +201,7 @@ impl LauncherItem {
         Ok(LaunchPlan {
             command: self.command.clone(),
             args,
-            working_directory: self
-                .working_directory
-                .as_deref()
-                .map(expand_path),
+            working_directory: self.working_directory.as_deref().map(expand_path),
             environment_set,
             environment_remove,
         })
@@ -286,7 +285,10 @@ impl LaunchPlan {
         }
         command.envs(&self.environment_set);
         let mut child = command.spawn().with_context(|| {
-            format!("failed to start launcher command {}", self.command.display())
+            format!(
+                "failed to start launcher command {}",
+                self.command.display()
+            )
         })?;
         let name = self.command.display().to_string();
         if let Err(error) = thread::Builder::new()
@@ -313,8 +315,12 @@ struct DetectedBrowser {
 }
 
 fn load_launcher_catalog(path: &Path) -> anyhow::Result<Vec<LauncherItem>> {
-    let config = AppConfig::from_path(path)
-        .with_context(|| format!("failed to load launcher configuration from {}", path.display()))?;
+    let config = AppConfig::from_path(path).with_context(|| {
+        format!(
+            "failed to load launcher configuration from {}",
+            path.display()
+        )
+    })?;
     config.validate()?;
     let detected = detect_browsers();
     let detected_by_id = detected
@@ -728,9 +734,8 @@ fn chromium_proxy_url(plan: &ProxyEnvironmentPlan) -> String {
 }
 
 fn prepare_firefox_profile(profile_dir: &Path, proxy: &LauncherProxyPlan) -> anyhow::Result<()> {
-    fs::create_dir_all(profile_dir).with_context(|| {
-        format!("failed to create Firefox profile {}", profile_dir.display())
-    })?;
+    fs::create_dir_all(profile_dir)
+        .with_context(|| format!("failed to create Firefox profile {}", profile_dir.display()))?;
     let preferences = match proxy {
         LauncherProxyPlan::Stk(plan) => match plan.scheme {
             ProxyEnvScheme::Http | ProxyEnvScheme::Auto => format!(
@@ -757,14 +762,11 @@ fn prepare_firefox_profile(profile_dir: &Path, proxy: &LauncherProxyPlan) -> any
                 plan.scheme == ProxyEnvScheme::Socks5h
             ),
         },
-        LauncherProxyPlan::Direct => {
-            "user_pref(\"network.proxy.type\", 0);\n".to_string()
-        }
+        LauncherProxyPlan::Direct => "user_pref(\"network.proxy.type\", 0);\n".to_string(),
         LauncherProxyPlan::Inherit => String::new(),
     };
-    fs::write(profile_dir.join("user.js"), preferences).with_context(|| {
-        format!("failed to update Firefox profile {}", profile_dir.display())
-    })
+    fs::write(profile_dir.join("user.js"), preferences)
+        .with_context(|| format!("failed to update Firefox profile {}", profile_dir.display()))
 }
 
 fn expand_proxy_arguments(
@@ -798,13 +800,17 @@ fn detect_browsers() -> Vec<DetectedBrowser> {
     browser_candidates()
         .into_iter()
         .filter_map(|candidate| {
-            candidate.commands.iter().find_map(|command| find_executable(command)).map(|command| DetectedBrowser {
-                id: candidate.id,
-                name: candidate.name,
-                engine: candidate.engine,
-                command,
-                order: candidate.order,
-            })
+            candidate
+                .commands
+                .iter()
+                .find_map(|command| find_executable(command))
+                .map(|command| DetectedBrowser {
+                    id: candidate.id,
+                    name: candidate.name,
+                    engine: candidate.engine,
+                    command,
+                    order: candidate.order,
+                })
         })
         .collect()
 }
@@ -820,25 +826,124 @@ struct BrowserCandidate {
 #[cfg(target_os = "macos")]
 fn browser_candidates() -> Vec<BrowserCandidate> {
     vec![
-        browser_candidate("chrome", "Google Chrome", BrowserEngine::Chromium, &["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"], 10),
-        browser_candidate("firefox", "Firefox", BrowserEngine::Firefox, &["/Applications/Firefox.app/Contents/MacOS/firefox", "~/Applications/Firefox.app/Contents/MacOS/firefox"], 20),
-        browser_candidate("edge", "Microsoft Edge", BrowserEngine::Chromium, &["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge", "~/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"], 30),
-        browser_candidate("brave", "Brave Browser", BrowserEngine::Chromium, &["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser", "~/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"], 40),
-        browser_candidate("chromium", "Chromium", BrowserEngine::Chromium, &["/Applications/Chromium.app/Contents/MacOS/Chromium", "~/Applications/Chromium.app/Contents/MacOS/Chromium"], 50),
-        browser_candidate("vivaldi", "Vivaldi", BrowserEngine::Chromium, &["/Applications/Vivaldi.app/Contents/MacOS/Vivaldi", "~/Applications/Vivaldi.app/Contents/MacOS/Vivaldi"], 60),
-        browser_candidate("opera", "Opera", BrowserEngine::Chromium, &["/Applications/Opera.app/Contents/MacOS/Opera", "~/Applications/Opera.app/Contents/MacOS/Opera"], 70),
+        browser_candidate(
+            "chrome",
+            "Google Chrome",
+            BrowserEngine::Chromium,
+            &[
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            ],
+            10,
+        ),
+        browser_candidate(
+            "firefox",
+            "Firefox",
+            BrowserEngine::Firefox,
+            &[
+                "/Applications/Firefox.app/Contents/MacOS/firefox",
+                "~/Applications/Firefox.app/Contents/MacOS/firefox",
+            ],
+            20,
+        ),
+        browser_candidate(
+            "edge",
+            "Microsoft Edge",
+            BrowserEngine::Chromium,
+            &[
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                "~/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            ],
+            30,
+        ),
+        browser_candidate(
+            "brave",
+            "Brave Browser",
+            BrowserEngine::Chromium,
+            &[
+                "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+                "~/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            ],
+            40,
+        ),
+        browser_candidate(
+            "chromium",
+            "Chromium",
+            BrowserEngine::Chromium,
+            &[
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                "~/Applications/Chromium.app/Contents/MacOS/Chromium",
+            ],
+            50,
+        ),
+        browser_candidate(
+            "vivaldi",
+            "Vivaldi",
+            BrowserEngine::Chromium,
+            &[
+                "/Applications/Vivaldi.app/Contents/MacOS/Vivaldi",
+                "~/Applications/Vivaldi.app/Contents/MacOS/Vivaldi",
+            ],
+            60,
+        ),
+        browser_candidate(
+            "opera",
+            "Opera",
+            BrowserEngine::Chromium,
+            &[
+                "/Applications/Opera.app/Contents/MacOS/Opera",
+                "~/Applications/Opera.app/Contents/MacOS/Opera",
+            ],
+            70,
+        ),
     ]
 }
 
 #[cfg(target_os = "linux")]
 fn browser_candidates() -> Vec<BrowserCandidate> {
     vec![
-        browser_candidate("chrome", "Google Chrome", BrowserEngine::Chromium, &["google-chrome", "google-chrome-stable"], 10),
-        browser_candidate("firefox", "Firefox", BrowserEngine::Firefox, &["firefox"], 20),
-        browser_candidate("edge", "Microsoft Edge", BrowserEngine::Chromium, &["microsoft-edge", "microsoft-edge-stable"], 30),
-        browser_candidate("brave", "Brave Browser", BrowserEngine::Chromium, &["brave-browser", "brave"], 40),
-        browser_candidate("chromium", "Chromium", BrowserEngine::Chromium, &["chromium", "chromium-browser"], 50),
-        browser_candidate("vivaldi", "Vivaldi", BrowserEngine::Chromium, &["vivaldi", "vivaldi-stable"], 60),
+        browser_candidate(
+            "chrome",
+            "Google Chrome",
+            BrowserEngine::Chromium,
+            &["google-chrome", "google-chrome-stable"],
+            10,
+        ),
+        browser_candidate(
+            "firefox",
+            "Firefox",
+            BrowserEngine::Firefox,
+            &["firefox"],
+            20,
+        ),
+        browser_candidate(
+            "edge",
+            "Microsoft Edge",
+            BrowserEngine::Chromium,
+            &["microsoft-edge", "microsoft-edge-stable"],
+            30,
+        ),
+        browser_candidate(
+            "brave",
+            "Brave Browser",
+            BrowserEngine::Chromium,
+            &["brave-browser", "brave"],
+            40,
+        ),
+        browser_candidate(
+            "chromium",
+            "Chromium",
+            BrowserEngine::Chromium,
+            &["chromium", "chromium-browser"],
+            50,
+        ),
+        browser_candidate(
+            "vivaldi",
+            "Vivaldi",
+            BrowserEngine::Chromium,
+            &["vivaldi", "vivaldi-stable"],
+            60,
+        ),
         browser_candidate("opera", "Opera", BrowserEngine::Chromium, &["opera"], 70),
     ]
 }
@@ -849,13 +954,77 @@ fn browser_candidates() -> Vec<BrowserCandidate> {
     let program_files = env::var("PROGRAMFILES").unwrap_or_default();
     let program_files_x86 = env::var("PROGRAMFILES(X86)").unwrap_or_default();
     vec![
-        browser_candidate_owned("chrome", "Google Chrome", BrowserEngine::Chromium, vec![format!(r"{local}\Google\Chrome\Application\chrome.exe"), format!(r"{program_files}\Google\Chrome\Application\chrome.exe"), "chrome.exe".to_string()], 10),
-        browser_candidate_owned("firefox", "Firefox", BrowserEngine::Firefox, vec![format!(r"{program_files}\Mozilla Firefox\firefox.exe"), format!(r"{program_files_x86}\Mozilla Firefox\firefox.exe"), "firefox.exe".to_string()], 20),
-        browser_candidate_owned("edge", "Microsoft Edge", BrowserEngine::Chromium, vec![format!(r"{program_files_x86}\Microsoft\Edge\Application\msedge.exe"), format!(r"{program_files}\Microsoft\Edge\Application\msedge.exe"), "msedge.exe".to_string()], 30),
-        browser_candidate_owned("brave", "Brave Browser", BrowserEngine::Chromium, vec![format!(r"{program_files}\BraveSoftware\Brave-Browser\Application\brave.exe"), format!(r"{local}\BraveSoftware\Brave-Browser\Application\brave.exe"), "brave.exe".to_string()], 40),
-        browser_candidate("chromium", "Chromium", BrowserEngine::Chromium, &["chromium.exe"], 50),
-        browser_candidate_owned("vivaldi", "Vivaldi", BrowserEngine::Chromium, vec![format!(r"{local}\Vivaldi\Application\vivaldi.exe"), "vivaldi.exe".to_string()], 60),
-        browser_candidate_owned("opera", "Opera", BrowserEngine::Chromium, vec![format!(r"{local}\Programs\Opera\opera.exe"), "opera.exe".to_string()], 70),
+        browser_candidate_owned(
+            "chrome",
+            "Google Chrome",
+            BrowserEngine::Chromium,
+            vec![
+                format!(r"{local}\Google\Chrome\Application\chrome.exe"),
+                format!(r"{program_files}\Google\Chrome\Application\chrome.exe"),
+                "chrome.exe".to_string(),
+            ],
+            10,
+        ),
+        browser_candidate_owned(
+            "firefox",
+            "Firefox",
+            BrowserEngine::Firefox,
+            vec![
+                format!(r"{program_files}\Mozilla Firefox\firefox.exe"),
+                format!(r"{program_files_x86}\Mozilla Firefox\firefox.exe"),
+                "firefox.exe".to_string(),
+            ],
+            20,
+        ),
+        browser_candidate_owned(
+            "edge",
+            "Microsoft Edge",
+            BrowserEngine::Chromium,
+            vec![
+                format!(r"{program_files_x86}\Microsoft\Edge\Application\msedge.exe"),
+                format!(r"{program_files}\Microsoft\Edge\Application\msedge.exe"),
+                "msedge.exe".to_string(),
+            ],
+            30,
+        ),
+        browser_candidate_owned(
+            "brave",
+            "Brave Browser",
+            BrowserEngine::Chromium,
+            vec![
+                format!(r"{program_files}\BraveSoftware\Brave-Browser\Application\brave.exe"),
+                format!(r"{local}\BraveSoftware\Brave-Browser\Application\brave.exe"),
+                "brave.exe".to_string(),
+            ],
+            40,
+        ),
+        browser_candidate(
+            "chromium",
+            "Chromium",
+            BrowserEngine::Chromium,
+            &["chromium.exe"],
+            50,
+        ),
+        browser_candidate_owned(
+            "vivaldi",
+            "Vivaldi",
+            BrowserEngine::Chromium,
+            vec![
+                format!(r"{local}\Vivaldi\Application\vivaldi.exe"),
+                "vivaldi.exe".to_string(),
+            ],
+            60,
+        ),
+        browser_candidate_owned(
+            "opera",
+            "Opera",
+            BrowserEngine::Chromium,
+            vec![
+                format!(r"{local}\Programs\Opera\opera.exe"),
+                "opera.exe".to_string(),
+            ],
+            70,
+        ),
     ]
 }
 
@@ -870,7 +1039,10 @@ fn browser_candidate(
         id,
         name,
         engine,
-        commands.iter().map(|command| (*command).to_string()).collect(),
+        commands
+            .iter()
+            .map(|command| (*command).to_string())
+            .collect(),
         order,
     )
 }
@@ -1042,7 +1214,11 @@ hosts:
     fn browser_and_application_configs_build_separate_catalog_entries() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.yaml");
-        fs::write(path.clone(), launcher_test_config().to_yaml_string().unwrap()).unwrap();
+        fs::write(
+            path.clone(),
+            launcher_test_config().to_yaml_string().unwrap(),
+        )
+        .unwrap();
         let catalog = LauncherCatalog::load(&path);
         assert!(catalog.error.is_none());
         assert_eq!(catalog.items.len(), 2);
@@ -1054,12 +1230,8 @@ hosts:
     fn custom_application_proxy_arguments_are_expanded() {
         let config = launcher_test_config();
         let proxy = resolve_launcher_proxy(&config, Some("web")).unwrap();
-        let arguments = expand_proxy_arguments(
-            &["--proxy={proxy-url}".to_string()],
-            &proxy,
-            None,
-        )
-        .unwrap();
+        let arguments =
+            expand_proxy_arguments(&["--proxy={proxy-url}".to_string()], &proxy, None).unwrap();
         assert_eq!(arguments, [OsString::from("--proxy=http://127.0.0.1:7890")]);
     }
 
@@ -1069,9 +1241,7 @@ hosts:
         let proxy = resolve_launcher_proxy(&config, Some("web")).unwrap();
         let item = test_browser_item(BrowserEngine::Chromium, None);
 
-        let normal = item
-            .build_launch_plan(LaunchMode::Normal, &proxy)
-            .unwrap();
+        let normal = item.build_launch_plan(LaunchMode::Normal, &proxy).unwrap();
         assert_eq!(
             normal.args,
             [
@@ -1081,9 +1251,7 @@ hosts:
             ]
         );
 
-        let private = item
-            .build_launch_plan(LaunchMode::Private, &proxy)
-            .unwrap();
+        let private = item.build_launch_plan(LaunchMode::Private, &proxy).unwrap();
         assert_eq!(
             private.args,
             [

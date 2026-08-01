@@ -450,8 +450,7 @@ fn AppContent() -> Element {
     });
     let mut logs = use_signal(super::logging::snapshot);
     let mut editor = use_signal(move || ConfigEditorState::load(&editor_path, initial_language));
-    let mut launchers =
-        use_signal(move || LauncherCatalog::load(&launcher_config_path));
+    let mut launchers = use_signal(move || LauncherCatalog::load(&launcher_config_path));
     let auto_start = use_signal(AutoStartUiState::load);
 
     let config_path_for_poll = config_path.clone();
@@ -1073,14 +1072,15 @@ fn LauncherTile(
     let is_browser = item.is_browser();
     let menu_open = open_menu.read().as_deref() == Some(item.id.as_str());
     let proxy_summary = item.proxy_summary();
-    let normal_title = unavailable.clone().unwrap_or_else(|| {
-        match language {
-            Language::English => format!("Launch {} with {}", item.name, proxy_summary),
-            Language::Chinese => format!("使用 {} 启动 {}", proxy_summary, item.name),
-        }
+    let normal_title = unavailable.clone().unwrap_or_else(|| match language {
+        Language::English => format!("Launch {} with {}", item.name, proxy_summary),
+        Language::Chinese => format!("使用 {} 启动 {}", proxy_summary, item.name),
     });
     let private_title = unavailable.clone().unwrap_or_else(|| match language {
-        Language::English => format!("Launch {} in private mode with {}", item.name, proxy_summary),
+        Language::English => format!(
+            "Launch {} in private mode with {}",
+            item.name, proxy_summary
+        ),
         Language::Chinese => format!("使用 {} 以隐身模式启动 {}", proxy_summary, item.name),
     });
     let normal_item = item.clone();
