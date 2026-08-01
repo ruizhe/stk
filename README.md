@@ -290,7 +290,6 @@ launchers:
       chrome:
         detect: chrome
         name: Chrome
-        icon: GC
         proxy: default
         normal-args: [https://api.ipify.org]
         private-args: [https://api.ipify.org]
@@ -302,6 +301,10 @@ launchers:
         private-args: [--private]
         proxy-args: ["--proxy-server={proxy-url}"]
         profile-dir: ~/.config/stk/company-browser
+        icon: CB
+        icon-path: ~/.config/stk/icons/company-browser.svg
+        private-icon: PI
+        private-icon-path: ~/.config/stk/icons/company-browser-private.svg
 
   applications:
     default-proxy: production
@@ -311,6 +314,7 @@ launchers:
         command: code
         args: [~/work/project]
         icon: VS
+        icon-path: ~/.config/stk/icons/code.png
         proxy: default
         working-directory: ~/work/project
         env:
@@ -320,11 +324,15 @@ launchers:
 
 Automatic discovery covers Chrome, Firefox, Edge, Brave, Chromium, Vivaldi, and Opera. It checks `/Applications` and `~/Applications` on macOS, `PATH` on Linux, and common installation directories plus `PATH` on Windows. Discovery runs only when the GUI loads a configuration, observes a new configuration generation, or the user clicks refresh. There is no periodic scan or ongoing monitoring of launched applications.
 
+Built-in browsers first try to load the installed application's system icon and fall back to the brand SVG bundled with STK, so icon extraction failures never prevent launching. The normal-mode menu uses the application icon, while the private-mode menu uses the browser's bundled private-browsing icon. Custom browsers can independently configure `icon-path` and `private-icon-path` with PNG, SVG, JPEG, GIF, WebP, BMP, or ICO images; application launchers also support `icon-path`. Relative paths are resolved from the directory containing the main STK configuration file, and `~` expands to the user directory. The existing `icon` short-text setting remains the normal-icon fallback; custom browsers can use `private-icon` for the private-mode text fallback.
+
+System and custom icons are read only when the launcher catalog loads, configuration changes, or the user explicitly refreshes it. Results are cached in process by path, modification time, and file size; there is no icon polling, file watcher, or resident conversion process.
+
 Every entry also accepts `enabled`, `show-in-overview`, and `order`. Browser `args` apply to both modes, with `normal-args` and `private-args` appended only to the corresponding mode. Application entries support `args`, `working-directory`, `env`, and `unset-env`.
 
 `proxy` accepts an `env.profiles` name, `HOST/TUNNEL@SCHEME`, `direct`, `inherit`, or `default`. `default` continues to the next fallback. Selection precedence is entry, browser/application section, `launchers.default-proxy`, `env.default`, and finally the first compatible local proxy. `direct` removes inherited proxy environment variables, while `inherit` preserves the current process environment.
 
-Built-in Chromium launchers reuse the browser's default profile unless `profile-dir` is explicitly configured. STK only appends the selected proxy argument and, for private launches, the browser's private-mode argument; configured `args`, `normal-args`, and `private-args` remain unchanged. Firefox still needs an STK-managed profile to apply a reliable per-launch proxy without modifying the user's default Firefox settings. `proxy-args` templates for custom browsers and applications support `{proxy-url}`, `{proxy-scheme}`, `{proxy-host}`, and `{proxy-port}`; browser templates also support `{profile-dir}`. In this version, `icon` renders up to two characters and is intended for a short label.
+Built-in Chromium launchers reuse the browser's default profile unless `profile-dir` is explicitly configured. STK only appends the selected proxy argument and, for private launches, the browser's private-mode argument; configured `args`, `normal-args`, and `private-args` remain unchanged. Firefox still needs an STK-managed profile to apply a reliable per-launch proxy without modifying the user's default Firefox settings. `proxy-args` templates for custom browsers and applications support `{proxy-url}`, `{proxy-scheme}`, `{proxy-host}`, and `{proxy-port}`; browser templates also support `{profile-dir}`. `icon` and `private-icon` render up to two characters when no image is available.
 
 ## Forwarding Modes
 

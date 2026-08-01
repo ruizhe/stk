@@ -291,7 +291,6 @@ launchers:
       chrome:
         detect: chrome
         name: Chrome
-        icon: GC
         proxy: default
         normal-args: [https://api.ipify.org]
         private-args: [https://api.ipify.org]
@@ -303,6 +302,10 @@ launchers:
         private-args: [--private]
         proxy-args: ["--proxy-server={proxy-url}"]
         profile-dir: ~/.config/stk/company-browser
+        icon: CB
+        icon-path: ~/.config/stk/icons/company-browser.svg
+        private-icon: PI
+        private-icon-path: ~/.config/stk/icons/company-browser-private.svg
 
   applications:
     default-proxy: production
@@ -312,6 +315,7 @@ launchers:
         command: code
         args: [~/work/project]
         icon: VS
+        icon-path: ~/.config/stk/icons/code.png
         proxy: default
         working-directory: ~/work/project
         env:
@@ -321,11 +325,15 @@ launchers:
 
 自动探测支持 Chrome、Firefox、Edge、Brave、Chromium、Vivaldi 和 Opera，并检查 macOS 的 `/Applications` 与 `~/Applications`、Linux 的 `PATH`，以及 Windows 的常见安装目录和 `PATH`。探测只在 GUI 加载配置、配置代次变化或用户点击刷新按钮时发生，不运行定时扫描，也不会持续监控已启动的应用。
 
+内置浏览器会优先读取系统安装的应用图标；读取失败时使用 STK 随程序内置的品牌图标，因此图标缺失不会影响浏览器启动。普通模式菜单使用应用图标，隐身模式菜单使用该浏览器对应的内置无痕图标。自定义浏览器可以分别通过 `icon-path` 和 `private-icon-path` 指定 PNG、SVG、JPEG、GIF、WebP、BMP 或 ICO 图片；应用入口支持 `icon-path`。相对路径以 STK 主配置文件所在目录为基准，`~` 会展开为用户目录。旧的 `icon` 短文字配置继续作为普通图标加载失败时的回退，自定义浏览器还可用 `private-icon` 配置隐身模式的文字回退。
+
+系统图标和自定义图片只在启动器目录加载、配置变化或手工刷新时读取，并按文件路径、修改时间和大小在进程内缓存；没有图标轮询、文件监控或常驻转换进程。
+
 每个入口还支持 `enabled`、`show-in-overview` 和 `order`。浏览器的 `args` 会应用于两种模式，`normal-args` 与 `private-args` 只追加到对应模式；应用入口支持 `args`、`working-directory`、`env` 和 `unset-env`。
 
 `proxy` 可以是 `env.profiles` 中的名称、`HOST/TUNNEL@SCHEME`、`direct`、`inherit` 或 `default`。`default` 表示继续使用上一级默认值；优先级为入口、浏览器/应用分组、`launchers.default-proxy`、`env.default`，最后自动选择第一个兼容的本地代理。`direct` 会清理继承的代理环境变量，`inherit` 保留当前进程环境。
 
-内置 Chromium 启动器默认复用浏览器原有的默认 profile，只有显式配置 `profile-dir` 时才使用指定目录。STK 只追加选中的代理参数，隐身启动时再追加浏览器的隐身参数；用户配置的 `args`、`normal-args` 和 `private-args` 保持不变。Firefox 为了在不修改用户默认配置的情况下可靠应用单次启动代理，仍需使用 STK 管理的 profile。自定义浏览器和应用的 `proxy-args` 支持 `{proxy-url}`、`{proxy-scheme}`、`{proxy-host}`、`{proxy-port}`；浏览器还支持 `{profile-dir}`。`icon` 在当前版本中显示最多两个字符，适合填写简称。
+内置 Chromium 启动器默认复用浏览器原有的默认 profile，只有显式配置 `profile-dir` 时才使用指定目录。STK 只追加选中的代理参数，隐身启动时再追加浏览器的隐身参数；用户配置的 `args`、`normal-args` 和 `private-args` 保持不变。Firefox 为了在不修改用户默认配置的情况下可靠应用单次启动代理，仍需使用 STK 管理的 profile。自定义浏览器和应用的 `proxy-args` 支持 `{proxy-url}`、`{proxy-scheme}`、`{proxy-host}`、`{proxy-port}`；浏览器还支持 `{profile-dir}`。图片不可用时，`icon` 和 `private-icon` 最多显示两个字符。
 
 ## 四类转发
 

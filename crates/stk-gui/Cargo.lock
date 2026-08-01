@@ -5587,6 +5587,7 @@ name = "stk-gui"
 version = "0.1.12"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "dioxus",
  "dispatch2",

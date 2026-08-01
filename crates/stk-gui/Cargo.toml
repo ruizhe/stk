@@ -12,6 +12,7 @@ desktop = ["dep:dioxus", "dep:image"]
 
 [dependencies]
 anyhow = "1.0.103"
+base64 = "0.22.1"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 dioxus = { version = "0.7.0", features = ["desktop"], optional = true }
 image = { version = "0.25.10", default-features = false, features = ["png"], optional = true }

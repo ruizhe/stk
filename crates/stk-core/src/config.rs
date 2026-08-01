@@ -347,6 +347,14 @@ impl BrowserLauncherConfig {
                 &format!("browser {id} profile-dir"),
                 browser.profile_dir.as_deref(),
             )?;
+            validate_optional_non_empty(
+                &format!("browser {id} icon-path"),
+                browser.icon_path.as_deref(),
+            )?;
+            validate_optional_non_empty(
+                &format!("browser {id} private-icon-path"),
+                browser.private_icon_path.as_deref(),
+            )?;
             validate_launcher_proxy(
                 &format!("browser {id} proxy"),
                 browser.proxy.as_deref(),
@@ -401,6 +409,12 @@ pub struct BrowserLauncherEntryConfig {
     pub profile_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_icon_path: Option<String>,
 }
 
 impl Default for BrowserLauncherEntryConfig {
@@ -420,6 +434,9 @@ impl Default for BrowserLauncherEntryConfig {
             proxy: None,
             profile_dir: None,
             icon: None,
+            icon_path: None,
+            private_icon: None,
+            private_icon_path: None,
         }
     }
 }
@@ -462,6 +479,10 @@ impl ApplicationLauncherConfig {
                 &format!("application {id} working-directory"),
                 application.working_directory.as_deref(),
             )?;
+            validate_optional_non_empty(
+                &format!("application {id} icon-path"),
+                application.icon_path.as_deref(),
+            )?;
             validate_launcher_proxy(
                 &format!("application {id} proxy"),
                 application.proxy.as_deref(),
@@ -498,6 +519,8 @@ pub struct ApplicationLauncherEntryConfig {
     pub unset_env: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_path: Option<String>,
 }
 
 impl Default for ApplicationLauncherEntryConfig {
@@ -515,6 +538,7 @@ impl Default for ApplicationLauncherEntryConfig {
             env: BTreeMap::new(),
             unset_env: Vec::new(),
             icon: None,
+            icon_path: None,
         }
     }
 }
@@ -1808,6 +1832,9 @@ mod tests {
             BrowserLauncherEntryConfig {
                 detect: Some("chrome".to_string()),
                 icon: Some("GC".to_string()),
+                icon_path: Some("~/.config/stk/icons/chrome.svg".to_string()),
+                private_icon: Some("IN".to_string()),
+                private_icon_path: Some("~/.config/stk/icons/chrome-private.svg".to_string()),
                 ..BrowserLauncherEntryConfig::default()
             },
         );
@@ -1818,6 +1845,7 @@ mod tests {
                 command: "code".to_string(),
                 args: vec![".".to_string()],
                 icon: Some("VS".to_string()),
+                icon_path: Some("~/.config/stk/icons/code.png".to_string()),
                 ..ApplicationLauncherEntryConfig::default()
             },
         );

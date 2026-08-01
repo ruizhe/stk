@@ -329,7 +329,9 @@ jobs:
           mkdir -p "$stage/examples" "$stage/packaging/systemd"
 
           install -m 755 "$binary" "$stage/stk"
-          install -m 644 README.md README.zh-CN.md LICENSE-MIT LICENSE-APACHE "$stage/"
+          install -m 644 \
+            README.md README.zh-CN.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md \
+            "$stage/"
           install -m 644 examples/basic.yaml examples/basic.json examples/basic.toml "$stage/examples/"
           install -m 644 examples/ssh-native.yaml examples/ssh-native.json examples/ssh-native.toml "$stage/examples/"
           install -m 644 packaging/systemd/stk.service "$stage/packaging/systemd/stk.service"
@@ -404,7 +406,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path $examples | Out-Null
           Copy-Item "target/release/stk.exe" (Join-Path $stage "stk.exe")
           Copy-Item "crates/stk-gui/target/release/stk-gui.exe" (Join-Path $stage "stk-gui.exe")
-          Copy-Item "README.md", "README.zh-CN.md", "LICENSE-MIT", "LICENSE-APACHE" $stage
+          $documents = @(
+            "README.md",
+            "README.zh-CN.md",
+            "LICENSE-MIT",
+            "LICENSE-APACHE",
+            "THIRD-PARTY-NOTICES.md"
+          )
+          Copy-Item $documents $stage
           Copy-Item "examples/basic.yaml", "examples/basic.json", "examples/basic.toml" $examples
           Copy-Item "examples/ssh-native.yaml", "examples/ssh-native.json", "examples/ssh-native.toml" $examples
 
@@ -506,7 +515,9 @@ jobs:
           codesign --force --deep --sign - "$app"
           codesign --verify --deep --strict "$app"
 
-          cp README.md README.zh-CN.md LICENSE-MIT LICENSE-APACHE "$stage/"
+          cp \
+            README.md README.zh-CN.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md \
+            "$stage/"
           cp examples/basic.yaml examples/basic.json examples/basic.toml "$stage/examples/"
           cp examples/ssh-native.yaml examples/ssh-native.json examples/ssh-native.toml "$stage/examples/"
 

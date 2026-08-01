@@ -649,6 +649,19 @@ textarea:focus-visible {
     white-space: nowrap;
 }
 
+.launcher-icon-image {
+    display: block;
+    width: 27px;
+    height: 27px;
+    object-fit: contain;
+    pointer-events: none;
+}
+
+.launcher-mode-menu-icon .launcher-icon-image {
+    width: 23px;
+    height: 23px;
+}
+
 .launcher-name {
     width: 100%;
     overflow: hidden;

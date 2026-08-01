@@ -1088,8 +1088,12 @@ fn LauncherTile(
     let private_item = item.clone();
     let menu_launcher_id = item.id.clone();
     let item_name = item.name.clone();
+    let main_icon_source = item.icon_source.clone();
+    let main_icon_text = item.icon_text.clone();
+    let menu_icon_source = item.icon_source.clone();
     let menu_icon_text = item.icon_text.clone();
-    let menu_private_icon_text = item.icon_text.clone();
+    let menu_private_icon_source = item.private_icon_source.clone();
+    let menu_private_icon_text = item.private_icon_text.clone();
     let normal_mode_label = tr(language, "Normal mode", "普通模式");
     let normal_mode_description = match language {
         Language::English => format!("Start {} with the configured proxy", item.name),
@@ -1121,7 +1125,7 @@ fn LauncherTile(
                             notice,
                         );
                     },
-                    span { class: "launcher-icon-text", "{item.icon_text}" }
+                    LauncherIcon { source: main_icon_source, text: main_icon_text }
                 }
                 if is_browser {
                     button {
@@ -1160,7 +1164,10 @@ fn LauncherTile(
                                     );
                                 },
                                 span { class: "launcher-mode-menu-icon", aria_hidden: "true",
-                                    "{menu_icon_text}"
+                                    LauncherIcon {
+                                        source: menu_icon_source.clone(),
+                                        text: menu_icon_text.clone(),
+                                    }
                                 }
                                 span { class: "launcher-mode-menu-copy",
                                     strong { "{normal_mode_label}" }
@@ -1183,7 +1190,10 @@ fn LauncherTile(
                                     );
                                 },
                                 span { class: "launcher-mode-menu-icon", aria_hidden: "true",
-                                    "{menu_private_icon_text}"
+                                    LauncherIcon {
+                                        source: menu_private_icon_source.clone(),
+                                        text: menu_private_icon_text.clone(),
+                                    }
                                 }
                                 span { class: "launcher-mode-menu-copy",
                                     strong { "{private_mode_label}" }
@@ -1195,6 +1205,23 @@ fn LauncherTile(
                 }
             }
             span { class: "launcher-name", title: "{item_name}", "{item_name}" }
+        }
+    }
+}
+
+#[component]
+fn LauncherIcon(source: Option<String>, text: String) -> Element {
+    rsx! {
+        if let Some(source) = source {
+            img {
+                class: "launcher-icon-image",
+                src: "{source}",
+                alt: "",
+                aria_hidden: "true",
+                draggable: "false",
+            }
+        } else {
+            span { class: "launcher-icon-text", aria_hidden: "true", "{text}" }
         }
     }
 }

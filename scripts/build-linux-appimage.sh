@@ -127,12 +127,14 @@ rm -rf "$APP_DIR"
 mkdir -p \
     "$APP_DIR/usr/bin" \
     "$APP_DIR/usr/lib64" \
+    "$APP_DIR/usr/share/doc/stk" \
     "$(dirname -- "$DESKTOP_FILE")" \
     "$(dirname -- "$ICON_FILE")"
 
 install -m 755 "$GUI_BINARY" "$APP_DIR/usr/bin/stk-gui"
 install -m 644 "$ROOT/packaging/linux/ssh-tunnel-keeper.desktop" "$DESKTOP_FILE"
 install -m 644 "$ROOT/crates/stk-gui/assets/stk-icon-256.png" "$ICON_FILE"
+install -m 644 "$ROOT/THIRD-PARTY-NOTICES.md" "$APP_DIR/usr/share/doc/stk/"
 install -m 755 "$APPRUN" "$APP_DIR/AppRun"
 ln -s "usr/share/applications/ssh-tunnel-keeper.desktop" \
     "$APP_DIR/ssh-tunnel-keeper.desktop"

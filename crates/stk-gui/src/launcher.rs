@@ -1,12 +1,14 @@
 use anyhow::{Context as _, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env,
     ffi::OsString,
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Mutex, OnceLock},
     thread,
 };
 use stk_core::{
@@ -66,6 +68,9 @@ pub(super) struct LauncherItem {
     pub id: String,
     pub name: String,
     pub icon_text: String,
+    pub icon_source: Option<String>,
+    pub private_icon_text: String,
+    pub private_icon_source: Option<String>,
     pub kind: LauncherKind,
     pub command: PathBuf,
     pub args: Vec<String>,
@@ -322,6 +327,7 @@ fn load_launcher_catalog(path: &Path) -> anyhow::Result<Vec<LauncherItem>> {
         )
     })?;
     config.validate()?;
+    let config_directory = path.parent().unwrap_or_else(|| Path::new("."));
     let detected = detect_browsers();
     let detected_by_id = detected
         .iter()
@@ -343,7 +349,13 @@ fn load_launcher_catalog(path: &Path) -> anyhow::Result<Vec<LauncherItem>> {
             .as_deref()
             .and_then(|detected_id| detected_by_id.get(detected_id).copied())
             .or_else(|| detected_by_id.get(id.as_str()).copied());
-        items.push(resolve_browser_item(&config, id, browser, detected_browser));
+        items.push(resolve_browser_item(
+            &config,
+            config_directory,
+            id,
+            browser,
+            detected_browser,
+        ));
     }
 
     if config.launchers.browsers.auto_discover {
@@ -354,6 +366,7 @@ fn load_launcher_catalog(path: &Path) -> anyhow::Result<Vec<LauncherItem>> {
             let entry = BrowserLauncherEntryConfig::default();
             items.push(resolve_browser_item(
                 &config,
+                config_directory,
                 browser.id,
                 &entry,
                 Some(&browser),
@@ -365,7 +378,12 @@ fn load_launcher_catalog(path: &Path) -> anyhow::Result<Vec<LauncherItem>> {
         if !application.enabled || !application.show_in_overview {
             continue;
         }
-        items.push(resolve_application_item(&config, id, application));
+        items.push(resolve_application_item(
+            &config,
+            config_directory,
+            id,
+            application,
+        ));
     }
 
     items.sort_by(|left, right| {
@@ -379,6 +397,7 @@ fn load_launcher_catalog(path: &Path) -> anyhow::Result<Vec<LauncherItem>> {
 
 fn resolve_browser_item(
     config: &AppConfig,
+    config_directory: &Path,
     id: &str,
     entry: &BrowserLauncherEntryConfig,
     detected: Option<&DetectedBrowser>,
@@ -404,6 +423,23 @@ fn resolve_browser_item(
         .engine
         .or_else(|| detected.map(|browser| browser.engine))
         .unwrap_or(BrowserEngine::Custom);
+    let browser_icon_id = entry
+        .detect
+        .as_deref()
+        .filter(|candidate| is_builtin_browser_id(candidate))
+        .or_else(|| detected.map(|browser| browser.id))
+        .or_else(|| is_builtin_browser_id(id).then_some(id));
+    let icon_source = configured_icon_source(entry.icon_path.as_deref(), config_directory)
+        .or_else(|| {
+            browser_icon_id.and_then(|browser_id| system_browser_icon(browser_id, &command))
+        })
+        .or_else(|| browser_icon_id.and_then(|browser_id| bundled_browser_icon(browser_id, false)));
+    let private_icon_source =
+        configured_icon_source(entry.private_icon_path.as_deref(), config_directory)
+            .or_else(|| {
+                browser_icon_id.and_then(|browser_id| bundled_browser_icon(browser_id, true))
+            })
+            .or_else(|| bundled_engine_private_icon(engine));
     let proxy_source = effective_proxy_source(
         entry.proxy.as_deref(),
         config.launchers.browsers.default_proxy.as_deref(),
@@ -413,6 +449,9 @@ fn resolve_browser_item(
     LauncherItem {
         id: format!("browser:{id}"),
         icon_text: launcher_icon_text(entry.icon.as_deref(), &name),
+        icon_source,
+        private_icon_text: launcher_icon_text(entry.private_icon.as_deref(), "Private"),
+        private_icon_source,
         name,
         kind: LauncherKind::Browser(engine),
         command,
@@ -434,10 +473,14 @@ fn resolve_browser_item(
 
 fn resolve_application_item(
     config: &AppConfig,
+    config_directory: &Path,
     id: &str,
     entry: &ApplicationLauncherEntryConfig,
 ) -> LauncherItem {
     let name = entry.name.clone().unwrap_or_else(|| id.to_string());
+    let command = find_executable(&entry.command).unwrap_or_else(|| expand_path(&entry.command));
+    let icon_source = configured_icon_source(entry.icon_path.as_deref(), config_directory)
+        .or_else(|| system_application_icon(&command));
     let proxy_source = effective_proxy_source(
         entry.proxy.as_deref(),
         config.launchers.applications.default_proxy.as_deref(),
@@ -447,9 +490,12 @@ fn resolve_application_item(
     LauncherItem {
         id: format!("application:{id}"),
         icon_text: launcher_icon_text(entry.icon.as_deref(), &name),
+        icon_source,
+        private_icon_text: String::new(),
+        private_icon_source: None,
         name,
         kind: LauncherKind::Application,
-        command: find_executable(&entry.command).unwrap_or_else(|| expand_path(&entry.command)),
+        command,
         args: entry.args.clone(),
         normal_args: Vec::new(),
         private_args: Vec::new(),
@@ -1112,6 +1158,401 @@ fn expand_path(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
+#[derive(Clone)]
+struct CachedIcon {
+    modified: Option<std::time::SystemTime>,
+    length: u64,
+    source: Option<String>,
+}
+
+static ICON_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedIcon>>> = OnceLock::new();
+static BUNDLED_ICON_CACHE: OnceLock<HashMap<&'static str, String>> = OnceLock::new();
+
+fn configured_icon_source(configured: Option<&str>, config_directory: &Path) -> Option<String> {
+    let configured = configured?.trim();
+    if configured.is_empty() {
+        return None;
+    }
+    let expanded = expand_path(configured);
+    let path = if expanded.is_absolute() {
+        expanded
+    } else {
+        config_directory.join(expanded)
+    };
+    let source = cached_icon_data_url(&path);
+    if source.is_none() {
+        tracing::debug!(path = %path.display(), "launcher icon could not be loaded");
+    }
+    source
+}
+
+fn cached_icon_data_url(path: &Path) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok();
+    let length = metadata.len();
+    let cache = ICON_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = cache.get(path)
+            && cached.modified == modified
+            && cached.length == length
+        {
+            return cached.source.clone();
+        }
+    }
+
+    let source = load_icon_data_url(path);
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            path.to_path_buf(),
+            CachedIcon {
+                modified,
+                length,
+                source: source.clone(),
+            },
+        );
+    source
+}
+
+fn load_icon_data_url(path: &Path) -> Option<String> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+
+    #[cfg(target_os = "macos")]
+    if extension.eq_ignore_ascii_case("icns") {
+        return convert_macos_icon(path).map(|bytes| icon_data_url("image/png", &bytes));
+    }
+
+    #[cfg(target_os = "windows")]
+    if extension.eq_ignore_ascii_case("exe") {
+        return extract_windows_icon(path).map(|bytes| icon_data_url("image/png", &bytes));
+    }
+
+    let mime = match extension.to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "svg" => "image/svg+xml",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        _ => return None,
+    };
+    fs::read(path).ok().map(|bytes| icon_data_url(mime, &bytes))
+}
+
+fn icon_data_url(mime: &str, bytes: &[u8]) -> String {
+    format!("data:{mime};base64,{}", STANDARD.encode(bytes))
+}
+
+#[cfg(target_os = "macos")]
+fn convert_macos_icon(path: &Path) -> Option<Vec<u8>> {
+    let directory = tempfile::tempdir().ok()?;
+    let output = directory.path().join("launcher-icon.png");
+    let status = Command::new("/usr/bin/sips")
+        .args(["-s", "format", "png", "-z", "64", "64"])
+        .arg(path)
+        .arg("--out")
+        .arg(&output)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    status.success().then(|| fs::read(output).ok()).flatten()
+}
+
+#[cfg(target_os = "windows")]
+fn extract_windows_icon(path: &Path) -> Option<Vec<u8>> {
+    let directory = tempfile::tempdir().ok()?;
+    let output = directory.path().join("launcher-icon.png");
+    let script = concat!(
+        "Add-Type -AssemblyName System.Drawing; ",
+        "$icon=[System.Drawing.Icon]::ExtractAssociatedIcon($env:STK_ICON_SOURCE); ",
+        "if ($null -eq $icon) { exit 1 }; ",
+        "$bitmap=$icon.ToBitmap(); ",
+        "$bitmap.Save($env:STK_ICON_OUTPUT,[System.Drawing.Imaging.ImageFormat]::Png); ",
+        "$bitmap.Dispose(); $icon.Dispose()"
+    );
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ])
+        .env("STK_ICON_SOURCE", path)
+        .env("STK_ICON_OUTPUT", &output)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    status.success().then(|| fs::read(output).ok()).flatten()
+}
+
+#[cfg(target_os = "macos")]
+fn system_browser_icon(_browser_id: &str, command: &Path) -> Option<String> {
+    macos_bundle_icon_path(command).and_then(|path| cached_icon_data_url(&path))
+}
+
+#[cfg(target_os = "linux")]
+fn system_browser_icon(browser_id: &str, command: &Path) -> Option<String> {
+    linux_browser_icon_paths(browser_id, command)
+        .into_iter()
+        .find_map(|path| cached_icon_data_url(&path))
+}
+
+#[cfg(target_os = "windows")]
+fn system_browser_icon(_browser_id: &str, command: &Path) -> Option<String> {
+    cached_icon_data_url(command)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn system_browser_icon(_browser_id: &str, _command: &Path) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn system_application_icon(command: &Path) -> Option<String> {
+    macos_bundle_icon_path(command).and_then(|path| cached_icon_data_url(&path))
+}
+
+#[cfg(target_os = "windows")]
+fn system_application_icon(command: &Path) -> Option<String> {
+    cached_icon_data_url(command)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn system_application_icon(_command: &Path) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_bundle_icon_path(command: &Path) -> Option<PathBuf> {
+    let bundle = command.ancestors().find(|path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+    })?;
+    let bundle_name = bundle
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let resources = bundle.join("Contents/Resources");
+    let mut candidates = fs::read_dir(resources)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("icns"))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|path| {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let file_stem = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let rank = if file_name == "app.icns" {
+            0
+        } else if file_stem == bundle_name {
+            1
+        } else if file_stem.contains(&bundle_name) || bundle_name.contains(&file_stem) {
+            2
+        } else {
+            3
+        };
+        (rank, file_name)
+    });
+    candidates.into_iter().next()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_browser_icon_paths(browser_id: &str, command: &Path) -> Vec<PathBuf> {
+    let icon_names: &[&str] = match browser_id {
+        "chrome" => &["google-chrome", "google-chrome-stable", "chrome"],
+        "firefox" => &["firefox"],
+        "edge" => &["microsoft-edge", "microsoft-edge-stable", "msedge"],
+        "brave" => &["brave-browser", "brave"],
+        "chromium" => &["chromium", "chromium-browser"],
+        "vivaldi" => &["vivaldi", "vivaldi-stable"],
+        "opera" => &["opera"],
+        _ => &[],
+    };
+    let mut candidates = Vec::new();
+    if let Some(directory) = command.parent() {
+        for file_name in [
+            "product_logo_128.png",
+            "product_logo_64.png",
+            "default128.png",
+            "default64.png",
+        ] {
+            candidates.push(directory.join(file_name));
+        }
+    }
+
+    let mut data_directories = Vec::new();
+    if let Some(directory) = env::var_os("XDG_DATA_HOME") {
+        data_directories.push(PathBuf::from(directory));
+    } else if let Some(home) = env::var_os("HOME") {
+        data_directories.push(Path::new(&home).join(".local/share"));
+    }
+    if let Some(directories) = env::var_os("XDG_DATA_DIRS") {
+        data_directories.extend(env::split_paths(&directories));
+    } else {
+        data_directories.extend([
+            PathBuf::from("/usr/local/share"),
+            PathBuf::from("/usr/share"),
+        ]);
+    }
+
+    for directory in data_directories {
+        for icon_name in icon_names {
+            for size in ["scalable", "256x256", "128x128", "64x64", "48x48", "32x32"] {
+                for extension in ["svg", "png", "webp"] {
+                    candidates.push(
+                        directory
+                            .join("icons/hicolor")
+                            .join(size)
+                            .join("apps")
+                            .join(format!("{icon_name}.{extension}")),
+                    );
+                }
+            }
+            for extension in ["svg", "png", "webp", "xpm"] {
+                candidates.push(
+                    directory
+                        .join("pixmaps")
+                        .join(format!("{icon_name}.{extension}")),
+                );
+            }
+        }
+    }
+    candidates
+}
+
+fn is_builtin_browser_id(id: &str) -> bool {
+    matches!(
+        id,
+        "chrome" | "firefox" | "edge" | "brave" | "chromium" | "vivaldi" | "opera"
+    )
+}
+
+fn bundled_browser_icon(browser_id: &str, private: bool) -> Option<String> {
+    let key = match (browser_id, private) {
+        ("chrome", false) => "chrome",
+        ("chrome", true) => "chrome-private",
+        ("firefox", false) => "firefox",
+        ("firefox", true) => "firefox-private",
+        ("edge", false) => "edge",
+        ("edge", true) => "edge-private",
+        ("brave", false) => "brave",
+        ("brave", true) => "brave-private",
+        ("chromium", false) => "chromium",
+        ("chromium", true) => "chromium-private",
+        ("vivaldi", false) => "vivaldi",
+        ("vivaldi", true) => "vivaldi-private",
+        ("opera", false) => "opera",
+        ("opera", true) => "opera-private",
+        _ => return None,
+    };
+    bundled_icon_cache().get(key).cloned()
+}
+
+fn bundled_engine_private_icon(engine: BrowserEngine) -> Option<String> {
+    let key = match engine {
+        BrowserEngine::Firefox => "firefox-private",
+        BrowserEngine::Chromium => "chromium-private",
+        BrowserEngine::Custom => "private",
+    };
+    bundled_icon_cache().get(key).cloned()
+}
+
+fn bundled_icon_cache() -> &'static HashMap<&'static str, String> {
+    BUNDLED_ICON_CACHE.get_or_init(|| {
+        HashMap::from([
+            (
+                "chrome",
+                embedded_svg(include_bytes!("../assets/launchers/chrome.svg")),
+            ),
+            (
+                "chrome-private",
+                embedded_svg(include_bytes!("../assets/launchers/chrome-private.svg")),
+            ),
+            (
+                "firefox",
+                embedded_svg(include_bytes!("../assets/launchers/firefox.svg")),
+            ),
+            (
+                "firefox-private",
+                embedded_svg(include_bytes!("../assets/launchers/firefox-private.svg")),
+            ),
+            (
+                "edge",
+                embedded_svg(include_bytes!("../assets/launchers/edge.svg")),
+            ),
+            (
+                "edge-private",
+                embedded_svg(include_bytes!("../assets/launchers/edge-private.svg")),
+            ),
+            (
+                "brave",
+                embedded_svg(include_bytes!("../assets/launchers/brave.svg")),
+            ),
+            (
+                "brave-private",
+                embedded_svg(include_bytes!("../assets/launchers/brave-private.svg")),
+            ),
+            (
+                "chromium",
+                embedded_svg(include_bytes!("../assets/launchers/chromium.svg")),
+            ),
+            (
+                "chromium-private",
+                embedded_svg(include_bytes!("../assets/launchers/chromium-private.svg")),
+            ),
+            (
+                "vivaldi",
+                embedded_svg(include_bytes!("../assets/launchers/vivaldi.svg")),
+            ),
+            (
+                "vivaldi-private",
+                embedded_svg(include_bytes!("../assets/launchers/vivaldi-private.svg")),
+            ),
+            (
+                "opera",
+                embedded_svg(include_bytes!("../assets/launchers/opera.svg")),
+            ),
+            (
+                "opera-private",
+                embedded_svg(include_bytes!("../assets/launchers/opera-private.svg")),
+            ),
+            (
+                "private",
+                embedded_svg(include_bytes!("../assets/launchers/private.svg")),
+            ),
+        ])
+    })
+}
+
+fn embedded_svg(bytes: &[u8]) -> String {
+    icon_data_url("image/svg+xml", bytes)
+}
+
 fn sanitize_path_segment(value: &str) -> String {
     let sanitized = value
         .chars()
@@ -1148,6 +1589,9 @@ mod tests {
             id: "browser:test".to_string(),
             name: "Test Browser".to_string(),
             icon_text: "TB".to_string(),
+            icon_source: None,
+            private_icon_text: "PB".to_string(),
+            private_icon_source: bundled_engine_private_icon(engine),
             kind: LauncherKind::Browser(engine),
             command: PathBuf::from("/bin/echo"),
             args: vec!["--user-argument".to_string()],
@@ -1224,6 +1668,62 @@ hosts:
         assert_eq!(catalog.items.len(), 2);
         assert!(catalog.items.iter().any(LauncherItem::is_browser));
         assert!(catalog.items.iter().any(|item| !item.is_browser()));
+    }
+
+    #[test]
+    fn bundled_browsers_use_distinct_normal_and_private_icons() {
+        for browser_id in [
+            "chrome", "firefox", "edge", "brave", "chromium", "vivaldi", "opera",
+        ] {
+            let normal = bundled_browser_icon(browser_id, false).unwrap();
+            let private = bundled_browser_icon(browser_id, true).unwrap();
+            assert!(normal.starts_with("data:image/svg+xml;base64,"));
+            assert!(private.starts_with("data:image/svg+xml;base64,"));
+            assert_ne!(normal, private, "{browser_id} must have a private icon");
+        }
+    }
+
+    #[test]
+    fn custom_browser_can_configure_separate_relative_icon_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("normal.svg"),
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><circle r="1"/></svg>"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("private.svg"),
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>"#,
+        )
+        .unwrap();
+        let entry = BrowserLauncherEntryConfig {
+            engine: Some(BrowserEngine::Custom),
+            command: Some(env::current_exe().unwrap().to_string_lossy().into_owned()),
+            private_args: vec!["--private".to_string()],
+            icon_path: Some("normal.svg".to_string()),
+            private_icon_path: Some("private.svg".to_string()),
+            ..BrowserLauncherEntryConfig::default()
+        };
+        let item = resolve_browser_item(
+            &AppConfig::default(),
+            directory.path(),
+            "custom",
+            &entry,
+            None,
+        );
+        assert!(
+            item.icon_source
+                .as_deref()
+                .unwrap()
+                .starts_with("data:image/svg+xml;base64,")
+        );
+        assert!(
+            item.private_icon_source
+                .as_deref()
+                .unwrap()
+                .starts_with("data:image/svg+xml;base64,")
+        );
+        assert_ne!(item.icon_source, item.private_icon_source);
     }
 
     #[test]
