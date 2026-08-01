@@ -333,7 +333,9 @@ launchers:
 
 `proxy` 可以是 `env.profiles` 中的名称、`HOST/TUNNEL@SCHEME`、`direct`、`inherit` 或 `default`。`default` 表示继续使用上一级默认值；优先级为入口、浏览器/应用分组、`launchers.default-proxy`、`env.default`，最后自动选择第一个兼容的本地代理。`direct` 会清理继承的代理环境变量，`inherit` 保留当前进程环境。
 
-内置 Chromium 启动器默认复用浏览器原有的默认 profile，只有显式配置 `profile-dir` 时才使用指定目录。STK 只追加选中的代理参数，隐身启动时再追加浏览器的隐身参数；用户配置的 `args`、`normal-args` 和 `private-args` 保持不变。Firefox 为了在不修改用户默认配置的情况下可靠应用单次启动代理，仍需使用 STK 管理的 profile。自定义浏览器和应用的 `proxy-args` 支持 `{proxy-url}`、`{proxy-scheme}`、`{proxy-host}`、`{proxy-port}`；浏览器还支持 `{profile-dir}`。图片不可用时，`icon` 和 `private-icon` 最多显示两个字符。
+内置 Chromium 和 Firefox 启动器默认使用长期保留的 STK 托管 profile，使进程级代理参数不受已经运行的系统浏览器影响。同一个启动器入口的普通模式和隐身模式共用这份托管 profile。macOS 默认目录是 `~/Library/Application Support/STK/browser-profiles`，Linux 是 `$XDG_DATA_HOME/stk/browser-profiles`（未配置时使用 `~/.local/share/stk/browser-profiles`），Windows 是 `%LOCALAPPDATA%\STK\browser-profiles`。目录按浏览器族和启动器 ID 隔离，例如内置 Chrome 使用 `chrome/default`，`chrome-production` 则使用 `chrome/chrome-production`。
+
+用户显式配置的 `profile-dir` 始终优先。需要让同一浏览器同时使用不同代理时，应配置不同的启动器入口，从而使用不同的 profile 目录。STK 不会复制或自动删除系统浏览器 profile；用户只需先在 STK 托管的普通模式中完成一次初始化，以后持续复用。隐身模式按浏览器设计仍然不会继承普通窗口的网站 Cookie，因此即使浏览器设置、书签和代理实例来自同一托管 profile，网站仍可能要求重新登录。STK 只追加选中的代理参数，隐身启动时再追加浏览器的隐身参数；用户配置的 `args`、`normal-args` 和 `private-args` 保持不变。自定义浏览器和应用的 `proxy-args` 支持 `{proxy-url}`、`{proxy-scheme}`、`{proxy-host}`、`{proxy-port}`；浏览器还支持 `{profile-dir}`。图片不可用时，`icon` 和 `private-icon` 最多显示两个字符。
 
 ## 四类转发
 

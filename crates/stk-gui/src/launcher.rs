@@ -154,7 +154,7 @@ impl LauncherItem {
             }
             LauncherKind::Browser(BrowserEngine::Firefox) => {
                 let profile_dir = configured_profile_dir
-                    .unwrap_or_else(|| self.default_managed_profile_directory(proxy));
+                    .unwrap_or_else(|| self.default_managed_profile_directory());
                 prepare_firefox_profile(&profile_dir, proxy)?;
                 args.push("-no-remote".into());
                 args.push("-profile".into());
@@ -212,11 +212,9 @@ impl LauncherItem {
         })
     }
 
-    fn default_managed_profile_directory(&self, proxy: &LauncherProxyPlan) -> PathBuf {
-        stk_core::default_config_directory(stk_core::ConfigScope::User)
-            .join("browser-data")
-            .join(sanitize_path_segment(&self.id))
-            .join(proxy.profile_key())
+    fn default_managed_profile_directory(&self) -> PathBuf {
+        let launcher_id = self.id.strip_prefix("browser:").unwrap_or(&self.id);
+        managed_browser_profile_directory("firefox", launcher_id)
     }
 }
 
@@ -228,19 +226,6 @@ pub(super) enum LauncherProxyPlan {
 }
 
 impl LauncherProxyPlan {
-    fn profile_key(&self) -> String {
-        match self {
-            Self::Stk(plan) => sanitize_path_segment(&format!(
-                "{}-{}-{}",
-                plan.candidate.host,
-                plan.candidate.tunnel,
-                proxy_scheme_name(plan.scheme)
-            )),
-            Self::Direct => "direct".to_string(),
-            Self::Inherit => "inherit".to_string(),
-        }
-    }
-
     fn environment(&self) -> (BTreeMap<String, String>, Vec<String>) {
         match self {
             Self::Stk(plan) => (plan.set.clone(), plan.remove.clone()),
@@ -440,6 +425,18 @@ fn resolve_browser_item(
                 browser_icon_id.and_then(|browser_id| bundled_browser_icon(browser_id, true))
             })
             .or_else(|| bundled_engine_private_icon(engine));
+    let profile_dir = entry.profile_dir.clone().or_else(|| {
+        let browser_family = browser_icon_id.or(match engine {
+            BrowserEngine::Chromium => Some("chromium"),
+            BrowserEngine::Firefox => Some("firefox"),
+            BrowserEngine::Custom => None,
+        })?;
+        Some(
+            managed_browser_profile_directory(browser_family, id)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    });
     let proxy_source = effective_proxy_source(
         entry.proxy.as_deref(),
         config.launchers.browsers.default_proxy.as_deref(),
@@ -459,7 +456,7 @@ fn resolve_browser_item(
         normal_args: entry.normal_args.clone(),
         private_args: entry.private_args.clone(),
         proxy_args: entry.proxy_args.clone(),
-        profile_dir: entry.profile_dir.clone(),
+        profile_dir,
         working_directory: None,
         environment: BTreeMap::new(),
         unset_environment: Vec::new(),
@@ -1158,6 +1155,58 @@ fn expand_path(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
+fn managed_browser_profile_directory(browser_family: &str, launcher_id: &str) -> PathBuf {
+    let browser_family = sanitize_path_segment(browser_family);
+    let launcher_id = sanitize_path_segment(launcher_id);
+    let profile_name = if launcher_id.is_empty() || launcher_id == browser_family {
+        "default".to_string()
+    } else {
+        launcher_id
+    };
+    browser_profile_data_root()
+        .join(if browser_family.is_empty() {
+            "browser"
+        } else {
+            &browser_family
+        })
+        .join(profile_name)
+}
+
+#[cfg(target_os = "macos")]
+fn browser_profile_data_root() -> PathBuf {
+    user_home_directory()
+        .join("Library/Application Support/STK")
+        .join("browser-profiles")
+}
+
+#[cfg(target_os = "linux")]
+fn browser_profile_data_root() -> PathBuf {
+    env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| user_home_directory().join(".local/share"))
+        .join("stk/browser-profiles")
+}
+
+#[cfg(target_os = "windows")]
+fn browser_profile_data_root() -> PathBuf {
+    env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| user_home_directory().join("AppData/Local"))
+        .join("STK/browser-profiles")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn browser_profile_data_root() -> PathBuf {
+    user_home_directory().join(".local/share/stk/browser-profiles")
+}
+
+fn user_home_directory() -> PathBuf {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"))
+}
+
 #[derive(Clone)]
 struct CachedIcon {
     modified: Option<std::time::SystemTime>,
@@ -1684,6 +1733,60 @@ hosts:
     }
 
     #[test]
+    fn managed_browser_profiles_are_stable_per_browser_and_launcher() {
+        assert_eq!(
+            managed_browser_profile_directory("chrome", "chrome"),
+            browser_profile_data_root().join("chrome/default")
+        );
+        assert_eq!(
+            managed_browser_profile_directory("chrome", "chrome-production"),
+            browser_profile_data_root().join("chrome/chrome-production")
+        );
+    }
+
+    #[test]
+    fn detected_browser_uses_managed_profile_unless_user_overrides_it() {
+        let command = env::current_exe().unwrap();
+        let detected = DetectedBrowser {
+            id: "chrome",
+            name: "Google Chrome",
+            engine: BrowserEngine::Chromium,
+            command,
+            order: 10,
+        };
+        let automatic = resolve_browser_item(
+            &AppConfig::default(),
+            Path::new("."),
+            "chrome",
+            &BrowserLauncherEntryConfig::default(),
+            Some(&detected),
+        );
+        let expected_profile = managed_browser_profile_directory("chrome", "chrome")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            automatic.profile_dir.as_deref(),
+            Some(expected_profile.as_str())
+        );
+
+        let configured = BrowserLauncherEntryConfig {
+            profile_dir: Some("~/profiles/my-chrome".to_string()),
+            ..BrowserLauncherEntryConfig::default()
+        };
+        let overridden = resolve_browser_item(
+            &AppConfig::default(),
+            Path::new("."),
+            "chrome",
+            &configured,
+            Some(&detected),
+        );
+        assert_eq!(
+            overridden.profile_dir.as_deref(),
+            Some("~/profiles/my-chrome")
+        );
+    }
+
+    #[test]
     fn custom_browser_can_configure_separate_relative_icon_paths() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(
@@ -1736,7 +1839,7 @@ hosts:
     }
 
     #[test]
-    fn chromium_reuses_default_profile_and_only_appends_mode_and_proxy_arguments() {
+    fn chromium_without_a_resolved_profile_only_appends_mode_and_proxy_arguments() {
         let config = launcher_test_config();
         let proxy = resolve_launcher_proxy(&config, Some("web")).unwrap();
         let item = test_browser_item(BrowserEngine::Chromium, None);
@@ -1764,7 +1867,7 @@ hosts:
     }
 
     #[test]
-    fn chromium_uses_profile_directory_only_when_explicitly_configured() {
+    fn chromium_uses_the_same_profile_directory_for_both_modes() {
         let directory = tempfile::tempdir().unwrap();
         let profile_dir = directory.path().join("profile");
         let item = test_browser_item(
@@ -1783,6 +1886,14 @@ hosts:
                 OsString::from("--normal-argument"),
             ]
         );
+        let private_plan = item
+            .build_launch_plan(LaunchMode::Private, &LauncherProxyPlan::Inherit)
+            .unwrap();
+        assert!(private_plan.args.contains(&OsString::from(format!(
+            "--user-data-dir={}",
+            profile_dir.display()
+        ))));
+        assert!(private_plan.args.contains(&OsString::from("--incognito")));
         assert!(profile_dir.is_dir());
     }
 }
