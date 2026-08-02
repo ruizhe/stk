@@ -274,6 +274,7 @@ impl LauncherItem {
             working_directory: self.working_directory.as_deref().map(expand_path),
             environment_set,
             environment_remove,
+            #[cfg(any(target_os = "macos", test))]
             launch_as_browser_application: self.is_browser(),
         })
     }
@@ -388,6 +389,7 @@ struct LaunchPlan {
     working_directory: Option<PathBuf>,
     environment_set: BTreeMap<String, String>,
     environment_remove: Vec<String>,
+    #[cfg(any(target_os = "macos", test))]
     launch_as_browser_application: bool,
 }
 
@@ -442,6 +444,7 @@ impl LaunchPlan {
         Ok(())
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn macos_application_launch_request(
         &self,
     ) -> anyhow::Result<Option<MacosApplicationLaunchRequest>> {
@@ -476,6 +479,7 @@ impl LaunchPlan {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MacosApplicationLaunchRequest {
     application_bundle: PathBuf,
@@ -576,6 +580,7 @@ impl MacosApplicationLaunchRequest {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn macos_application_bundle_path(command: &Path) -> Option<PathBuf> {
     let expanded = command
         .to_str()
@@ -591,6 +596,7 @@ fn macos_application_bundle_path(command: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn resolved_launch_environment(
     environment_set: &BTreeMap<String, String>,
     environment_remove: &[String],
