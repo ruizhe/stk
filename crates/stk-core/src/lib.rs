@@ -4,6 +4,7 @@ pub mod control;
 pub mod engine;
 pub mod health;
 mod inbound;
+mod network;
 mod outbound;
 pub mod reload;
 pub mod ssh;

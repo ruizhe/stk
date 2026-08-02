@@ -7,6 +7,7 @@ use crate::{
         SOCKS5_REPLY_COMMAND_NOT_SUPPORTED, SOCKS5_REPLY_GENERAL_FAILURE, SOCKS5_REPLY_SUCCEEDED,
         accept_socks5, detect_protocol, write_socks5_reply,
     },
+    network::{ConnectivityHandle, ConnectivityMonitor},
     outbound::{BoxedProxyStream, DialContext, OutboundDialer, TargetAddr},
     reload::ReloadHandle,
     ssh::{SshPoolDialer, register_idle_ssh_host},
@@ -131,6 +132,8 @@ impl Engine {
             hosts,
         } = self.config;
         let mut tasks = JoinSet::new();
+        let connectivity_monitor = ConnectivityMonitor::start().await;
+        let connectivity = connectivity_monitor.handle();
         if let Some(handle) = reload_handle {
             let endpoint = ControlEndpoint::from_config(&control, profile.config_scope())?;
             let listener = ControlListener::bind(endpoint).await?;
@@ -170,7 +173,7 @@ impl Engine {
                 );
                 continue;
             }
-            let dialer = build_ssh_host(&host_name, &host)?;
+            let dialer = build_ssh_host(&host_name, &host, connectivity.clone())?;
             retained_dialers.push(Arc::clone(&dialer));
             let listener_retry = ListenerRetryPolicy {
                 initial: Duration::from_millis(host.restart_initial_millis),
@@ -324,6 +327,7 @@ fn listener_exit_result(
 fn build_ssh_host(
     host_name: &str,
     host: &ResolvedHostConfig,
+    connectivity: ConnectivityHandle,
 ) -> anyhow::Result<Arc<dyn OutboundDialer>> {
     if !host.auto {
         bail!(
@@ -332,10 +336,11 @@ fn build_ssh_host(
         );
     }
 
-    Ok(Arc::new(SshPoolDialer::start(
+    Ok(Arc::new(SshPoolDialer::start_with_connectivity(
         host_name.to_string(),
         host.runtime_pool(host_name),
         host.probe,
+        connectivity,
     )?))
 }
 

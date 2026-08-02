@@ -5,6 +5,7 @@ use crate::{
     },
     engine::{ProxySessionContext, handle_proxy_session},
     health::{HealthStatus, LoadBalancer, SshHostState},
+    network::{ConnectivityHandle, ConnectivitySnapshot, NetworkAvailability},
     outbound::{BoxedProxyStream, DialContext, LocalTcpDialer, OutboundDialer, TargetAddr},
     ssh_config::{
         ResolvedHostKeyPolicy, ResolvedSshEndpoint, ResolvedSshPlan, expand_proxy_command,
@@ -32,7 +33,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context as TaskContext, Poll},
     time::{Duration, Instant},
@@ -41,7 +42,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf, copy_bidirectional},
     net::TcpStream,
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{RwLock, mpsc},
+    sync::{Notify, RwLock, mpsc, watch},
     task::{AbortHandle, JoinSet},
     time::{MissedTickBehavior, interval, sleep, timeout},
 };
@@ -56,6 +57,23 @@ const SESSION_SCALE_DOWN_UTILIZATION_NUMERATOR: usize = 1;
 const SESSION_MANAGER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const SESSION_MANAGER_TICK_INTERVAL: Duration = Duration::from_millis(20);
+
+#[cfg(not(test))]
+const OFFLINE_REMOTE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const OFFLINE_REMOTE_REFRESH_INTERVAL: Duration = Duration::from_millis(40);
+
+#[cfg(not(test))]
+const DORMANT_SESSION_MANAGER_INTERVAL: Duration = Duration::from_secs(60 * 60);
+#[cfg(test)]
+const DORMANT_SESSION_MANAGER_INTERVAL: Duration = Duration::from_secs(5);
+
+#[cfg(not(test))]
+const RESUME_SETTLE_INTERVAL: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const RESUME_SETTLE_INTERVAL: Duration = Duration::from_millis(40);
+
+const SUSPECTED_SUSPEND_GAP: Duration = Duration::from_secs(5);
 
 #[cfg(not(test))]
 const SESSION_SCALE_UP_SUSTAINED_INTERVAL: Duration = Duration::from_secs(2);
@@ -76,8 +94,68 @@ fn initial_session_start_count(minimum: usize) -> usize {
     minimum.min(MAX_CONCURRENT_SESSION_STARTS_PER_HOST)
 }
 
+fn session_establish_wait_timeout(plan: &ResolvedSshPlan) -> Duration {
+    plan.jumps
+        .iter()
+        .chain(std::iter::once(&plan.target))
+        .fold(Duration::ZERO, |total, endpoint| {
+            total.saturating_add(endpoint.connect_timeout.saturating_mul(2))
+        })
+        .max(Duration::from_secs(1))
+}
+
 fn can_start_another_session(connecting: usize) -> bool {
     connecting < MAX_CONCURRENT_SESSION_STARTS_PER_HOST
+}
+
+fn session_spawn_authorized(
+    connectivity: ConnectivitySnapshot,
+    requires_remote_availability: bool,
+    demand_pending: bool,
+    startup_spawn_budget: usize,
+) -> bool {
+    match connectivity.availability {
+        NetworkAvailability::Offline => false,
+        NetworkAvailability::Online => {
+            connectivity.events_available
+                || requires_remote_availability
+                || demand_pending
+                || startup_spawn_budget > 0
+        }
+        NetworkAvailability::Unknown => {
+            requires_remote_availability || demand_pending || startup_spawn_budget > 0
+        }
+    }
+}
+
+fn session_manager_tick_interval(
+    connectivity: ConnectivitySnapshot,
+    requires_remote_availability: bool,
+    background_work_enabled: bool,
+) -> Duration {
+    if connectivity.is_offline() {
+        if requires_remote_availability {
+            OFFLINE_REMOTE_REFRESH_INTERVAL
+        } else {
+            DORMANT_SESSION_MANAGER_INTERVAL
+        }
+    } else if background_work_enabled {
+        SESSION_MANAGER_TICK_INTERVAL
+    } else {
+        DORMANT_SESSION_MANAGER_INTERVAL
+    }
+}
+
+fn new_session_manager_ticker(period: Duration) -> tokio::time::Interval {
+    let mut ticker = interval(period);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticker
+}
+
+fn new_delayed_session_manager_ticker(period: Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticker
 }
 
 fn session_pool_is_under_pressure(
@@ -105,6 +183,28 @@ fn session_pool_can_scale_down(
     (in_flight as u128).saturating_mul(SESSION_SCALE_UTILIZATION_DENOMINATOR as u128)
         <= (capacity_after_scale_down as u128)
             .saturating_mul(SESSION_SCALE_DOWN_UTILIZATION_NUMERATOR as u128)
+}
+
+fn session_pool_requires_forced_turnover(
+    active_sessions: usize,
+    retiring_sessions: usize,
+    maximum_sessions: usize,
+    replacement_capacity_blocked: bool,
+    forced_turnover_in_progress: bool,
+) -> bool {
+    replacement_capacity_blocked
+        && active_sessions >= maximum_sessions
+        && active_sessions > 0
+        && retiring_sessions == active_sessions
+        && !forced_turnover_in_progress
+}
+
+fn probe_failure_requires_disconnect(
+    consecutive_failures: u32,
+    failure_threshold: u32,
+    active_channels: usize,
+) -> bool {
+    consecutive_failures >= failure_threshold && active_channels == 0
 }
 
 #[cfg(test)]
@@ -155,7 +255,11 @@ struct SshSessionState {
     rtt_millis: Option<u64>,
     startup_ms: Option<f64>,
     last_error: Option<String>,
+    retirement_started: Option<Instant>,
     drain_started: Option<Instant>,
+    drain_idle_since: Option<Instant>,
+    drain_payload_generation: u64,
+    forced_turnover_requested: bool,
 }
 
 impl Default for SshSessionState {
@@ -165,7 +269,11 @@ impl Default for SshSessionState {
             rtt_millis: None,
             startup_ms: None,
             last_error: None,
+            retirement_started: None,
             drain_started: None,
+            drain_idle_since: None,
+            drain_payload_generation: 0,
+            forced_turnover_requested: false,
         }
     }
 }
@@ -175,6 +283,7 @@ struct ManagedSshSession {
     state: Arc<RwLock<SshSessionState>>,
     handle: Arc<RwLock<Option<Arc<NativeSshHandle>>>>,
     in_flight: Arc<AtomicUsize>,
+    payload_generation: Arc<AtomicU64>,
     retire_requested: AtomicBool,
 }
 
@@ -188,11 +297,17 @@ impl ManagedSshSession {
     }
 }
 
+fn notify_session_event(events: &watch::Sender<u64>) {
+    events.send_modify(|generation| *generation = generation.wrapping_add(1));
+}
+
 struct NativeSshNode {
     name: String,
     state: Arc<RwLock<SshNodeState>>,
     sessions: Arc<RwLock<Vec<Arc<ManagedSshSession>>>>,
     remote_owner: Arc<RwLock<Option<u64>>>,
+    connect_demand: Arc<Notify>,
+    session_events: watch::Sender<u64>,
     channel_open_timeout: Duration,
     max_channels_per_session: usize,
 }
@@ -207,7 +322,6 @@ impl NativeSshNode {
         let (host, port) = target_host_port(target);
         let sessions = self.sessions.read().await.clone();
         let mut preferred = Vec::new();
-        let mut fallback = Vec::new();
         for session in sessions {
             if !session.has_capacity(self.max_channels_per_session) {
                 continue;
@@ -221,22 +335,20 @@ impl NativeSshNode {
                 SshSessionStatus::Healthy if !session.retire_requested.load(Ordering::Relaxed) => {
                     preferred.push((score, Arc::clone(&session)));
                 }
-                SshSessionStatus::Healthy | SshSessionStatus::Suspect => {
-                    fallback.push((score, Arc::clone(&session)));
-                }
                 SshSessionStatus::Connecting
+                | SshSessionStatus::Healthy
+                | SshSessionStatus::Suspect
                 | SshSessionStatus::Draining
                 | SshSessionStatus::Offline => {}
             }
         }
         preferred.sort_by_key(|(score, _)| *score);
-        fallback.sort_by_key(|(score, _)| *score);
-        preferred.extend(fallback);
 
         let mut last_error = None;
         for (_, session) in preferred {
             let Some(reservation) = reserve_in_flight(
                 &session.in_flight,
+                &session.payload_generation,
                 self.max_channels_per_session,
                 session.id,
             ) else {
@@ -321,10 +433,9 @@ impl NativeSshNode {
                 continue;
             }
             let state = session.state.read().await;
-            if matches!(
-                state.status,
-                SshSessionStatus::Healthy | SshSessionStatus::Suspect
-            ) {
+            if state.status == SshSessionStatus::Healthy
+                && !session.retire_requested.load(Ordering::Relaxed)
+            {
                 return true;
             }
         }
@@ -345,14 +456,27 @@ pub(crate) struct SshPoolDialer {
     name: String,
     nodes: Vec<Arc<NativeSshNode>>,
     balancer: LoadBalancer,
+    connectivity: ConnectivityHandle,
+    session_events: watch::Sender<u64>,
+    session_wait_timeout: Duration,
     tasks: Vec<AbortHandle>,
 }
 
 impl SshPoolDialer {
+    #[cfg(test)]
     pub(crate) fn start(
         name: impl Into<String>,
         pool: SshPoolConfig,
         probe: ProbeConfig,
+    ) -> anyhow::Result<Self> {
+        Self::start_with_connectivity(name, pool, probe, ConnectivityHandle::assume_online())
+    }
+
+    pub(crate) fn start_with_connectivity(
+        name: impl Into<String>,
+        pool: SshPoolConfig,
+        probe: ProbeConfig,
+        connectivity: ConnectivityHandle,
     ) -> anyhow::Result<Self> {
         let name = name.into();
         let plans = pool
@@ -360,6 +484,12 @@ impl SshPoolDialer {
             .iter()
             .map(|upstream| resolve_ssh_plan(upstream, &pool).map(Arc::new))
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let session_wait_timeout = plans
+            .iter()
+            .map(|plan| session_establish_wait_timeout(plan))
+            .max()
+            .unwrap_or_else(|| Duration::from_secs(1));
+        let (session_events, _) = watch::channel(0_u64);
         let mut nodes = Vec::with_capacity(pool.hosts.len());
         let mut tasks = Vec::new();
 
@@ -371,6 +501,8 @@ impl SshPoolDialer {
                 state: Arc::clone(&state),
                 sessions: Arc::new(RwLock::new(Vec::new())),
                 remote_owner: Arc::new(RwLock::new(None)),
+                connect_demand: Arc::new(Notify::new()),
+                session_events: session_events.clone(),
                 channel_open_timeout: plan.target.connect_timeout,
                 max_channels_per_session: pool.max_channels_per_session,
             });
@@ -391,6 +523,7 @@ impl SshPoolDialer {
             let manager_pool = pool.clone();
             let manager_plan = Arc::clone(&plan);
             let manager_node = Arc::clone(&node);
+            let manager_connectivity = connectivity.clone();
             let span = info_span!(
                 "ssh_session_pool",
                 host_name = %manager_name
@@ -403,6 +536,7 @@ impl SshPoolDialer {
                     manager_plan,
                     probe,
                     manager_node,
+                    manager_connectivity,
                 )
                 .instrument(span),
             );
@@ -413,6 +547,9 @@ impl SshPoolDialer {
             name,
             nodes,
             balancer: LoadBalancer::new(pool.policy),
+            connectivity,
+            session_events,
+            session_wait_timeout,
             tasks,
         })
     }
@@ -420,14 +557,19 @@ impl SshPoolDialer {
     async fn snapshots(&self, excluded: &HashSet<String>) -> Vec<SshHostState> {
         let mut snapshots = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
+            let available = !excluded.contains(&node.name) && node.has_available_session().await;
             let state = node.state.read().await;
-            let status = match state.status {
-                HealthStatus::Unknown => HealthStatus::Offline,
-                status => status,
+            let status = if available {
+                HealthStatus::Healthy
+            } else {
+                match state.status {
+                    HealthStatus::Unknown => HealthStatus::Offline,
+                    status => status,
+                }
             };
             snapshots.push(SshHostState {
                 name: node.name.clone(),
-                enabled: !excluded.contains(&node.name) && node.has_available_session().await,
+                enabled: available,
                 status,
                 rtt_millis: state.rtt_millis,
                 in_flight: node.in_flight().await,
@@ -439,48 +581,23 @@ impl SshPoolDialer {
     fn node(&self, name: &str) -> Option<&Arc<NativeSshNode>> {
         self.nodes.iter().find(|node| node.name == name)
     }
-}
 
-pub(crate) fn register_idle_ssh_host(host_name: &str, pool: &SshPoolConfig) -> anyhow::Result<()> {
-    let upstream = pool
-        .hosts
-        .first()
-        .with_context(|| format!("SSH host {host_name} has no runtime endpoint"))?;
-    let plan = resolve_ssh_plan(upstream, pool)?;
-    register_resolved_host(upstream, &plan, pool);
-    stats::update_host_state(
-        host_name,
-        stats::HostStateUpdate {
-            status: stats::HostRuntimeStatus::Idle,
-            rtt_ms: None,
-            restart_count: 0,
-            last_error: None,
-        },
-    );
-    Ok(())
-}
+    async fn has_available_session(&self) -> bool {
+        for node in &self.nodes {
+            if node.has_available_session().await {
+                return true;
+            }
+        }
+        false
+    }
 
-fn register_resolved_host(upstream: &SshHostConfig, plan: &ResolvedSshPlan, pool: &SshPoolConfig) {
-    stats::register_host(stats::HostRegistration {
-        name: upstream.name.clone(),
-        ssh_alias: plan.target.alias.clone(),
-        address: format_ssh_address(&plan.target.host, plan.target.port),
-        min_sessions: pool.min_sessions_per_host,
-        max_sessions: pool.max_sessions_per_host,
-    });
-}
-
-impl Drop for SshPoolDialer {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
+    fn request_session_capacity(&self) {
+        for node in &self.nodes {
+            node.connect_demand.notify_one();
         }
     }
-}
 
-#[async_trait]
-impl OutboundDialer for SshPoolDialer {
-    async fn dial(&self, context: DialContext) -> anyhow::Result<BoxedProxyStream> {
+    async fn dial_available(&self, context: &DialContext) -> anyhow::Result<BoxedProxyStream> {
         let mut excluded = HashSet::new();
         let mut last_error = None;
 
@@ -536,6 +653,115 @@ impl OutboundDialer for SshPoolDialer {
     }
 }
 
+pub(crate) fn register_idle_ssh_host(host_name: &str, pool: &SshPoolConfig) -> anyhow::Result<()> {
+    let upstream = pool
+        .hosts
+        .first()
+        .with_context(|| format!("SSH host {host_name} has no runtime endpoint"))?;
+    let plan = resolve_ssh_plan(upstream, pool)?;
+    register_resolved_host(upstream, &plan, pool);
+    stats::update_host_state(
+        host_name,
+        stats::HostStateUpdate {
+            status: stats::HostRuntimeStatus::Idle,
+            rtt_ms: None,
+            restart_count: 0,
+            last_error: None,
+        },
+    );
+    Ok(())
+}
+
+fn register_resolved_host(upstream: &SshHostConfig, plan: &ResolvedSshPlan, pool: &SshPoolConfig) {
+    stats::register_host(stats::HostRegistration {
+        name: upstream.name.clone(),
+        ssh_alias: plan.target.alias.clone(),
+        address: format_ssh_address(&plan.target.host, plan.target.port),
+        min_sessions: pool.min_sessions_per_host,
+        max_sessions: pool.max_sessions_per_host,
+    });
+}
+
+impl Drop for SshPoolDialer {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+#[async_trait]
+impl OutboundDialer for SshPoolDialer {
+    async fn dial(&self, context: DialContext) -> anyhow::Result<BoxedProxyStream> {
+        if self.has_available_session().await {
+            return self.dial_available(&context).await;
+        }
+
+        let mut connectivity = self.connectivity.current();
+        if connectivity.is_offline()
+            || connectivity.availability == NetworkAvailability::Unknown
+            || !connectivity.events_available
+        {
+            connectivity = self.connectivity.refresh().await;
+        }
+        if connectivity.is_offline() {
+            bail!(
+                "SSH host {} cannot connect while the system network is offline",
+                self.name
+            );
+        }
+
+        let mut session_events = self.session_events.subscribe();
+        let mut connectivity_events = self.connectivity.subscribe();
+        let mut connectivity_events_open = true;
+        self.request_session_capacity();
+        let deadline = Instant::now() + self.session_wait_timeout;
+
+        loop {
+            if self.has_available_session().await {
+                return self.dial_available(&context).await;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                bail!(
+                    "SSH host {} did not establish a healthy session within {} ms",
+                    self.name,
+                    self.session_wait_timeout.as_millis()
+                );
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            tokio::select! {
+                changed = session_events.changed() => {
+                    if changed.is_err() {
+                        bail!("SSH host {} session manager stopped", self.name);
+                    }
+                }
+                changed = connectivity_events.changed(), if connectivity_events_open => {
+                    if changed.is_err() {
+                        connectivity_events_open = false;
+                        continue;
+                    }
+                    connectivity = *connectivity_events.borrow_and_update();
+                    if connectivity.is_offline() {
+                        bail!(
+                            "SSH host {} cannot connect while the system network is offline",
+                            self.name
+                        );
+                    }
+                    self.request_session_capacity();
+                }
+                _ = sleep(remaining) => {
+                    bail!(
+                        "SSH host {} did not establish a healthy session within {} ms",
+                        self.name,
+                        self.session_wait_timeout.as_millis()
+                    );
+                }
+            }
+        }
+    }
+}
+
 trait LogTaskResult: Sized {
     fn map_err_log(self, message: &'static str) -> impl std::future::Future<Output = ()> + Send;
 }
@@ -577,6 +803,7 @@ struct NativeSshHandler {
     known_hosts_paths: Vec<PathBuf>,
     remote_forwards: Arc<HashMap<u32, RemoteForwardRoute>>,
     in_flight: Arc<AtomicUsize>,
+    payload_generation: Arc<AtomicU64>,
     disconnect_tx: mpsc::UnboundedSender<String>,
 }
 
@@ -657,6 +884,7 @@ impl client::Handler for NativeSshHandler {
 
         let connection_id = next_connection_id();
         let active_channel = ActiveChannelGuard::new(Arc::clone(&self.in_flight), self.session_id);
+        let payload_generation = Arc::clone(&self.payload_generation);
         let upstream = self.upstream.clone();
         let session_id = self.session_id;
         let connected_address = connected_address.to_string();
@@ -692,6 +920,7 @@ impl client::Handler for NativeSshHandler {
                                 tunnel_id,
                                 local_host,
                                 local_port,
+                                payload_generation,
                             },
                             channel,
                             reply,
@@ -714,6 +943,7 @@ impl client::Handler for NativeSshHandler {
                                 tunnel_id,
                                 protocol,
                                 peer_addr,
+                                payload_generation,
                             },
                             channel.into_stream(),
                         )
@@ -745,6 +975,7 @@ struct RemoteTcpForwardContext {
     tunnel_id: String,
     local_host: String,
     local_port: u16,
+    payload_generation: Arc<AtomicU64>,
 }
 
 async fn handle_remote_tcp_forward(
@@ -788,7 +1019,10 @@ async fn handle_remote_tcp_forward(
     };
     stats::mark_connection_active(context.connection_id);
     let connect_ms = elapsed_ms(started);
-    let mut ssh_stream = channel.into_stream();
+    let mut ssh_stream = PayloadActivityStream::new(
+        channel.into_stream(),
+        Arc::clone(&context.payload_generation),
+    );
     let relay_started = Instant::now();
     let recorder = stats::tunnel_and_session_transfer_recorder(
         &context.upstream,
@@ -832,6 +1066,7 @@ struct RemoteProxyContext {
     tunnel_id: String,
     protocol: ProxyProtocol,
     peer_addr: SocketAddr,
+    payload_generation: Arc<AtomicU64>,
 }
 
 async fn serve_remote_proxy<S>(context: RemoteProxyContext, remote_stream: S) -> anyhow::Result<()>
@@ -850,6 +1085,7 @@ where
         },
     ));
     let session_recorder = stats::session_transfer_recorder(context.session_id);
+    let remote_stream = PayloadActivityStream::new(remote_stream, context.payload_generation);
     let remote_stream =
         stats::TimedIo::with_transfer_recorder(remote_stream, Instant::now(), session_recorder);
     let result = handle_proxy_session(
@@ -1040,6 +1276,7 @@ async fn manage_ssh_sessions(
     plan: Arc<ResolvedSshPlan>,
     probe: ProbeConfig,
     node: Arc<NativeSshNode>,
+    connectivity: ConnectivityHandle,
 ) {
     let initial_backoff = Duration::from_millis(pool.restart_initial_millis);
     let max_backoff = Duration::from_secs(pool.restart_max_secs);
@@ -1057,24 +1294,108 @@ async fn manage_ssh_sessions(
     let mut high_pressure_since = None;
     let mut low_pressure_since = None;
     let mut next_scale_down_at = None;
+    let requires_remote_availability = !upstream.remote_forwards.is_empty();
+    let mut connectivity_rx = connectivity.subscribe();
+    let mut connectivity_snapshot = *connectivity_rx.borrow();
+    let mut connectivity_events_open = true;
+    let mut demand_pending = false;
+    let mut startup_spawn_budget = pool.min_sessions_per_host;
     let mut tasks = JoinSet::new();
-    let mut ticker = interval(SESSION_MANAGER_TICK_INTERVAL);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut ticker = new_session_manager_ticker(session_manager_tick_interval(
+        connectivity_snapshot,
+        requires_remote_availability,
+        session_spawn_authorized(
+            connectivity_snapshot,
+            requires_remote_availability,
+            demand_pending,
+            startup_spawn_budget,
+        ),
+    ));
+    let mut last_manager_tick = Instant::now();
 
-    for _ in 0..initial_session_start_count(pool.min_sessions_per_host) {
-        let session_id = stats::next_ssh_session_id();
-        spawn_managed_session(
-            &mut tasks, session_id, &outbound, &upstream, &plan, probe, &node,
-        )
-        .await;
+    if session_spawn_authorized(
+        connectivity_snapshot,
+        requires_remote_availability,
+        demand_pending,
+        startup_spawn_budget,
+    ) {
+        for _ in 0..initial_session_start_count(pool.min_sessions_per_host) {
+            let session_id = stats::next_ssh_session_id();
+            spawn_managed_session(
+                &mut tasks,
+                session_id,
+                SessionSpawnContext {
+                    outbound: &outbound,
+                    upstream: &upstream,
+                    plan: &plan,
+                    probe,
+                    node: &node,
+                    connectivity: &connectivity,
+                },
+            )
+            .await;
+            startup_spawn_budget = startup_spawn_budget.saturating_sub(1);
+        }
     }
 
     loop {
         tokio::select! {
+            changed = connectivity_rx.changed(), if connectivity_events_open => {
+                if changed.is_err() {
+                    connectivity_events_open = false;
+                    connectivity_snapshot = connectivity.current();
+                } else {
+                    let previous = connectivity_snapshot;
+                    connectivity_snapshot = *connectivity_rx.borrow_and_update();
+                    if (previous.is_offline() && !connectivity_snapshot.is_offline())
+                        || connectivity_snapshot.resumed
+                    {
+                        backoff = initial_backoff;
+                        next_spawn_at = Instant::now();
+                        next_owner_attempt = Instant::now();
+                    }
+                }
+                let background_work_enabled = !tasks.is_empty()
+                    || session_spawn_authorized(
+                        connectivity_snapshot,
+                        requires_remote_availability,
+                        demand_pending,
+                        startup_spawn_budget,
+                    );
+                ticker = new_session_manager_ticker(session_manager_tick_interval(
+                    connectivity_snapshot,
+                    requires_remote_availability,
+                    background_work_enabled,
+                ));
+            }
+            _ = node.connect_demand.notified() => {
+                demand_pending = true;
+                let previous_connectivity = connectivity_snapshot;
+                if connectivity_snapshot.is_offline()
+                    || connectivity_snapshot.availability == NetworkAvailability::Unknown
+                    || !connectivity_snapshot.events_available
+                {
+                    connectivity_snapshot = connectivity.refresh().await;
+                }
+                if (previous_connectivity.is_offline() && !connectivity_snapshot.is_offline())
+                    || (!connectivity_snapshot.events_available
+                        && !requires_remote_availability
+                        && tasks.is_empty())
+                {
+                    backoff = initial_backoff;
+                    next_spawn_at = Instant::now();
+                }
+                ticker = new_session_manager_ticker(session_manager_tick_interval(
+                    connectivity_snapshot,
+                    requires_remote_availability,
+                    true,
+                ));
+            }
             joined = tasks.join_next(), if !tasks.is_empty() => {
                 match joined {
                     Some(Ok(exit)) => {
                         node.sessions.write().await.retain(|session| session.id != exit.id);
+                        notify_session_event(&node.session_events);
                         if scheduled_rotation.as_ref().is_some_and(|rotation: &ScheduledSessionRotation| {
                             rotation.candidate_session_id == exit.id
                         }) {
@@ -1129,8 +1450,53 @@ async fn manage_ssh_sessions(
                     }
                     None => {}
                 }
+                let background_work_enabled = !tasks.is_empty()
+                    || session_spawn_authorized(
+                        connectivity_snapshot,
+                        requires_remote_availability,
+                        demand_pending,
+                        startup_spawn_budget,
+                    );
+                ticker = new_session_manager_ticker(session_manager_tick_interval(
+                    connectivity_snapshot,
+                    requires_remote_availability,
+                    background_work_enabled,
+                ));
             }
             _ = ticker.tick() => {
+                let tick_started = Instant::now();
+                let active_maintenance = !connectivity_snapshot.is_offline()
+                    && (!tasks.is_empty()
+                        || session_spawn_authorized(
+                            connectivity_snapshot,
+                            requires_remote_availability,
+                            demand_pending,
+                            startup_spawn_budget,
+                        ));
+                let resumed_after_gap = active_maintenance
+                    && tick_started.saturating_duration_since(last_manager_tick)
+                        >= SUSPECTED_SUSPEND_GAP;
+                last_manager_tick = tick_started;
+                connectivity_snapshot = connectivity.current();
+                if resumed_after_gap || connectivity_snapshot.resumed {
+                    connectivity_snapshot = connectivity.refresh().await;
+                    ticker = new_delayed_session_manager_ticker(RESUME_SETTLE_INTERVAL);
+                    continue;
+                }
+                if connectivity_snapshot.is_offline() {
+                    if requires_remote_availability {
+                        connectivity_snapshot = connectivity.refresh().await;
+                    }
+                    if connectivity_snapshot.is_offline() {
+                        refresh_node_state(&node).await;
+                        ticker = new_delayed_session_manager_ticker(session_manager_tick_interval(
+                            connectivity_snapshot,
+                            requires_remote_availability,
+                            false,
+                        ));
+                        continue;
+                    }
+                }
                 refresh_node_state(&node).await;
 
                 if Instant::now() >= next_owner_attempt
@@ -1154,13 +1520,17 @@ async fn manage_ssh_sessions(
                 let mut connecting_non_retiring = 0_usize;
                 let mut active_non_retiring = 0_usize;
                 let mut healthy_in_flight = 0_usize;
+                let mut retiring_active = 0_usize;
                 let mut retirement_pending = false;
+                let mut forced_turnover_in_progress = false;
                 for session in &sessions {
                     let state = session.state.read().await;
                     if state.status != SshSessionStatus::Offline {
                         active_count += 1;
                         if !session.retire_requested.load(Ordering::Relaxed) {
                             active_non_retiring += 1;
+                        } else {
+                            retiring_active += 1;
                         }
                     }
                     if state.status == SshSessionStatus::Healthy
@@ -1177,9 +1547,20 @@ async fn manage_ssh_sessions(
                         connecting_non_retiring += 1;
                     }
                     retirement_pending |= session.retire_requested.load(Ordering::Relaxed);
+                    forced_turnover_in_progress |= state.forced_turnover_requested;
                 }
 
                 let now = Instant::now();
+                if healthy_non_retiring > 0 {
+                    demand_pending = false;
+                }
+                let can_spawn_new_session = healthy_non_retiring > 0
+                    || session_spawn_authorized(
+                        connectivity_snapshot,
+                        requires_remote_availability,
+                        demand_pending,
+                        startup_spawn_budget,
+                    );
                 if scheduled_rotation.is_some()
                     && healthy_non_retiring < pool.min_sessions_per_host
                 {
@@ -1230,6 +1611,7 @@ async fn manage_ssh_sessions(
                 }
 
                 if next_rotation_at.is_some_and(|next| now >= next)
+                    && can_spawn_new_session
                     && scheduled_rotation.is_none()
                     && !retirement_pending
                     && healthy_non_retiring >= pool.min_sessions_per_host
@@ -1267,6 +1649,7 @@ async fn manage_ssh_sessions(
                 if (needs_desired_capacity
                     || needs_scheduled_replacement
                     || needs_elastic_capacity)
+                    && can_spawn_new_session
                     && can_start_another_session(connecting_non_retiring)
                     && now >= next_spawn_at
                 {
@@ -1284,13 +1667,18 @@ async fn manage_ssh_sessions(
                     spawn_managed_session(
                         &mut tasks,
                         session_id,
-                        &outbound,
-                        &upstream,
-                        &plan,
-                        probe,
-                        &node,
+                        SessionSpawnContext {
+                            outbound: &outbound,
+                            upstream: &upstream,
+                            plan: &plan,
+                            probe,
+                            node: &node,
+                            connectivity: &connectivity,
+                        },
                     )
                     .await;
+                    startup_spawn_budget = startup_spawn_budget.saturating_sub(1);
+                    demand_pending = false;
                     next_spawn_at = now + spawn_cooldown;
                     if needs_elastic_capacity {
                         high_pressure_since = None;
@@ -1321,7 +1709,7 @@ async fn manage_ssh_sessions(
                     ).await
                     && let Some(session) = sessions.iter().find(|session| session.id == session_id)
                 {
-                    session.retire_requested.store(true, Ordering::Release);
+                    request_session_retirement(session).await;
                     retirement_pending = true;
                     desired_sessions = desired_sessions
                         .saturating_sub(1)
@@ -1337,13 +1725,23 @@ async fn manage_ssh_sessions(
                     );
                 }
 
-                let forced_turnover = retirement_pending
+                let replacement_capacity_blocked = retirement_pending
                     && active_count >= pool.max_sessions_per_host
                     && active_non_retiring < desired_sessions
                     && connecting_non_retiring == 0;
+                let all_slots_retiring = session_pool_requires_forced_turnover(
+                    active_count,
+                    retiring_active,
+                    pool.max_sessions_per_host,
+                    replacement_capacity_blocked,
+                    forced_turnover_in_progress,
+                );
+                if all_slots_retiring && force_oldest_retiring_session(&node).await {
+                    continue;
+                }
                 drain_replaced_sessions(
                     &node,
-                    if forced_turnover {
+                    if replacement_capacity_blocked {
                         0
                     } else {
                         desired_sessions
@@ -1351,6 +1749,18 @@ async fn manage_ssh_sessions(
                     drain_timeout,
                 )
                 .await;
+                let background_work_enabled = !tasks.is_empty()
+                    || session_spawn_authorized(
+                        connectivity_snapshot,
+                        requires_remote_availability,
+                        demand_pending,
+                        startup_spawn_budget,
+                    );
+                ticker = new_delayed_session_manager_ticker(session_manager_tick_interval(
+                    connectivity_snapshot,
+                    requires_remote_availability,
+                    background_work_enabled,
+                ));
             }
         }
     }
@@ -1429,7 +1839,7 @@ async fn advance_scheduled_session_rotation(
         return ScheduledRotationProgress::Waiting;
     }
 
-    candidate.retire_requested.store(true, Ordering::Release);
+    request_session_retirement(candidate).await;
     info!(
         ssh_host = %node.name,
         ssh_session_id = candidate.id,
@@ -1439,32 +1849,45 @@ async fn advance_scheduled_session_rotation(
     ScheduledRotationProgress::Activated
 }
 
+struct SessionSpawnContext<'a> {
+    outbound: &'a str,
+    upstream: &'a SshHostConfig,
+    plan: &'a Arc<ResolvedSshPlan>,
+    probe: ProbeConfig,
+    node: &'a Arc<NativeSshNode>,
+    connectivity: &'a ConnectivityHandle,
+}
+
 async fn spawn_managed_session(
     tasks: &mut JoinSet<SessionExit>,
     session_id: u64,
-    outbound: &str,
-    upstream: &SshHostConfig,
-    plan: &Arc<ResolvedSshPlan>,
-    probe: ProbeConfig,
-    node: &Arc<NativeSshNode>,
+    context: SessionSpawnContext<'_>,
 ) {
     stats::register_ssh_session(stats::SshSessionRegistration {
         id: session_id,
-        host_name: outbound.to_string(),
-        ssh_alias: plan.target.alias.clone(),
-        address: format_ssh_address(&plan.target.host, plan.target.port),
+        host_name: context.outbound.to_string(),
+        ssh_alias: context.plan.target.alias.clone(),
+        address: format_ssh_address(&context.plan.target.host, context.plan.target.port),
     });
     let session = Arc::new(ManagedSshSession {
         id: session_id,
         state: Arc::new(RwLock::new(SshSessionState::default())),
         handle: Arc::new(RwLock::new(None)),
         in_flight: Arc::new(AtomicUsize::new(0)),
+        payload_generation: Arc::new(AtomicU64::new(0)),
         retire_requested: AtomicBool::new(false),
     });
-    node.sessions.write().await.push(Arc::clone(&session));
-    let outbound = outbound.to_string();
-    let upstream = upstream.clone();
-    let plan = Arc::clone(plan);
+    context
+        .node
+        .sessions
+        .write()
+        .await
+        .push(Arc::clone(&session));
+    let outbound = context.outbound.to_string();
+    let upstream = context.upstream.clone();
+    let plan = Arc::clone(context.plan);
+    let connectivity = context.connectivity.clone();
+    let session_events = context.node.session_events.clone();
     let span = info_span!(
         "ssh_session",
         host_name = %outbound,
@@ -1475,7 +1898,18 @@ async fn spawn_managed_session(
         ssh_session_id = session_id,
         "starting native SSH session for pool capacity"
     );
-    tasks.spawn(run_managed_session(outbound, upstream, plan, probe, session).instrument(span));
+    tasks.spawn(
+        run_managed_session(
+            outbound,
+            upstream,
+            plan,
+            context.probe,
+            session,
+            connectivity,
+            session_events,
+        )
+        .instrument(span),
+    );
 }
 
 async fn run_managed_session(
@@ -1484,6 +1918,8 @@ async fn run_managed_session(
     plan: Arc<ResolvedSshPlan>,
     probe: ProbeConfig,
     session: Arc<ManagedSshSession>,
+    connectivity: ConnectivityHandle,
+    session_events: watch::Sender<u64>,
 ) -> SessionExit {
     let _session_metric = stats::SshSessionGuard::start(session.id);
     let mut reached_healthy = false;
@@ -1498,6 +1934,7 @@ async fn run_managed_session(
                 state.startup_ms = Some(established.startup_ms);
                 state.last_error = None;
             }
+            notify_session_event(&session_events);
             sync_session_runtime_stats(&session, false).await;
             info!(
                 host_name = %outbound,
@@ -1513,6 +1950,7 @@ async fn run_managed_session(
                 &mut established.disconnect_rx,
                 &session,
                 probe,
+                &connectivity,
             )
             .await
         }
@@ -1552,6 +1990,7 @@ async fn establish_session(
             transport,
             remote_forwards,
             Arc::clone(&session.in_flight),
+            Arc::clone(&session.payload_generation),
         )
         .await?;
         (handle, disconnect_rx, Vec::new())
@@ -1565,6 +2004,7 @@ async fn establish_session(
             transport,
             Arc::new(HashMap::new()),
             Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicU64::new(0)),
         )
         .await?;
         let mut transport_chain = vec![first_handle];
@@ -1584,6 +2024,7 @@ async fn establish_session(
                 transport,
                 Arc::new(HashMap::new()),
                 Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicU64::new(0)),
             )
             .await?;
             transport_chain.push(handle);
@@ -1603,6 +2044,7 @@ async fn establish_session(
             target_transport,
             remote_forwards,
             Arc::clone(&session.in_flight),
+            Arc::clone(&session.payload_generation),
         )
         .await?;
         (handle, disconnect_rx, transport_chain)
@@ -1674,6 +2116,7 @@ async fn connect_ssh_endpoint(
     transport: BoxedSshTransport,
     remote_forwards: Arc<HashMap<u32, RemoteForwardRoute>>,
     in_flight: Arc<AtomicUsize>,
+    payload_generation: Arc<AtomicU64>,
 ) -> anyhow::Result<(Arc<NativeSshHandle>, mpsc::UnboundedReceiver<String>)> {
     let config = Arc::new(client::Config {
         nodelay: true,
@@ -1692,6 +2135,7 @@ async fn connect_ssh_endpoint(
         known_hosts_paths: endpoint.known_hosts_paths.clone(),
         remote_forwards,
         in_flight,
+        payload_generation,
         disconnect_tx,
     };
     let mut handle = timeout(
@@ -1865,25 +2309,75 @@ async fn monitor_session(
     disconnect_rx: &mut mpsc::UnboundedReceiver<String>,
     session: &Arc<ManagedSshSession>,
     probe: ProbeConfig,
+    connectivity: &ConnectivityHandle,
 ) -> String {
+    if !probe.enabled {
+        return disconnect_rx
+            .recv()
+            .await
+            .unwrap_or_else(|| "SSH session disconnected".to_string());
+    }
     let mut consecutive_failures = 0_u32;
     let mut consecutive_successes = 0_u32;
+    let mut observed_payload_generation = session.payload_generation.load(Ordering::Relaxed);
     let replacement_threshold = probe.fail_threshold.saturating_sub(1).max(1);
+    let mut connectivity_rx = connectivity.subscribe();
+    let mut connectivity_events_open = true;
     loop {
+        if connectivity_rx.borrow().is_offline() {
+            consecutive_failures = 0;
+            consecutive_successes = 0;
+            tokio::select! {
+                reason = disconnect_rx.recv() => {
+                    return reason.unwrap_or_else(|| "SSH session disconnected".to_string());
+                }
+                changed = connectivity_rx.changed(), if connectivity_events_open => {
+                    if changed.is_err() {
+                        connectivity_events_open = false;
+                    }
+                }
+            }
+            continue;
+        }
         tokio::select! {
             reason = disconnect_rx.recv() => {
                 return reason.unwrap_or_else(|| "SSH session disconnected".to_string());
             }
+            changed = connectivity_rx.changed(), if connectivity_events_open => {
+                if changed.is_err() {
+                    connectivity_events_open = false;
+                }
+                continue;
+            }
             _ = sleep(Duration::from_secs(probe.interval_secs.max(1))) => {
-                if !probe.enabled {
+                let payload_generation = session.payload_generation.load(Ordering::Relaxed);
+                if session.in_flight.load(Ordering::Relaxed) > 0
+                    && payload_generation != observed_payload_generation
+                {
+                    observed_payload_generation = payload_generation;
+                    consecutive_failures = 0;
+                    consecutive_successes = consecutive_successes.saturating_add(1);
+                    let mut state = session.state.write().await;
+                    if !session.retire_requested.load(Ordering::Relaxed)
+                        && consecutive_successes >= probe.recovery_threshold
+                    {
+                        state.status = SshSessionStatus::Healthy;
+                    }
+                    state.last_error = None;
                     continue;
                 }
+                observed_payload_generation = payload_generation;
                 let started = Instant::now();
                 let result = timeout(
                     Duration::from_millis(probe.timeout_millis.max(1)),
                     handle.send_ping(),
                 ).await;
                 stats::record_ssh_session_probe(session.id);
+                if connectivity.current().is_offline() {
+                    consecutive_failures = 0;
+                    consecutive_successes = 0;
+                    continue;
+                }
                 match result {
                     Ok(Ok(())) => {
                         consecutive_failures = 0;
@@ -1907,7 +2401,11 @@ async fn monitor_session(
                             &error,
                             consecutive_failures >= replacement_threshold,
                         ).await;
-                        if consecutive_failures >= probe.fail_threshold {
+                        if probe_failure_requires_disconnect(
+                            consecutive_failures,
+                            probe.fail_threshold,
+                            session.in_flight.load(Ordering::Relaxed),
+                        ) {
                             let _ = handle.disconnect(Disconnect::ConnectionLost, &error, "en").await;
                             return error;
                         }
@@ -1924,7 +2422,11 @@ async fn monitor_session(
                             &error,
                             consecutive_failures >= replacement_threshold,
                         ).await;
-                        if consecutive_failures >= probe.fail_threshold {
+                        if probe_failure_requires_disconnect(
+                            consecutive_failures,
+                            probe.fail_threshold,
+                            session.in_flight.load(Ordering::Relaxed),
+                        ) {
                             let _ = handle.disconnect(Disconnect::ConnectionLost, &error, "en").await;
                             return error;
                         }
@@ -1940,18 +2442,26 @@ async fn mark_session_probe_failure(
     error: &str,
     request_replacement: bool,
 ) {
-    let mut state = session.state.write().await;
-    state.status = SshSessionStatus::Suspect;
-    state.last_error = Some(error.to_string());
     if request_replacement {
-        session.retire_requested.store(true, Ordering::Release);
+        request_session_retirement(session).await;
     }
+    let mut state = session.state.write().await;
+    if state.status != SshSessionStatus::Draining {
+        state.status = SshSessionStatus::Suspect;
+    }
+    state.last_error = Some(error.to_string());
     warn!(
         ssh_session_id = session.id,
         request_replacement,
         %error,
         "native SSH session health probe failed"
     );
+}
+
+async fn request_session_retirement(session: &Arc<ManagedSshSession>) {
+    if !session.retire_requested.swap(true, Ordering::AcqRel) {
+        session.state.write().await.retirement_started = Some(Instant::now());
+    }
 }
 
 async fn refresh_node_state(node: &Arc<NativeSshNode>) {
@@ -2292,12 +2802,19 @@ async fn drain_replaced_sessions(
             continue;
         }
         let mut state = session.state.write().await;
+        if state.forced_turnover_requested {
+            continue;
+        }
+        let now = Instant::now();
+        let payload_generation = session.payload_generation.load(Ordering::Relaxed);
         if state.status != SshSessionStatus::Draining {
             if draining_in_progress {
                 continue;
             }
             state.status = SshSessionStatus::Draining;
-            state.drain_started = Some(Instant::now());
+            state.drain_started = Some(now);
+            state.drain_idle_since = Some(now);
+            state.drain_payload_generation = payload_generation;
             draining_in_progress = true;
             info!(
                 ssh_host = %node.name,
@@ -2306,24 +2823,139 @@ async fn drain_replaced_sessions(
                 "SSH session started draining"
             );
         }
-        let timed_out = state
-            .drain_started
-            .is_some_and(|started| started.elapsed() >= drain_timeout);
-        let drained = session.in_flight.load(Ordering::Relaxed) == 0;
+        let decision = session_drain_decision(
+            &mut state,
+            session.in_flight.load(Ordering::Relaxed),
+            payload_generation,
+            now,
+            drain_timeout,
+        );
         drop(state);
-        if (drained || timed_out)
+        if let Some(reason) = decision.disconnect_reason()
             && let Some(handle) = session.current_handle().await
         {
-            let reason = if drained {
-                "replacement session is ready and active channels drained"
-            } else {
-                "SSH session drain timeout exceeded"
-            };
             let _ = handle
                 .disconnect(Disconnect::ByApplication, reason, "en")
                 .await;
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionDrainDecision {
+    Waiting,
+    Drained,
+    Stalled,
+}
+
+impl SessionDrainDecision {
+    fn disconnect_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Waiting => None,
+            Self::Drained => Some("replacement session is ready and active channels drained"),
+            Self::Stalled => Some("SSH session made no payload progress before the drain timeout"),
+        }
+    }
+}
+
+fn session_drain_decision(
+    state: &mut SshSessionState,
+    active_channels: usize,
+    payload_generation: u64,
+    now: Instant,
+    drain_timeout: Duration,
+) -> SessionDrainDecision {
+    if active_channels == 0 {
+        return SessionDrainDecision::Drained;
+    }
+    if payload_generation != state.drain_payload_generation {
+        state.drain_payload_generation = payload_generation;
+        state.drain_idle_since = Some(now);
+        return SessionDrainDecision::Waiting;
+    }
+    if state
+        .drain_idle_since
+        .is_some_and(|idle_since| now.saturating_duration_since(idle_since) >= drain_timeout)
+    {
+        SessionDrainDecision::Stalled
+    } else {
+        SessionDrainDecision::Waiting
+    }
+}
+
+async fn force_oldest_retiring_session(node: &Arc<NativeSshNode>) -> bool {
+    let Some((is_owner, session)) = oldest_retiring_session(node).await else {
+        return false;
+    };
+    let Some(handle) = session.current_handle().await else {
+        return false;
+    };
+    {
+        let mut state = session.state.write().await;
+        if state.forced_turnover_requested {
+            return false;
+        }
+        state.forced_turnover_requested = true;
+        state.status = SshSessionStatus::Draining;
+        state.drain_started.get_or_insert_with(Instant::now);
+        state.last_error =
+            Some("forced turnover because all max-sessions slots were draining".to_string());
+    }
+    warn!(
+        ssh_host = %node.name,
+        ssh_session_id = session.id,
+        active_channels = session.in_flight.load(Ordering::Relaxed),
+        remote_forward_owner = is_owner,
+        "forcing the longest-draining SSH session to leave the saturated pool"
+    );
+    let reason = "all max-sessions slots are draining; forcing the oldest draining session out";
+    if let Err(error) = handle
+        .disconnect(Disconnect::ByApplication, reason, "en")
+        .await
+    {
+        let mut state = session.state.write().await;
+        state.forced_turnover_requested = false;
+        state.last_error = Some(format!(
+            "failed to force draining session turnover: {error}"
+        ));
+        warn!(
+            ssh_host = %node.name,
+            ssh_session_id = session.id,
+            %error,
+            "failed to force the longest-draining SSH session out of the saturated pool"
+        );
+        return false;
+    }
+    true
+}
+
+async fn oldest_retiring_session(
+    node: &Arc<NativeSshNode>,
+) -> Option<(bool, Arc<ManagedSshSession>)> {
+    let owner = *node.remote_owner.read().await;
+    let sessions = node.sessions.read().await.clone();
+    let mut candidates = Vec::new();
+    for session in sessions {
+        if !session.retire_requested.load(Ordering::Relaxed) {
+            continue;
+        }
+        let state = session.state.read().await;
+        if state.status == SshSessionStatus::Offline || state.forced_turnover_requested {
+            continue;
+        }
+        let elapsed = state
+            .drain_started
+            .or(state.retirement_started)
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        candidates.push((owner == Some(session.id), elapsed, Arc::clone(&session)));
+    }
+    let prefer_non_owner = candidates.iter().any(|(is_owner, _, _)| !is_owner);
+    candidates
+        .into_iter()
+        .filter(|(is_owner, _, _)| !prefer_non_owner || !is_owner)
+        .max_by_key(|(_, elapsed, _)| *elapsed)
+        .map(|(is_owner, _, session)| (is_owner, session))
 }
 
 fn build_remote_routes(upstream: &SshHostConfig) -> HashMap<u32, RemoteForwardRoute> {
@@ -2440,6 +3072,7 @@ impl Drop for ActiveChannelGuard {
 
 struct InFlightReservation {
     counter: Arc<AtomicUsize>,
+    payload_generation: Arc<AtomicU64>,
     session_id: u64,
     active: bool,
 }
@@ -2450,6 +3083,7 @@ impl InFlightReservation {
         CountedStream {
             inner: stream,
             counter: Arc::clone(&self.counter),
+            payload_generation: Arc::clone(&self.payload_generation),
             session_id: self.session_id,
             transfer_recorder: stats::session_transfer_recorder(self.session_id),
         }
@@ -2467,6 +3101,7 @@ impl Drop for InFlightReservation {
 
 fn reserve_in_flight(
     counter: &Arc<AtomicUsize>,
+    payload_generation: &Arc<AtomicU64>,
     maximum: usize,
     session_id: u64,
 ) -> Option<InFlightReservation> {
@@ -2478,6 +3113,7 @@ fn reserve_in_flight(
     stats::ssh_session_channel_reserved(session_id);
     Some(InFlightReservation {
         counter: Arc::clone(counter),
+        payload_generation: Arc::clone(payload_generation),
         session_id,
         active: true,
     })
@@ -2486,6 +3122,7 @@ fn reserve_in_flight(
 struct CountedStream<S> {
     inner: S,
     counter: Arc<AtomicUsize>,
+    payload_generation: Arc<AtomicU64>,
     session_id: u64,
     transfer_recorder: stats::TransferRecorder,
 }
@@ -2510,6 +3147,9 @@ where
         let result = Pin::new(&mut self.inner).poll_read(context, buffer);
         if let Poll::Ready(Ok(())) = &result {
             let read = buffer.filled().len().saturating_sub(before);
+            if read > 0 {
+                self.payload_generation.fetch_add(1, Ordering::Relaxed);
+            }
             self.transfer_recorder.record(0, read as u64);
         }
         result
@@ -2527,7 +3167,79 @@ where
     ) -> Poll<std::io::Result<usize>> {
         let result = Pin::new(&mut self.inner).poll_write(context, buffer);
         if let Poll::Ready(Ok(written)) = result {
+            if written > 0 {
+                self.payload_generation.fetch_add(1, Ordering::Relaxed);
+            }
             self.transfer_recorder.record(written as u64, 0);
+            Poll::Ready(Ok(written))
+        } else {
+            result
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
+struct PayloadActivityStream<S> {
+    inner: S,
+    payload_generation: Arc<AtomicU64>,
+}
+
+impl<S> PayloadActivityStream<S> {
+    fn new(inner: S, payload_generation: Arc<AtomicU64>) -> Self {
+        Self {
+            inner,
+            payload_generation,
+        }
+    }
+}
+
+impl<S> AsyncRead for PayloadActivityStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buffer.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(context, buffer);
+        if let Poll::Ready(Ok(())) = &result
+            && buffer.filled().len() > before
+        {
+            self.payload_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+impl<S> AsyncWrite for PayloadActivityStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(context, buffer);
+        if let Poll::Ready(Ok(written)) = result {
+            if written > 0 {
+                self.payload_generation.fetch_add(1, Ordering::Relaxed);
+            }
             Poll::Ready(Ok(written))
         } else {
             result
@@ -2560,6 +3272,38 @@ mod tests {
 
     static NEXT_TEST_KEY_ID: AtomicU64 = AtomicU64::new(1);
 
+    fn detached_session(
+        id: u64,
+        status: SshSessionStatus,
+        retiring: bool,
+    ) -> Arc<ManagedSshSession> {
+        Arc::new(ManagedSshSession {
+            id,
+            state: Arc::new(RwLock::new(SshSessionState {
+                status,
+                retirement_started: retiring.then(Instant::now),
+                ..SshSessionState::default()
+            })),
+            handle: Arc::new(RwLock::new(None)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            payload_generation: Arc::new(AtomicU64::new(0)),
+            retire_requested: AtomicBool::new(retiring),
+        })
+    }
+
+    fn detached_node(sessions: Vec<Arc<ManagedSshSession>>) -> Arc<NativeSshNode> {
+        Arc::new(NativeSshNode {
+            name: "detached-test-node".to_string(),
+            state: Arc::new(RwLock::new(SshNodeState::default())),
+            sessions: Arc::new(RwLock::new(sessions)),
+            remote_owner: Arc::new(RwLock::new(None)),
+            connect_demand: Arc::new(Notify::new()),
+            session_events: watch::channel(0).0,
+            channel_open_timeout: Duration::from_secs(1),
+            max_channels_per_session: 8,
+        })
+    }
+
     #[test]
     fn restart_backoff_is_capped() {
         assert_eq!(
@@ -2577,6 +3321,131 @@ mod tests {
     }
 
     #[test]
+    fn connectivity_policy_blocks_offline_spawns_and_preserves_remote_recovery() {
+        let snapshot = |availability, events_available| ConnectivitySnapshot {
+            availability,
+            events_available,
+            resumed: false,
+            generation: 1,
+        };
+        assert!(!session_spawn_authorized(
+            snapshot(NetworkAvailability::Offline, true),
+            true,
+            true,
+            1,
+        ));
+        assert!(!session_spawn_authorized(
+            snapshot(NetworkAvailability::Online, false),
+            false,
+            false,
+            0,
+        ));
+        assert!(session_spawn_authorized(
+            snapshot(NetworkAvailability::Online, false),
+            false,
+            true,
+            0,
+        ));
+        assert!(session_spawn_authorized(
+            snapshot(NetworkAvailability::Online, false),
+            true,
+            false,
+            0,
+        ));
+        assert_eq!(
+            session_manager_tick_interval(
+                snapshot(NetworkAvailability::Offline, false),
+                true,
+                false,
+            ),
+            OFFLINE_REMOTE_REFRESH_INTERVAL
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_connectivity_defers_initial_spawn_until_network_recovers() {
+        let (ssh_address, server) = start_test_ssh_server().await;
+        let key_path = write_test_key("offline-gate");
+        let (connectivity, controller) =
+            ConnectivityHandle::controlled(NetworkAvailability::Offline, true);
+        let pool = SshPoolDialer::start_with_connectivity(
+            "offline-gate",
+            test_pool_config(ssh_address, &key_path, 1, 1, 8, Vec::new()),
+            ProbeConfig {
+                enabled: false,
+                ..ProbeConfig::default()
+            },
+            connectivity,
+        )
+        .unwrap();
+
+        sleep(Duration::from_millis(100)).await;
+        assert!(pool.nodes[0].sessions.read().await.is_empty());
+
+        controller.set(NetworkAvailability::Online);
+        wait_for_healthy_sessions(&pool.nodes[0], 1).await;
+
+        drop(pool);
+        let _ = std::fs::remove_file(key_path);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn eventless_local_pool_reconnects_on_incoming_demand() {
+        let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ssh_address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let key_path = write_test_key("eventless-demand");
+        let (connectivity, _controller) =
+            ConnectivityHandle::controlled(NetworkAvailability::Online, false);
+        let pool = SshPoolDialer::start_with_connectivity(
+            "eventless-demand",
+            test_pool_config(ssh_address, &key_path, 1, 1, 8, Vec::new()),
+            ProbeConfig {
+                enabled: false,
+                ..ProbeConfig::default()
+            },
+            connectivity,
+        )
+        .unwrap();
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if pool.nodes[0].state.read().await.restart_count >= 1
+                    && pool.nodes[0].sessions.read().await.is_empty()
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial eventless connection attempt did not finish");
+
+        let ssh_listener = TcpListener::bind(ssh_address).await.unwrap();
+        let server = start_test_ssh_server_on(ssh_listener);
+        let (target, echo) = start_echo_server().await;
+        let mut stream = pool
+            .dial(DialContext {
+                host_name: "eventless-demand".to_string(),
+                target: TargetAddr::Socket(target),
+                connection_id: None,
+            })
+            .await
+            .unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        let mut reply = [0_u8; 4];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"ping");
+
+        drop(stream);
+        drop(pool);
+        let _ = std::fs::remove_file(key_path);
+        echo.await.unwrap();
+        server.abort();
+    }
+
+    #[test]
     fn elastic_session_pool_uses_hysteresis() {
         assert!(!session_pool_is_under_pressure(2, 1, 4));
         assert!(session_pool_is_under_pressure(3, 1, 4));
@@ -2585,6 +3454,88 @@ mod tests {
         assert!(!session_pool_can_scale_down(2, 2, 1, 4));
         assert!(session_pool_can_scale_down(1, 2, 1, 4));
         assert!(!session_pool_can_scale_down(0, 1, 1, 4));
+    }
+
+    #[test]
+    fn saturated_pool_forces_turnover_only_when_every_slot_is_retiring() {
+        assert!(session_pool_requires_forced_turnover(3, 3, 3, true, false));
+        assert!(!session_pool_requires_forced_turnover(3, 2, 3, true, false));
+        assert!(!session_pool_requires_forced_turnover(2, 2, 3, true, false));
+        assert!(!session_pool_requires_forced_turnover(
+            3, 3, 3, false, false
+        ));
+        assert!(!session_pool_requires_forced_turnover(3, 3, 3, true, true));
+    }
+
+    #[test]
+    fn failed_probe_does_not_disconnect_a_session_with_active_channels() {
+        assert!(!probe_failure_requires_disconnect(3, 3, 1));
+        assert!(!probe_failure_requires_disconnect(2, 3, 0));
+        assert!(probe_failure_requires_disconnect(3, 3, 0));
+    }
+
+    #[tokio::test]
+    async fn suspect_and_retiring_sessions_do_not_accept_new_channels() {
+        let suspect = detached_session(1, SshSessionStatus::Suspect, false);
+        let retiring = detached_session(2, SshSessionStatus::Healthy, true);
+        let node = detached_node(vec![suspect, retiring]);
+        assert!(!node.has_available_session().await);
+    }
+
+    #[test]
+    fn draining_session_waits_while_payload_is_progressing() {
+        let now = Instant::now();
+        let timeout = Duration::from_secs(30);
+        let mut state = SshSessionState {
+            status: SshSessionStatus::Draining,
+            drain_started: Some(now - Duration::from_secs(60)),
+            drain_idle_since: Some(now - Duration::from_secs(31)),
+            drain_payload_generation: 10,
+            ..SshSessionState::default()
+        };
+
+        assert_eq!(
+            session_drain_decision(&mut state, 1, 11, now, timeout),
+            SessionDrainDecision::Waiting
+        );
+        assert_eq!(state.drain_idle_since, Some(now));
+        assert_eq!(
+            session_drain_decision(&mut state, 1, 11, now + Duration::from_secs(29), timeout,),
+            SessionDrainDecision::Waiting
+        );
+        assert_eq!(
+            session_drain_decision(&mut state, 1, 11, now + Duration::from_secs(30), timeout,),
+            SessionDrainDecision::Stalled
+        );
+        assert_eq!(
+            session_drain_decision(&mut state, 0, 11, now, timeout),
+            SessionDrainDecision::Drained
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_turnover_prefers_the_oldest_non_owner_session() {
+        let now = Instant::now();
+        let owner = detached_session(1, SshSessionStatus::Draining, true);
+        let oldest_non_owner = detached_session(2, SshSessionStatus::Draining, true);
+        let newest_non_owner = detached_session(3, SshSessionStatus::Draining, true);
+        owner.state.write().await.drain_started = Some(now - Duration::from_secs(90));
+        oldest_non_owner.state.write().await.drain_started = Some(now - Duration::from_secs(60));
+        newest_non_owner.state.write().await.drain_started = Some(now - Duration::from_secs(30));
+        let node = detached_node(vec![
+            Arc::clone(&owner),
+            Arc::clone(&oldest_non_owner),
+            newest_non_owner,
+        ]);
+        *node.remote_owner.write().await = Some(owner.id);
+
+        let (is_owner, selected) = oldest_retiring_session(&node).await.unwrap();
+        assert!(!is_owner);
+        assert_eq!(selected.id, oldest_non_owner.id);
+
+        *node.remote_owner.write().await = None;
+        let (_, selected) = oldest_retiring_session(&node).await.unwrap();
+        assert_eq!(selected.id, owner.id);
     }
 
     #[test]
@@ -2633,6 +3584,7 @@ mod tests {
                 tunnel_id: "test-upstream/remote-proxy/remote-socks".to_string(),
                 protocol: ProxyProtocol::Socks5h,
                 peer_addr: "127.0.0.1:12345".parse().unwrap(),
+                payload_generation: Arc::new(AtomicU64::new(0)),
             },
             server,
         ));
@@ -2687,6 +3639,7 @@ mod tests {
                 tunnel_id: "test-upstream/remote-proxy/remote-mixed".to_string(),
                 protocol: ProxyProtocol::Mixed,
                 peer_addr: "127.0.0.1:12345".parse().unwrap(),
+                payload_generation: Arc::new(AtomicU64::new(0)),
             },
             server,
         ));
@@ -2831,13 +3784,31 @@ mod tests {
         assert_eq!(&echoed, b"ping");
         drop(stream);
 
-        let mut remote_fixed_stream = TcpStream::connect(remote_fixed_listen).await.unwrap();
+        let mut remote_fixed_stream = timeout(Duration::from_secs(3), async {
+            loop {
+                match TcpStream::connect(remote_fixed_listen).await {
+                    Ok(stream) => break stream,
+                    Err(_) => sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("remote fixed forward did not start listening");
         remote_fixed_stream.write_all(b"ping").await.unwrap();
         remote_fixed_stream.read_exact(&mut echoed).await.unwrap();
         assert_eq!(&echoed, b"ping");
         drop(remote_fixed_stream);
 
-        let mut remote_dynamic_stream = TcpStream::connect(remote_dynamic_listen).await.unwrap();
+        let mut remote_dynamic_stream = timeout(Duration::from_secs(3), async {
+            loop {
+                match TcpStream::connect(remote_dynamic_listen).await {
+                    Ok(stream) => break stream,
+                    Err(_) => sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("remote dynamic forward did not start listening");
         remote_dynamic_stream
             .write_all(&[0x05, 0x01, 0x00])
             .await
@@ -3102,6 +4073,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saturated_retiring_pool_forces_one_session_out_before_replacement() {
+        let (ssh_address, server) = start_test_ssh_server().await;
+        let key_path = write_test_key("saturated-retiring");
+        let pool = SshPoolDialer::start(
+            "saturated-retiring",
+            test_pool_config(ssh_address, &key_path, 2, 2, 8, Vec::new()),
+            ProbeConfig {
+                enabled: false,
+                ..ProbeConfig::default()
+            },
+        )
+        .unwrap();
+        let node = Arc::clone(&pool.nodes[0]);
+        wait_for_healthy_sessions(&node, 2).await;
+        let originals = node.sessions.read().await.clone();
+        let original_ids = originals
+            .iter()
+            .map(|session| session.id)
+            .collect::<HashSet<_>>();
+        for session in &originals {
+            session.in_flight.store(1, AtomicOrdering::Relaxed);
+            mark_session_probe_failure(session, "test saturated retirement", true).await;
+            sleep(Duration::from_millis(5)).await;
+        }
+
+        timeout(Duration::from_secs(4), async {
+            loop {
+                let sessions = node.sessions.read().await.clone();
+                let original_count = sessions
+                    .iter()
+                    .filter(|session| original_ids.contains(&session.id))
+                    .count();
+                let healthy_replacements = sessions
+                    .iter()
+                    .filter(|session| !original_ids.contains(&session.id))
+                    .filter(|session| !session.retire_requested.load(AtomicOrdering::Relaxed))
+                    .filter(|session| {
+                        session
+                            .state
+                            .try_read()
+                            .is_ok_and(|state| state.status == SshSessionStatus::Healthy)
+                    })
+                    .count();
+                if original_count == 1 && healthy_replacements == 1 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("saturated retiring pool did not force one session turnover");
+
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            node.sessions
+                .read()
+                .await
+                .iter()
+                .filter(|session| original_ids.contains(&session.id))
+                .count(),
+            1,
+            "forced turnover must wait instead of killing every draining session"
+        );
+
+        drop(pool);
+        let _ = std::fs::remove_file(key_path);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn scheduled_rotation_waits_for_a_healthy_replacement() {
         let candidate = Arc::new(ManagedSshSession {
             id: 1,
@@ -3111,6 +4152,7 @@ mod tests {
             })),
             handle: Arc::new(RwLock::new(None)),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            payload_generation: Arc::new(AtomicU64::new(0)),
             retire_requested: AtomicBool::new(false),
         });
         let replacement = Arc::new(ManagedSshSession {
@@ -3118,6 +4160,7 @@ mod tests {
             state: Arc::new(RwLock::new(SshSessionState::default())),
             handle: Arc::new(RwLock::new(None)),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            payload_generation: Arc::new(AtomicU64::new(0)),
             retire_requested: AtomicBool::new(false),
         });
         let node = Arc::new(NativeSshNode {
@@ -3128,6 +4171,8 @@ mod tests {
                 Arc::clone(&replacement),
             ])),
             remote_owner: Arc::new(RwLock::new(None)),
+            connect_demand: Arc::new(Notify::new()),
+            session_events: watch::channel(0).0,
             channel_open_timeout: Duration::from_secs(1),
             max_channels_per_session: 8,
         });
@@ -3162,6 +4207,7 @@ mod tests {
                 })),
                 handle: Arc::new(RwLock::new(None)),
                 in_flight: Arc::new(AtomicUsize::new(0)),
+                payload_generation: Arc::new(AtomicU64::new(0)),
                 retire_requested: AtomicBool::new(retiring),
             })
         };
@@ -3179,6 +4225,8 @@ mod tests {
                 Arc::clone(&second_replacement),
             ])),
             remote_owner: Arc::new(RwLock::new(None)),
+            connect_demand: Arc::new(Notify::new()),
+            session_events: watch::channel(0).0,
             channel_open_timeout: Duration::from_secs(1),
             max_channels_per_session: 8,
         });
@@ -3739,6 +4787,10 @@ mod tests {
     async fn start_test_ssh_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        (address, start_test_ssh_server_on(listener))
+    }
+
+    fn start_test_ssh_server_on(listener: TcpListener) -> tokio::task::JoinHandle<()> {
         let server_key =
             russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
                 .unwrap();
@@ -3748,7 +4800,7 @@ mod tests {
             keys: vec![server_key],
             ..Default::default()
         });
-        let task = tokio::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
                     return;
@@ -3764,8 +4816,7 @@ mod tests {
                     let _ = running.await;
                 });
             }
-        });
-        (address, task)
+        })
     }
 
     async fn unused_local_address() -> SocketAddr {
