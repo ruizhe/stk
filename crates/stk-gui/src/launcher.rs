@@ -3,8 +3,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env,
-    ffi::OsString,
-    fs,
+    ffi::{OsStr, OsString},
+    fmt, fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -17,6 +17,7 @@ use stk_core::{
     config::ProxyProtocol,
     stats::{RuntimeSnapshot, TunnelKind, TunnelRuntimeStatus},
 };
+use sysinfo::System;
 
 const PROXY_ENVIRONMENT_NAMES: [&str; 12] = [
     "ALL_PROXY",
@@ -37,6 +38,39 @@ const PROXY_ENVIRONMENT_NAMES: [&str; 12] = [
 pub(super) enum LaunchMode {
     Normal,
     Private,
+    DefaultProfile,
+}
+
+#[derive(Debug)]
+pub(super) enum LauncherLaunchError {
+    DefaultProfileAlreadyRunning,
+    Other(anyhow::Error),
+}
+
+impl fmt::Display for LauncherLaunchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DefaultProfileAlreadyRunning => {
+                formatter.write_str("the browser default profile is already running")
+            }
+            Self::Other(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for LauncherLaunchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DefaultProfileAlreadyRunning => None,
+            Self::Other(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+impl From<anyhow::Error> for LauncherLaunchError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Other(error)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +124,10 @@ impl LauncherItem {
         matches!(self.kind, LauncherKind::Browser(_))
     }
 
+    pub fn supports_default_profile(&self) -> bool {
+        matches!(self.kind, LauncherKind::Browser(BrowserEngine::Chromium))
+    }
+
     pub fn proxy_summary(&self) -> String {
         match &self.proxy {
             Ok(LauncherProxyPlan::Stk(plan)) => format!(
@@ -115,13 +153,24 @@ impl LauncherItem {
         }
     }
 
-    pub fn launch(&self, mode: LaunchMode) -> anyhow::Result<()> {
+    pub fn launch(&self, mode: LaunchMode) -> Result<(), LauncherLaunchError> {
         let proxy = self
             .proxy
             .as_ref()
-            .map_err(|error| anyhow::anyhow!(error.clone()))?;
+            .map_err(|error| LauncherLaunchError::Other(anyhow::anyhow!(error.clone())))?;
+        if mode == LaunchMode::DefaultProfile {
+            if !self.supports_default_profile() {
+                return Err(LauncherLaunchError::Other(anyhow::anyhow!(
+                    "the browser does not support proxy-only default-profile launching"
+                )));
+            }
+            if default_profile_browser_is_running(&self.command) {
+                return Err(LauncherLaunchError::DefaultProfileAlreadyRunning);
+            }
+        }
         let plan = self.build_launch_plan(mode, proxy)?;
-        plan.spawn()
+        plan.spawn()?;
+        Ok(())
     }
 
     fn build_launch_plan(
@@ -133,7 +182,9 @@ impl LauncherItem {
         let configured_profile_dir = self.profile_dir.as_deref().map(expand_path);
         match self.kind {
             LauncherKind::Browser(BrowserEngine::Chromium) => {
-                if let Some(profile_dir) = configured_profile_dir.as_ref() {
+                if mode != LaunchMode::DefaultProfile
+                    && let Some(profile_dir) = configured_profile_dir.as_ref()
+                {
                     fs::create_dir_all(profile_dir).with_context(|| {
                         format!("failed to create browser profile {}", profile_dir.display())
                     })?;
@@ -143,7 +194,7 @@ impl LauncherItem {
                     args.push(format!("--proxy-server={}", chromium_proxy_url(plan)).into());
                 }
                 match mode {
-                    LaunchMode::Normal => {
+                    LaunchMode::Normal | LaunchMode::DefaultProfile => {
                         args.extend(self.normal_args.iter().map(OsString::from));
                     }
                     LaunchMode::Private => {
@@ -167,6 +218,9 @@ impl LauncherItem {
                         args.push("-private-window".into());
                         args.extend(self.private_args.iter().map(OsString::from));
                     }
+                    LaunchMode::DefaultProfile => {
+                        bail!("Firefox does not support proxy-only default-profile launching")
+                    }
                 }
             }
             LauncherKind::Browser(BrowserEngine::Custom) => {
@@ -182,7 +236,9 @@ impl LauncherItem {
                     profile_dir,
                 )?);
                 args.extend(match mode {
-                    LaunchMode::Normal => self.normal_args.iter().map(OsString::from),
+                    LaunchMode::Normal | LaunchMode::DefaultProfile => {
+                        self.normal_args.iter().map(OsString::from)
+                    }
                     LaunchMode::Private => self.private_args.iter().map(OsString::from),
                 });
             }
@@ -216,6 +272,71 @@ impl LauncherItem {
         let launcher_id = self.id.strip_prefix("browser:").unwrap_or(&self.id);
         managed_browser_profile_directory("firefox", launcher_id)
     }
+}
+
+fn default_profile_browser_is_running(command: &Path) -> bool {
+    let system = System::new_all();
+    system.processes().values().any(|process| {
+        is_default_profile_browser_process(command, process.exe(), process.name(), process.cmd())
+    })
+}
+
+fn is_default_profile_browser_process(
+    command: &Path,
+    process_executable: Option<&Path>,
+    process_name: &OsStr,
+    command_line: &[OsString],
+) -> bool {
+    if !process_matches_executable(command, process_executable, process_name) {
+        return false;
+    }
+    if command_line.iter().any(|argument| {
+        let argument = argument.to_string_lossy();
+        argument == "--type" || argument.starts_with("--type=")
+    }) {
+        return false;
+    }
+    !command_line.iter().any(|argument| {
+        let argument = argument.to_string_lossy();
+        argument == "--user-data-dir" || argument.starts_with("--user-data-dir=")
+    })
+}
+
+fn process_matches_executable(
+    command: &Path,
+    process_executable: Option<&Path>,
+    process_name: &OsStr,
+) -> bool {
+    if let Some(process_executable) = process_executable {
+        return paths_match(command, process_executable);
+    }
+    command
+        .file_name()
+        .is_some_and(|command_name| os_strings_match(command_name, process_name))
+}
+
+fn paths_match(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    let Ok(left) = fs::canonicalize(left) else {
+        return false;
+    };
+    let Ok(right) = fs::canonicalize(right) else {
+        return false;
+    };
+    os_strings_match(left.as_os_str(), right.as_os_str())
+}
+
+#[cfg(windows)]
+fn os_strings_match(left: &OsStr, right: &OsStr) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn os_strings_match(left: &OsStr, right: &OsStr) -> bool {
+    left == right
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1895,5 +2016,74 @@ hosts:
         ))));
         assert!(private_plan.args.contains(&OsString::from("--incognito")));
         assert!(profile_dir.is_dir());
+    }
+
+    #[test]
+    fn chromium_default_profile_mode_only_omits_the_managed_profile_argument() {
+        let config = launcher_test_config();
+        let proxy = resolve_launcher_proxy(&config, Some("web")).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let profile_dir = directory.path().join("managed-profile");
+        let item = test_browser_item(
+            BrowserEngine::Chromium,
+            Some(profile_dir.to_string_lossy().into_owned()),
+        );
+
+        let plan = item
+            .build_launch_plan(LaunchMode::DefaultProfile, &proxy)
+            .unwrap();
+        assert_eq!(
+            plan.args,
+            [
+                OsString::from("--user-argument"),
+                OsString::from("--proxy-server=http://127.0.0.1:7890"),
+                OsString::from("--normal-argument"),
+            ]
+        );
+        assert!(!profile_dir.exists());
+        assert!(item.supports_default_profile());
+        assert!(!test_browser_item(BrowserEngine::Firefox, None).supports_default_profile());
+    }
+
+    #[test]
+    fn default_profile_process_detection_ignores_managed_and_child_processes() {
+        let command = Path::new("/Applications/Test Browser/Browser");
+        let process_name = command.file_name().unwrap();
+        let main_command = [command.as_os_str().to_os_string()];
+        assert!(is_default_profile_browser_process(
+            command,
+            Some(command),
+            process_name,
+            &main_command,
+        ));
+
+        let managed_command = [
+            command.as_os_str().to_os_string(),
+            OsString::from("--user-data-dir=/tmp/stk-browser"),
+        ];
+        assert!(!is_default_profile_browser_process(
+            command,
+            Some(command),
+            process_name,
+            &managed_command,
+        ));
+
+        let child_command = [
+            command.as_os_str().to_os_string(),
+            OsString::from("--type=renderer"),
+        ];
+        assert!(!is_default_profile_browser_process(
+            command,
+            Some(command),
+            process_name,
+            &child_command,
+        ));
+
+        assert!(!is_default_profile_browser_process(
+            command,
+            Some(Path::new("/Other/Browser")),
+            process_name,
+            &main_command,
+        ));
     }
 }

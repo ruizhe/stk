@@ -30,7 +30,7 @@ use tracing::{info, warn};
 
 use super::{
     gui_config::{GuiConfig, Language},
-    launcher::{LaunchMode, LauncherCatalog, LauncherItem},
+    launcher::{LaunchMode, LauncherCatalog, LauncherItem, LauncherLaunchError},
     logging::{GuiLogEntry, GuiLogLevel},
 };
 
@@ -966,8 +966,15 @@ fn Overview(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum LauncherNoticeKind {
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LauncherNotice {
-    success: bool,
+    kind: LauncherNoticeKind,
     message: String,
 }
 
@@ -998,9 +1005,14 @@ fn QuickLauncherBar(
                 div { class: "quick-launcher-status",
                     if let Some(current_notice) = current_notice.as_ref() {
                         span {
-                            class: if current_notice.success { "launcher-notice success" } else { "launcher-notice error" },
+                            class: match current_notice.kind {
+                                LauncherNoticeKind::Success => "launcher-notice success",
+                                LauncherNoticeKind::Warning => "launcher-notice warning",
+                                LauncherNoticeKind::Error => "launcher-notice error",
+                            },
                             title: "{current_notice.message}",
-                            if current_notice.success {
+                            role: "alert",
+                            if current_notice.kind == LauncherNoticeKind::Success {
                                 CircleCheck { size: 13 }
                             } else {
                                 CircleAlert { size: 13 }
@@ -1083,9 +1095,20 @@ fn LauncherTile(
         ),
         Language::Chinese => format!("使用 {} 以隐身模式启动 {}", proxy_summary, item.name),
     });
+    let default_profile_title = unavailable.clone().unwrap_or_else(|| match language {
+        Language::English => format!(
+            "Launch {} with its default profile and {}. Fully quit the default-profile browser first.",
+            item.name, proxy_summary
+        ),
+        Language::Chinese => format!(
+            "使用默认浏览器资料和 {} 启动 {}；请先完整退出正在使用默认资料的浏览器",
+            proxy_summary, item.name
+        ),
+    });
     let normal_item = item.clone();
     let menu_normal_item = item.clone();
     let private_item = item.clone();
+    let default_profile_item = item.clone();
     let menu_launcher_id = item.id.clone();
     let item_name = item.name.clone();
     let main_icon_source = item.icon_source.clone();
@@ -1094,6 +1117,9 @@ fn LauncherTile(
     let menu_icon_text = item.icon_text.clone();
     let menu_private_icon_source = item.private_icon_source.clone();
     let menu_private_icon_text = item.private_icon_text.clone();
+    let menu_default_profile_icon_source = item.icon_source.clone();
+    let menu_default_profile_icon_text = item.icon_text.clone();
+    let supports_default_profile = item.supports_default_profile();
     let normal_mode_label = tr(language, "Normal mode", "普通模式");
     let normal_mode_description = match language {
         Language::English => format!("Start {} with the configured proxy", item.name),
@@ -1103,6 +1129,11 @@ fn LauncherTile(
     let private_mode_description = match language {
         Language::English => format!("Start {} privately with the configured proxy", item.name),
         Language::Chinese => format!("使用已配置的代理以隐身模式启动 {}", item.name),
+    };
+    let default_profile_mode_label = tr(language, "Default browser profile", "默认浏览器资料");
+    let default_profile_mode_description = match language {
+        Language::English => "Use the normal profile with proxy; fully quit the browser first",
+        Language::Chinese => "使用默认资料和代理；请先完整退出浏览器",
     };
 
     rsx! {
@@ -1200,6 +1231,34 @@ fn LauncherTile(
                                     small { "{private_mode_description}" }
                                 }
                             }
+                            if supports_default_profile {
+                                button {
+                                    class: "launcher-mode-menu-item",
+                                    role: "menuitem",
+                                    title: "{default_profile_title}",
+                                    disabled,
+                                    onclick: move |_| {
+                                        open_menu.set(None);
+                                        launch_launcher(
+                                            default_profile_item.clone(),
+                                            LaunchMode::DefaultProfile,
+                                            language,
+                                            launching,
+                                            notice,
+                                        );
+                                    },
+                                    span { class: "launcher-mode-menu-icon", aria_hidden: "true",
+                                        LauncherIcon {
+                                            source: menu_default_profile_icon_source.clone(),
+                                            text: menu_default_profile_icon_text.clone(),
+                                        }
+                                    }
+                                    span { class: "launcher-mode-menu-copy",
+                                        strong { "{default_profile_mode_label}" }
+                                        small { "{default_profile_mode_description}" }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1241,22 +1300,44 @@ fn launch_launcher(
         let result = tokio::task::spawn_blocking(move || item.launch(mode)).await;
         launching.set(None);
         let notice_message = match result {
+            Ok(Ok(())) if mode == LaunchMode::DefaultProfile => LauncherNotice {
+                kind: LauncherNoticeKind::Warning,
+                message: match language {
+                    Language::English => format!(
+                        "Started {name} with its default profile and proxy. To remove the proxy, fully quit the browser and reopen it from the system launcher."
+                    ),
+                    Language::Chinese => format!(
+                        "已使用默认浏览器资料和代理启动 {name}。要去掉代理，请完整退出浏览器，再通过系统启动器重新打开。"
+                    ),
+                },
+            },
             Ok(Ok(())) => LauncherNotice {
-                success: true,
+                kind: LauncherNoticeKind::Success,
                 message: match language {
                     Language::English => format!("Started {name}"),
                     Language::Chinese => format!("已启动 {name}"),
                 },
             },
-            Ok(Err(error)) => LauncherNotice {
-                success: false,
+            Ok(Err(LauncherLaunchError::DefaultProfileAlreadyRunning)) => LauncherNotice {
+                kind: LauncherNoticeKind::Error,
+                message: match language {
+                    Language::English => format!(
+                        "{name} is already using its default profile. Fully quit the browser before launching this mode."
+                    ),
+                    Language::Chinese => format!(
+                        "{name} 的默认浏览器资料正在使用中。请先完整退出浏览器，再使用此模式启动。"
+                    ),
+                },
+            },
+            Ok(Err(LauncherLaunchError::Other(error))) => LauncherNotice {
+                kind: LauncherNoticeKind::Error,
                 message: match language {
                     Language::English => format!("Failed to start {name}: {error:#}"),
                     Language::Chinese => format!("启动 {name} 失败：{error:#}"),
                 },
             },
             Err(error) => LauncherNotice {
-                success: false,
+                kind: LauncherNoticeKind::Error,
                 message: match language {
                     Language::English => format!("Launcher task for {name} failed: {error}"),
                     Language::Chinese => format!("{name} 的启动任务失败：{error}"),

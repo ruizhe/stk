@@ -275,7 +275,7 @@ env:
 
 ### GUI 快速启动器
 
-GUI 在概览页顶部显示紧凑的浏览器和应用入口。点击浏览器主图标会使用选中的代理启动普通模式，点击右侧小箭头会打开菜单，可选择使用同一代理的普通模式或隐身模式；普通应用只有一个启动按钮。入口不可用时会置灰，鼠标提示会说明是命令不存在、代理尚未监听还是配置选择无效。
+GUI 在概览页顶部显示紧凑的浏览器和应用入口。点击浏览器主图标会使用选中的代理启动普通模式，点击右侧小箭头会打开菜单，可选择使用同一代理的普通模式或隐身模式。Chromium 系浏览器还会显示“默认浏览器资料”模式：不传入 STK 托管的 `--user-data-dir`，只使用代理参数启动浏览器的日常默认资料；普通应用只有一个启动按钮。入口不可用时会置灰，鼠标提示会说明是命令不存在、代理尚未监听还是配置选择无效。
 
 浏览器与普通应用分别配置：
 
@@ -334,6 +334,8 @@ launchers:
 `proxy` 可以是 `env.profiles` 中的名称、`HOST/TUNNEL@SCHEME`、`direct`、`inherit` 或 `default`。`default` 表示继续使用上一级默认值；优先级为入口、浏览器/应用分组、`launchers.default-proxy`、`env.default`，最后自动选择第一个兼容的本地代理。`direct` 会清理继承的代理环境变量，`inherit` 保留当前进程环境。
 
 内置 Chromium 和 Firefox 启动器默认使用长期保留的 STK 托管 profile，使进程级代理参数不受已经运行的系统浏览器影响。同一个启动器入口的普通模式和隐身模式共用这份托管 profile。macOS 默认目录是 `~/Library/Application Support/STK/browser-profiles`，Linux 是 `$XDG_DATA_HOME/stk/browser-profiles`（未配置时使用 `~/.local/share/stk/browser-profiles`），Windows 是 `%LOCALAPPDATA%\STK\browser-profiles`。目录按浏览器族和启动器 ID 隔离，例如内置 Chrome 使用 `chrome/default`，`chrome-production` 则使用 `chrome/chrome-production`。
+
+“默认浏览器资料”模式适用于 Chromium 引擎，包括自动探测到的 Chrome、Edge、Brave、Chromium、Vivaldi 和 Opera。启动前 STK 会检查该浏览器是否已有使用默认资料的主进程；renderer/helper 子进程以及带显式 `--user-data-dir` 的 STK 托管进程不会被误判。如果默认资料正在使用，STK 会阻止本次启动并提醒先完整退出浏览器，否则 Chromium 可能把请求交给已有进程并忽略新传入的代理参数。使用此模式后，如需去掉代理，必须先完整退出浏览器，再通过系统启动器正常打开。Firefox 没有等价且可靠的“默认 profile + 仅命令行代理”方式，因此 Firefox 不显示该菜单项，STK 也不会修改用户的默认 Firefox profile。
 
 用户显式配置的 `profile-dir` 始终优先。需要让同一浏览器同时使用不同代理时，应配置不同的启动器入口，从而使用不同的 profile 目录。STK 不会复制或自动删除系统浏览器 profile；用户只需先在 STK 托管的普通模式中完成一次初始化，以后持续复用。隐身模式按浏览器设计仍然不会继承普通窗口的网站 Cookie，因此即使浏览器设置、书签和代理实例来自同一托管 profile，网站仍可能要求重新登录。STK 只追加选中的代理参数，隐身启动时再追加浏览器的隐身参数；用户配置的 `args`、`normal-args` 和 `private-args` 保持不变。自定义浏览器和应用的 `proxy-args` 支持 `{proxy-url}`、`{proxy-scheme}`、`{proxy-host}`、`{proxy-port}`；浏览器还支持 `{profile-dir}`。图片不可用时，`icon` 和 `private-icon` 最多显示两个字符。
 

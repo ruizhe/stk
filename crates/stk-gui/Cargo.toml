@@ -4,7 +4,7 @@ description = "Desktop application for SSH Tunnel Keeper"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
-version = "0.1.15"
+version = "0.1.16"
 
 [features]
 default = []
@@ -19,6 +19,7 @@ image = { version = "0.25.10", default-features = false, features = ["png"], opt
 lucide-dioxus = { version = "3.26.0", features = ["arrows", "connectivity", "development", "files", "multimedia", "navigation", "notifications", "text", "time"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = "0.9.34"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tempfile = "3.23.0"
 time = { version = "0.3.53", features = ["formatting", "local-offset", "macros"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "signal", "sync", "time"] }
