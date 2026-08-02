@@ -335,6 +335,8 @@ launchers:
 
 内置 Chromium 和 Firefox 启动器默认使用长期保留的 STK 托管 profile，使进程级代理参数不受已经运行的系统浏览器影响。同一个启动器入口的普通模式和隐身模式共用这份托管 profile。macOS 默认目录是 `~/Library/Application Support/STK/browser-profiles`，Linux 是 `$XDG_DATA_HOME/stk/browser-profiles`（未配置时使用 `~/.local/share/stk/browser-profiles`），Windows 是 `%LOCALAPPDATA%\STK\browser-profiles`。目录按浏览器族和启动器 ID 隔离，例如内置 Chrome 使用 `chrome/default`，`chrome-production` 则使用 `chrome/chrome-production`。
 
+macOS 上，如果浏览器命令位于 `.app` bundle 内，STK 会通过 `NSWorkspace` 和 LaunchServices 打开它，并使用 `NSWorkspaceOpenConfiguration` 传入原有浏览器参数与解析后的环境变量。因此托管 profile、代理、隐身模式和用户自定义参数保持不变，同时不再直接执行其他应用包内部的 Mach-O 二进制。非 bundle 命令、需要工作目录的浏览器入口以及普通 application launcher 继续直接创建进程。
+
 “默认浏览器资料”模式适用于 Chromium 引擎，包括自动探测到的 Chrome、Edge、Brave、Chromium、Vivaldi 和 Opera。启动前 STK 会检查该浏览器是否已有使用默认资料的主进程；renderer/helper 子进程以及带显式 `--user-data-dir` 的 STK 托管进程不会被误判。如果默认资料正在使用，STK 会阻止本次启动并提醒先完整退出浏览器，否则 Chromium 可能把请求交给已有进程并忽略新传入的代理参数。使用此模式后，如需去掉代理，必须先完整退出浏览器，再通过系统启动器正常打开。Firefox 没有等价且可靠的“默认 profile + 仅命令行代理”方式，因此 Firefox 不显示该菜单项，STK 也不会修改用户的默认 Firefox profile。
 
 用户显式配置的 `profile-dir` 始终优先。需要让同一浏览器同时使用不同代理时，应配置不同的启动器入口，从而使用不同的 profile 目录。STK 不会复制或自动删除系统浏览器 profile；用户只需先在 STK 托管的普通模式中完成一次初始化，以后持续复用。隐身模式按浏览器设计仍然不会继承普通窗口的网站 Cookie，因此即使浏览器设置、书签和代理实例来自同一托管 profile，网站仍可能要求重新登录。STK 只追加选中的代理参数，隐身启动时再追加浏览器的隐身参数；用户配置的 `args`、`normal-args` 和 `private-args` 保持不变。自定义浏览器和应用的 `proxy-args` 支持 `{proxy-url}`、`{proxy-scheme}`、`{proxy-host}`、`{proxy-port}`；浏览器还支持 `{profile-dir}`。图片不可用时，`icon` 和 `private-icon` 最多显示两个字符。
@@ -618,7 +620,7 @@ macOS 主窗口显示时会出现在 Dock 和 Cmd+Tab；关闭窗口后切换为
 
 为控制移动设备功耗，session 管理循环每秒检查一次容量，扩容要求持续高水位且一次只增加一条，缩容使用较长空闲窗口。payload 活动只通过传输路径上已有的 relaxed atomic 记录，不增加定时器、轮询任务或文件/网络 watcher；有字节持续传输时跳过多余 ping，也会减少高负载下的探针开销。`min-sessions` 中的每条常驻连接仍需要 keepalive 和空闲时的质量探测，因此该值越大，基础网络活动和功耗也会相应增加。上述池管理逻辑位于跨平台 core，在 macOS、Linux 和 Windows 上一致。
 
-runtime 在 macOS、Linux 和 Windows 上订阅系统的接口和路由变化事件。系统明确离线时不会创建新的 SSH session task，也不会进行 replacement、扩容、定时轮转或远端 owner 恢复；自定义健康探针暂停失败累计，已有 TCP/SSH session 不会被 STK 主动关闭，因此短暂断网后仍存活的连接可以继续使用。系统恢复网络或从休眠中唤醒后，runtime 会先刷新网络状态并等待短暂的稳定窗口，再恢复所需容量和远端监听，避免唤醒时过期定时器集中建连。
+runtime 在 macOS、Linux 和 Windows 上订阅系统的接口和路由变化事件。系统明确离线时不会创建新的 SSH session task，也不会进行 replacement、扩容、定时轮转或远端 owner 恢复；自定义健康探针暂停失败累计，已有 TCP/SSH session 不会被 STK 主动关闭，因此短暂断网后仍存活的连接可以继续使用。休眠恢复通知按边沿事件处理，内容未变化的网络快照不会重复广播。系统恢复网络或从休眠中唤醒后，runtime 会先刷新网络状态并设置短暂的稳定 deadline；session 退出和新连接需求都不能提前取消这段等待，然后才恢复所需容量和远端监听，从而避免跨 host 的刷新放大和过期定时器集中建连。
 
 如果运行环境无法提供网络变化事件，只有本地监听的 host 在初始建连尝试结束后会进入按需模式：新的本地请求会实时刷新网络状态、唤醒 session manager，并在连接超时范围内等待健康 session。配置了 `-R` 远端转发或远端代理的 host 不能依赖本地请求唤醒，因此仍会每 30 秒低频刷新一次系统网络状态；只有状态不再明确离线时才按现有指数退避尝试 SSH 和远端注册。系统报告网络可用不代表目标 SSH 服务一定可达，服务端故障仍由原有建连退避处理。
 

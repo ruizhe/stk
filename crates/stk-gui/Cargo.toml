@@ -4,7 +4,7 @@ description = "Desktop application for SSH Tunnel Keeper"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
-version = "0.1.16"
+version = "0.1.17"
 
 [features]
 default = []
@@ -28,6 +28,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 stk-core = { path = "../stk-core" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
 dispatch2 = "0.3.1"
 objc2-app-kit = {
   version = "0.3.2",
@@ -41,9 +42,12 @@ objc2-app-kit = {
     "NSFontDescriptor",
     "NSParagraphStyle",
     "NSResponder",
+    "NSRunningApplication",
     "NSStatusBarButton",
     "NSStatusItem",
-    "NSView"
+    "NSView",
+    "NSWorkspace",
+    "block2"
   ]
 }
 objc2-foundation = {
@@ -52,8 +56,12 @@ objc2-foundation = {
   features = [
     "std",
     "NSAttributedString",
+    "NSArray",
+    "NSDictionary",
+    "NSError",
     "NSRange",
     "NSString",
+    "NSURL",
     "NSValue"
   ]
 }

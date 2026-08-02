@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::AbortHandle,
+    time::Instant,
 };
 use tracing::{debug, info, warn};
 
@@ -20,7 +21,7 @@ pub(crate) enum NetworkAvailability {
 pub(crate) struct ConnectivitySnapshot {
     pub(crate) availability: NetworkAvailability,
     pub(crate) events_available: bool,
-    pub(crate) resumed: bool,
+    pub(crate) resume_generation: u64,
     pub(crate) generation: u64,
 }
 
@@ -29,13 +30,17 @@ impl ConnectivitySnapshot {
         Self {
             availability: NetworkAvailability::Unknown,
             events_available: false,
-            resumed: false,
+            resume_generation: 0,
             generation: 0,
         }
     }
 
     pub(crate) fn is_offline(self) -> bool {
         self.availability == NetworkAvailability::Offline
+    }
+
+    pub(crate) fn resumed_since(self, previous: Self) -> bool {
+        self.resume_generation != previous.resume_generation
     }
 }
 
@@ -75,7 +80,7 @@ impl ConnectivityHandle {
         Self::fixed(ConnectivitySnapshot {
             availability: NetworkAvailability::Online,
             events_available: true,
-            resumed: false,
+            resume_generation: 0,
             generation: 1,
         })
     }
@@ -98,7 +103,7 @@ impl ConnectivityHandle {
         let snapshot = ConnectivitySnapshot {
             availability,
             events_available,
-            resumed: false,
+            resume_generation: 0,
             generation: 1,
         };
         let (sender, state) = watch::channel(snapshot);
@@ -134,7 +139,6 @@ impl ConnectivityTestController {
     pub(crate) fn set(&self, availability: NetworkAvailability) {
         self.sender.send_modify(|snapshot| {
             snapshot.availability = availability;
-            snapshot.resumed = false;
             snapshot.generation = snapshot.generation.wrapping_add(1);
         });
     }
@@ -153,16 +157,18 @@ impl ConnectivityMonitor {
         let task = match Monitor::new().await {
             Ok(monitor) => {
                 let mut source = monitor.interface_state();
-                publish_interface_state(&state_tx, &source.get(), true);
-                tokio::spawn(run_event_monitor(monitor, source, state_tx, command_rx))
+                let mut publisher = ConnectivityPublisher::new(state_tx);
+                publisher.publish_interface_state(&source.get(), true);
+                tokio::spawn(run_event_monitor(monitor, source, publisher, command_rx))
             }
             Err(error) => {
                 warn!(
                     ?error,
                     "network change events are unavailable; using on-demand snapshots"
                 );
-                publish_interface_state(&state_tx, &InterfaceState::new().await, false);
-                tokio::spawn(run_snapshot_monitor(state_tx, command_rx))
+                let mut publisher = ConnectivityPublisher::new(state_tx);
+                publisher.publish_interface_state(&InterfaceState::new().await, false);
+                tokio::spawn(run_snapshot_monitor(publisher, command_rx))
             }
         };
 
@@ -193,10 +199,76 @@ enum MonitorCommand {
     },
 }
 
+struct ConnectivityPublisher {
+    state_tx: watch::Sender<ConnectivitySnapshot>,
+    last_unsuspend: Option<Instant>,
+}
+
+impl ConnectivityPublisher {
+    fn new(state_tx: watch::Sender<ConnectivitySnapshot>) -> Self {
+        Self {
+            state_tx,
+            last_unsuspend: None,
+        }
+    }
+
+    fn current(&self) -> ConnectivitySnapshot {
+        *self.state_tx.borrow()
+    }
+
+    fn publish_interface_state(&mut self, state: &InterfaceState, events_available: bool) -> bool {
+        self.publish_snapshot(
+            interface_availability(state),
+            events_available,
+            state.last_unsuspend,
+        )
+    }
+
+    fn publish_events_unavailable(&mut self) -> bool {
+        self.publish_snapshot(self.current().availability, false, None)
+    }
+
+    fn publish_snapshot(
+        &mut self,
+        availability: NetworkAvailability,
+        events_available: bool,
+        last_unsuspend: Option<Instant>,
+    ) -> bool {
+        let previous = self.current();
+        let resumed = last_unsuspend.is_some_and(|current| {
+            self.last_unsuspend
+                .is_none_or(|last_seen| current > last_seen)
+        });
+        if resumed {
+            self.last_unsuspend = last_unsuspend;
+        }
+        let resume_generation = if resumed {
+            previous.resume_generation.wrapping_add(1)
+        } else {
+            previous.resume_generation
+        };
+        if previous.availability == availability
+            && previous.events_available == events_available
+            && previous.resume_generation == resume_generation
+        {
+            return false;
+        }
+        let snapshot = ConnectivitySnapshot {
+            availability,
+            events_available,
+            resume_generation,
+            generation: previous.generation.wrapping_add(1),
+        };
+        self.state_tx.send_replace(snapshot);
+        log_connectivity_change(previous, snapshot, resumed);
+        true
+    }
+}
+
 async fn run_event_monitor(
     _monitor: Monitor,
     mut source: n0_watcher::Direct<InterfaceState>,
-    state_tx: watch::Sender<ConnectivitySnapshot>,
+    mut publisher: ConnectivityPublisher,
     mut command_rx: mpsc::Receiver<MonitorCommand>,
 ) {
     let mut events_active = true;
@@ -204,10 +276,12 @@ async fn run_event_monitor(
         tokio::select! {
             update = source.updated(), if events_active => {
                 match update {
-                    Ok(state) => publish_interface_state(&state_tx, &state, true),
+                    Ok(state) => {
+                        publisher.publish_interface_state(&state, true);
+                    }
                     Err(_) => {
                         events_active = false;
-                        publish_events_unavailable(&state_tx);
+                        publisher.publish_events_unavailable();
                         warn!("network change event stream stopped; using on-demand snapshots");
                     }
                 }
@@ -216,59 +290,32 @@ async fn run_event_monitor(
                 let Some(command) = command else {
                     break;
                 };
-                handle_monitor_command(command, &state_tx, events_active).await;
+                handle_monitor_command(command, &mut publisher, events_active).await;
             }
         }
     }
 }
 
 async fn run_snapshot_monitor(
-    state_tx: watch::Sender<ConnectivitySnapshot>,
+    mut publisher: ConnectivityPublisher,
     mut command_rx: mpsc::Receiver<MonitorCommand>,
 ) {
     while let Some(command) = command_rx.recv().await {
-        handle_monitor_command(command, &state_tx, false).await;
+        handle_monitor_command(command, &mut publisher, false).await;
     }
 }
 
 async fn handle_monitor_command(
     command: MonitorCommand,
-    state_tx: &watch::Sender<ConnectivitySnapshot>,
+    publisher: &mut ConnectivityPublisher,
     events_available: bool,
 ) {
     match command {
         MonitorCommand::Refresh { reply } => {
-            publish_interface_state(state_tx, &InterfaceState::new().await, events_available);
-            let _ = reply.send(*state_tx.borrow());
+            publisher.publish_interface_state(&InterfaceState::new().await, events_available);
+            let _ = reply.send(publisher.current());
         }
     }
-}
-
-fn publish_events_unavailable(state_tx: &watch::Sender<ConnectivitySnapshot>) {
-    let previous = *state_tx.borrow();
-    state_tx.send_modify(|snapshot| {
-        snapshot.events_available = false;
-        snapshot.resumed = false;
-        snapshot.generation = snapshot.generation.wrapping_add(1);
-    });
-    log_connectivity_change(previous, *state_tx.borrow());
-}
-
-fn publish_interface_state(
-    state_tx: &watch::Sender<ConnectivitySnapshot>,
-    state: &InterfaceState,
-    events_available: bool,
-) {
-    let previous = *state_tx.borrow();
-    let availability = interface_availability(state);
-    let snapshot = ConnectivitySnapshot {
-        availability,
-        events_available,
-        resumed: state.last_unsuspend.is_some(),
-        generation: previous.generation.wrapping_add(1),
-    };
-    state_tx.send_replace(snapshot);
-    log_connectivity_change(previous, snapshot);
 }
 
 fn interface_availability(state: &InterfaceState) -> NetworkAvailability {
@@ -281,7 +328,11 @@ fn interface_availability(state: &InterfaceState) -> NetworkAvailability {
     }
 }
 
-fn log_connectivity_change(previous: ConnectivitySnapshot, current: ConnectivitySnapshot) {
+fn log_connectivity_change(
+    previous: ConnectivitySnapshot,
+    current: ConnectivitySnapshot,
+    resumed: bool,
+) {
     if previous.availability != current.availability {
         match current.availability {
             NetworkAvailability::Online => info!("system network path is available"),
@@ -293,7 +344,7 @@ fn log_connectivity_change(previous: ConnectivitySnapshot, current: Connectivity
     } else {
         debug!(
             availability = ?current.availability,
-            resumed = current.resumed,
+            resumed,
             events_available = current.events_available,
             "system network state refreshed"
         );
@@ -320,5 +371,46 @@ mod tests {
         let current = handle.current();
         assert_eq!(current.availability, NetworkAvailability::Online);
         assert!(current.generation > initial.generation);
+    }
+
+    #[test]
+    fn duplicate_network_snapshots_are_not_rebroadcast() {
+        let (state_tx, mut state_rx) = watch::channel(ConnectivitySnapshot::initial());
+        let mut publisher = ConnectivityPublisher::new(state_tx);
+
+        assert!(publisher.publish_snapshot(NetworkAvailability::Online, true, None));
+        state_rx.borrow_and_update();
+        let published = publisher.current();
+
+        assert!(!publisher.publish_snapshot(NetworkAvailability::Online, true, None));
+        assert_eq!(publisher.current(), published);
+        assert!(!state_rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn unsuspend_timestamp_is_published_once_as_an_event_generation() {
+        let (state_tx, mut state_rx) = watch::channel(ConnectivitySnapshot::initial());
+        let mut publisher = ConnectivityPublisher::new(state_tx);
+        let first_resume = Instant::now();
+
+        assert!(publisher.publish_snapshot(NetworkAvailability::Online, true, Some(first_resume),));
+        state_rx.borrow_and_update();
+        let first = publisher.current();
+        assert_eq!(first.resume_generation, 1);
+
+        assert!(
+            !publisher.publish_snapshot(NetworkAvailability::Online, true, Some(first_resume),)
+        );
+        assert!(!publisher.publish_snapshot(NetworkAvailability::Online, true, None));
+        assert!(!state_rx.has_changed().unwrap());
+
+        assert!(publisher.publish_snapshot(
+            NetworkAvailability::Online,
+            true,
+            Some(first_resume + std::time::Duration::from_secs(1)),
+        ));
+        let second = publisher.current();
+        assert_eq!(second.resume_generation, 2);
+        assert!(second.resumed_since(first));
     }
 }

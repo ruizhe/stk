@@ -19,6 +19,15 @@ use stk_core::{
 };
 use sysinfo::System;
 
+#[cfg(target_os = "macos")]
+use block2::RcBlock;
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration};
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSArray, NSDictionary, NSError, NSString, NSURL};
+#[cfg(target_os = "macos")]
+use std::sync::mpsc;
+
 const PROXY_ENVIRONMENT_NAMES: [&str; 12] = [
     "ALL_PROXY",
     "all_proxy",
@@ -265,6 +274,7 @@ impl LauncherItem {
             working_directory: self.working_directory.as_deref().map(expand_path),
             environment_set,
             environment_remove,
+            launch_as_browser_application: self.is_browser(),
         })
     }
 
@@ -378,10 +388,27 @@ struct LaunchPlan {
     working_directory: Option<PathBuf>,
     environment_set: BTreeMap<String, String>,
     environment_remove: Vec<String>,
+    launch_as_browser_application: bool,
 }
 
 impl LaunchPlan {
     fn spawn(self) -> anyhow::Result<()> {
+        #[cfg(target_os = "macos")]
+        match self.macos_application_launch_request() {
+            Ok(Some(request)) => return request.spawn(),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    command = %self.command.display(),
+                    "browser launch is not representable by LaunchServices; using direct execution"
+                );
+            }
+        }
+        self.spawn_direct()
+    }
+
+    fn spawn_direct(self) -> anyhow::Result<()> {
         let mut command = Command::new(&self.command);
         command
             .args(&self.args)
@@ -414,6 +441,184 @@ impl LaunchPlan {
         }
         Ok(())
     }
+
+    fn macos_application_launch_request(
+        &self,
+    ) -> anyhow::Result<Option<MacosApplicationLaunchRequest>> {
+        if !self.launch_as_browser_application || self.working_directory.is_some() {
+            return Ok(None);
+        }
+        let Some(application_bundle) = macos_application_bundle_path(&self.command) else {
+            return Ok(None);
+        };
+        let arguments = self
+            .args
+            .iter()
+            .map(|argument| {
+                argument.to_str().map(str::to_string).with_context(|| {
+                    format!(
+                        "launcher argument for {} is not valid UTF-8",
+                        self.command.display()
+                    )
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let environment = resolved_launch_environment(
+            &self.environment_set,
+            &self.environment_remove,
+            &self.command,
+        )?;
+        Ok(Some(MacosApplicationLaunchRequest {
+            application_bundle,
+            arguments,
+            environment,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MacosApplicationLaunchRequest {
+    application_bundle: PathBuf,
+    arguments: Vec<String>,
+    environment: BTreeMap<String, String>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosApplicationLaunchRequest {
+    fn spawn(self) -> anyhow::Result<()> {
+        let application_path = self
+            .application_bundle
+            .to_str()
+            .with_context(|| {
+                format!(
+                    "macOS application path is not valid UTF-8: {}",
+                    self.application_bundle.display()
+                )
+            })?
+            .to_string();
+
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        let application_name = self.application_bundle.display().to_string();
+        let completion_application_name = application_name.clone();
+        dispatch2::DispatchQueue::main().exec_async(move || {
+            let application_url =
+                NSURL::fileURLWithPath_isDirectory(&NSString::from_str(&application_path), true);
+            let configuration = NSWorkspaceOpenConfiguration::configuration();
+            configuration.setCreatesNewApplicationInstance(true);
+            configuration.setAllowsRunningApplicationSubstitution(false);
+            configuration.setAddsToRecentItems(false);
+
+            let arguments = self
+                .arguments
+                .iter()
+                .map(|argument| NSString::from_str(argument))
+                .collect::<Vec<_>>();
+            configuration.setArguments(&NSArray::from_retained_slice(&arguments));
+
+            let environment_keys = self
+                .environment
+                .keys()
+                .map(|name| NSString::from_str(name))
+                .collect::<Vec<_>>();
+            let environment_values = self
+                .environment
+                .values()
+                .map(|value| NSString::from_str(value))
+                .collect::<Vec<_>>();
+            let environment_key_refs = environment_keys
+                .iter()
+                .map(|value| &**value)
+                .collect::<Vec<_>>();
+            let environment_value_refs = environment_values
+                .iter()
+                .map(|value| &**value)
+                .collect::<Vec<_>>();
+            let environment =
+                NSDictionary::from_slices(&environment_key_refs, &environment_value_refs);
+            configuration.setEnvironment(&environment);
+
+            let completion: RcBlock<dyn Fn(*mut NSRunningApplication, *mut NSError)> = RcBlock::new(
+                move |application: *mut NSRunningApplication, error: *mut NSError| {
+                    let result = if let Some(error) = unsafe { error.as_ref() } {
+                        Err(error.localizedDescription().to_string())
+                    } else if application.is_null() {
+                        Err(
+                            "LaunchServices returned neither an application nor an error"
+                                .to_string(),
+                        )
+                    } else {
+                        Ok(())
+                    };
+                    if completion_tx.send(result).is_err() {
+                        tracing::debug!(
+                            application = %completion_application_name,
+                            "LaunchServices completion arrived after the launcher stopped waiting"
+                        );
+                    }
+                },
+            );
+            NSWorkspace::sharedWorkspace().openApplicationAtURL_configuration_completionHandler(
+                &application_url,
+                &configuration,
+                Some(&completion),
+            );
+        });
+        match completion_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => bail!("LaunchServices failed to open {application_name}: {error}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                bail!("timed out waiting for LaunchServices to open {application_name}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("LaunchServices completion channel closed while opening {application_name}")
+            }
+        }
+    }
+}
+
+fn macos_application_bundle_path(command: &Path) -> Option<PathBuf> {
+    let expanded = command
+        .to_str()
+        .map(expand_path)
+        .unwrap_or_else(|| command.to_path_buf());
+    expanded
+        .ancestors()
+        .find(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+        })
+        .map(Path::to_path_buf)
+}
+
+fn resolved_launch_environment(
+    environment_set: &BTreeMap<String, String>,
+    environment_remove: &[String],
+    command: &Path,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut environment = env::vars_os().collect::<BTreeMap<OsString, OsString>>();
+    for name in environment_remove {
+        environment.remove(OsStr::new(name));
+    }
+    for (name, value) in environment_set {
+        environment.insert(OsString::from(name), OsString::from(value));
+    }
+    environment
+        .into_iter()
+        .map(|(name, value)| {
+            let name = name.into_string().map_err(|name| {
+                anyhow::anyhow!(
+                    "environment name {:?} for {} is not valid UTF-8",
+                    name,
+                    command.display()
+                )
+            })?;
+            let value = value.into_string().map_err(|value| {
+                anyhow::anyhow!("environment value for {name} ({value:?}) is not valid UTF-8")
+            })?;
+            Ok((name, value))
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -1505,11 +1710,7 @@ fn system_application_icon(_command: &Path) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn macos_bundle_icon_path(command: &Path) -> Option<PathBuf> {
-    let bundle = command.ancestors().find(|path| {
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
-    })?;
+    let bundle = macos_application_bundle_path(command)?;
     let bundle_name = bundle
         .file_stem()
         .and_then(|name| name.to_str())
@@ -1866,6 +2067,32 @@ hosts:
     }
 
     #[test]
+    fn macos_application_bundle_is_resolved_from_browser_executable_paths() {
+        assert_eq!(
+            macos_application_bundle_path(Path::new(
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            )),
+            Some(PathBuf::from("/Applications/Google Chrome.app"))
+        );
+        assert_eq!(
+            macos_application_bundle_path(Path::new(
+                "/Applications/A Browser With Spaces.app/Contents/MacOS/A Browser With Spaces"
+            )),
+            Some(PathBuf::from("/Applications/A Browser With Spaces.app"))
+        );
+        assert_eq!(
+            macos_application_bundle_path(Path::new(
+                "~/Applications/Test Browser.app/Contents/MacOS/Test Browser"
+            )),
+            Some(user_home_directory().join("Applications/Test Browser.app"))
+        );
+        assert_eq!(
+            macos_application_bundle_path(Path::new("/usr/local/bin/custom-browser")),
+            None
+        );
+    }
+
+    #[test]
     fn detected_browser_uses_managed_profile_unless_user_overrides_it() {
         let command = env::current_exe().unwrap();
         let detected = DetectedBrowser {
@@ -2016,6 +2243,77 @@ hosts:
         ))));
         assert!(private_plan.args.contains(&OsString::from("--incognito")));
         assert!(profile_dir.is_dir());
+    }
+
+    #[test]
+    fn launch_services_request_preserves_browser_arguments_and_environment() {
+        let config = launcher_test_config();
+        let proxy = resolve_launcher_proxy(&config, Some("web")).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let profile_dir = directory.path().join("Profile With Spaces");
+        let mut item = test_browser_item(
+            BrowserEngine::Chromium,
+            Some(profile_dir.to_string_lossy().into_owned()),
+        );
+        item.command =
+            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+
+        let plan = item.build_launch_plan(LaunchMode::Private, &proxy).unwrap();
+        let request = plan
+            .macos_application_launch_request()
+            .unwrap()
+            .expect("browser application should use LaunchServices");
+
+        assert_eq!(
+            request.application_bundle,
+            PathBuf::from("/Applications/Google Chrome.app")
+        );
+        assert_eq!(
+            request.arguments,
+            [
+                "--user-argument".to_string(),
+                format!("--user-data-dir={}", profile_dir.display()),
+                "--proxy-server=http://127.0.0.1:7890".to_string(),
+                "--incognito".to_string(),
+                "--private-argument".to_string(),
+            ]
+        );
+        assert_eq!(
+            request.environment.get("HTTP_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(
+            request
+                .environment
+                .get("STK_PROXY_HOST")
+                .map(String::as_str),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn launch_services_falls_back_for_working_directories_and_application_launchers() {
+        let mut browser = test_browser_item(BrowserEngine::Chromium, None)
+            .build_launch_plan(LaunchMode::Normal, &LauncherProxyPlan::Inherit)
+            .unwrap();
+        browser.command =
+            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        browser.working_directory = Some(PathBuf::from("/tmp"));
+        assert!(
+            browser
+                .macos_application_launch_request()
+                .unwrap()
+                .is_none()
+        );
+
+        browser.working_directory = None;
+        browser.launch_as_browser_application = false;
+        assert!(
+            browser
+                .macos_application_launch_request()
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

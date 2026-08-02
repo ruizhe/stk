@@ -158,6 +158,26 @@ fn new_delayed_session_manager_ticker(period: Duration) -> tokio::time::Interval
     ticker
 }
 
+fn new_session_manager_ticker_not_before(
+    period: Duration,
+    not_before: Option<Instant>,
+) -> tokio::time::Interval {
+    let delay = session_manager_ticker_delay(not_before, Instant::now());
+    if delay.is_zero() {
+        new_session_manager_ticker(period)
+    } else {
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + delay, period);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ticker
+    }
+}
+
+fn session_manager_ticker_delay(not_before: Option<Instant>, now: Instant) -> Duration {
+    not_before
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .unwrap_or_default()
+}
+
 fn session_pool_is_under_pressure(
     in_flight: usize,
     healthy_sessions: usize,
@@ -1301,6 +1321,7 @@ async fn manage_ssh_sessions(
     let mut demand_pending = false;
     let mut startup_spawn_budget = pool.min_sessions_per_host;
     let mut tasks = JoinSet::new();
+    let mut resume_settle_until = None;
     let mut ticker = new_session_manager_ticker(session_manager_tick_interval(
         connectivity_snapshot,
         requires_remote_availability,
@@ -1341,14 +1362,16 @@ async fn manage_ssh_sessions(
     loop {
         tokio::select! {
             changed = connectivity_rx.changed(), if connectivity_events_open => {
+                let mut resumed = false;
                 if changed.is_err() {
                     connectivity_events_open = false;
                     connectivity_snapshot = connectivity.current();
                 } else {
                     let previous = connectivity_snapshot;
                     connectivity_snapshot = *connectivity_rx.borrow_and_update();
+                    resumed = connectivity_snapshot.resumed_since(previous);
                     if (previous.is_offline() && !connectivity_snapshot.is_offline())
-                        || connectivity_snapshot.resumed
+                        || resumed
                     {
                         backoff = initial_backoff;
                         next_spawn_at = Instant::now();
@@ -1362,11 +1385,18 @@ async fn manage_ssh_sessions(
                         demand_pending,
                         startup_spawn_budget,
                     );
-                ticker = new_session_manager_ticker(session_manager_tick_interval(
-                    connectivity_snapshot,
-                    requires_remote_availability,
-                    background_work_enabled,
-                ));
+                if resumed {
+                    last_manager_tick = Instant::now();
+                    resume_settle_until = Some(Instant::now() + RESUME_SETTLE_INTERVAL);
+                }
+                ticker = new_session_manager_ticker_not_before(
+                    session_manager_tick_interval(
+                        connectivity_snapshot,
+                        requires_remote_availability,
+                        background_work_enabled,
+                    ),
+                    resume_settle_until,
+                );
             }
             _ = node.connect_demand.notified() => {
                 demand_pending = true;
@@ -1385,11 +1415,14 @@ async fn manage_ssh_sessions(
                     backoff = initial_backoff;
                     next_spawn_at = Instant::now();
                 }
-                ticker = new_session_manager_ticker(session_manager_tick_interval(
-                    connectivity_snapshot,
-                    requires_remote_availability,
-                    true,
-                ));
+                ticker = new_session_manager_ticker_not_before(
+                    session_manager_tick_interval(
+                        connectivity_snapshot,
+                        requires_remote_availability,
+                        true,
+                    ),
+                    resume_settle_until,
+                );
             }
             joined = tasks.join_next(), if !tasks.is_empty() => {
                 match joined {
@@ -1457,11 +1490,14 @@ async fn manage_ssh_sessions(
                         demand_pending,
                         startup_spawn_budget,
                     );
-                ticker = new_session_manager_ticker(session_manager_tick_interval(
-                    connectivity_snapshot,
-                    requires_remote_availability,
-                    background_work_enabled,
-                ));
+                ticker = new_session_manager_ticker_not_before(
+                    session_manager_tick_interval(
+                        connectivity_snapshot,
+                        requires_remote_availability,
+                        background_work_enabled,
+                    ),
+                    resume_settle_until,
+                );
             }
             _ = ticker.tick() => {
                 let tick_started = Instant::now();
@@ -1478,10 +1514,21 @@ async fn manage_ssh_sessions(
                         >= SUSPECTED_SUSPEND_GAP;
                 last_manager_tick = tick_started;
                 connectivity_snapshot = connectivity.current();
-                if resumed_after_gap || connectivity_snapshot.resumed {
+                if resumed_after_gap {
                     connectivity_snapshot = connectivity.refresh().await;
-                    ticker = new_delayed_session_manager_ticker(RESUME_SETTLE_INTERVAL);
+                    resume_settle_until = Some(Instant::now() + RESUME_SETTLE_INTERVAL);
+                    ticker = new_session_manager_ticker_not_before(
+                        session_manager_tick_interval(
+                            connectivity_snapshot,
+                            requires_remote_availability,
+                            active_maintenance,
+                        ),
+                        resume_settle_until,
+                    );
                     continue;
+                }
+                if resume_settle_until.is_some_and(|deadline| tick_started >= deadline) {
+                    resume_settle_until = None;
                 }
                 if connectivity_snapshot.is_offline() {
                     if requires_remote_availability {
@@ -3321,11 +3368,30 @@ mod tests {
     }
 
     #[test]
+    fn resume_settle_deadline_survives_intermediate_manager_events() {
+        let now = Instant::now();
+        let deadline = now + RESUME_SETTLE_INTERVAL;
+
+        assert_eq!(
+            session_manager_ticker_delay(Some(deadline), now),
+            RESUME_SETTLE_INTERVAL
+        );
+        assert_eq!(
+            session_manager_ticker_delay(Some(deadline), now + RESUME_SETTLE_INTERVAL / 2),
+            RESUME_SETTLE_INTERVAL / 2
+        );
+        assert_eq!(
+            session_manager_ticker_delay(Some(deadline), deadline),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
     fn connectivity_policy_blocks_offline_spawns_and_preserves_remote_recovery() {
         let snapshot = |availability, events_available| ConnectivitySnapshot {
             availability,
             events_available,
-            resumed: false,
+            resume_generation: 0,
             generation: 1,
         };
         assert!(!session_spawn_authorized(
