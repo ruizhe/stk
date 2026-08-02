@@ -32,10 +32,10 @@ use std::{
     pin::Pin,
     process::Stdio,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
-    task::{Context as TaskContext, Poll},
+    task::{Context as TaskContext, Poll, Waker},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -240,6 +240,253 @@ trait SshTransport: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> SshTransport for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 type BoxedSshTransport = Box<dyn SshTransport>;
+
+// russh starts its session task before connect_stream returns a Handle. If the
+// caller cancels a stalled key exchange, dropping that future alone cannot stop
+// the already-spawned task. Keep the transport externally abortable until both
+// key exchange and authentication have completed.
+const SSH_HANDSHAKE_ABORT_ARMED: u8 = 0;
+const SSH_HANDSHAKE_ABORTED: u8 = 1;
+const SSH_HANDSHAKE_ABORT_DISARMED: u8 = 2;
+
+struct SshHandshakeAbortState {
+    status: AtomicU8,
+    read_waker: Mutex<Option<Waker>>,
+    write_waker: Mutex<Option<Waker>>,
+}
+
+impl SshHandshakeAbortState {
+    fn new() -> Self {
+        Self {
+            status: AtomicU8::new(SSH_HANDSHAKE_ABORT_ARMED),
+            read_waker: Mutex::new(None),
+            write_waker: Mutex::new(None),
+        }
+    }
+
+    fn status(&self) -> u8 {
+        self.status.load(Ordering::Acquire)
+    }
+
+    fn register(&self, slot: &Mutex<Option<Waker>>, waker: &Waker) -> u8 {
+        let status = self.status();
+        if status != SSH_HANDSHAKE_ABORT_ARMED {
+            return status;
+        }
+        let mut slot = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let status = self.status();
+        if status == SSH_HANDSHAKE_ABORT_ARMED
+            && slot
+                .as_ref()
+                .is_none_or(|registered| !registered.will_wake(waker))
+        {
+            *slot = Some(waker.clone());
+        }
+        status
+    }
+
+    fn register_read(&self, waker: &Waker) -> u8 {
+        self.register(&self.read_waker, waker)
+    }
+
+    fn register_write(&self, waker: &Waker) -> u8 {
+        self.register(&self.write_waker, waker)
+    }
+
+    fn clear(slot: &Mutex<Option<Waker>>) {
+        slot.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
+    fn clear_read(&self) {
+        Self::clear(&self.read_waker);
+    }
+
+    fn clear_write(&self) {
+        Self::clear(&self.write_waker);
+    }
+
+    fn clear_all(&self) {
+        self.clear_read();
+        self.clear_write();
+    }
+
+    fn abort(&self) {
+        if self
+            .status
+            .compare_exchange(
+                SSH_HANDSHAKE_ABORT_ARMED,
+                SSH_HANDSHAKE_ABORTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let read_waker = self
+            .read_waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let write_waker = self
+            .write_waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(waker) = read_waker {
+            waker.wake();
+        }
+        if let Some(waker) = write_waker {
+            waker.wake();
+        }
+    }
+
+    fn disarm(&self) {
+        if self
+            .status
+            .compare_exchange(
+                SSH_HANDSHAKE_ABORT_ARMED,
+                SSH_HANDSHAKE_ABORT_DISARMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.clear_all();
+        }
+    }
+}
+
+struct SshHandshakeAbortGuard {
+    state: Arc<SshHandshakeAbortState>,
+}
+
+impl SshHandshakeAbortGuard {
+    fn disarm(self) {
+        self.state.disarm();
+    }
+}
+
+impl Drop for SshHandshakeAbortGuard {
+    fn drop(&mut self) {
+        self.state.abort();
+    }
+}
+
+struct SshHandshakeTransport {
+    inner: BoxedSshTransport,
+    abort: Arc<SshHandshakeAbortState>,
+}
+
+impl SshHandshakeTransport {
+    fn aborted_error() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "SSH handshake was cancelled",
+        )
+    }
+}
+
+impl AsyncRead for SshHandshakeTransport {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.abort.status() {
+            SSH_HANDSHAKE_ABORTED => return Poll::Ready(Err(Self::aborted_error())),
+            SSH_HANDSHAKE_ABORT_DISARMED => {
+                return Pin::new(&mut self.inner).poll_read(context, buffer);
+            }
+            SSH_HANDSHAKE_ABORT_ARMED => {}
+            _ => unreachable!("invalid SSH handshake abort state"),
+        }
+        match Pin::new(&mut self.inner).poll_read(context, buffer) {
+            Poll::Pending => match self.abort.register_read(context.waker()) {
+                SSH_HANDSHAKE_ABORTED => Poll::Ready(Err(Self::aborted_error())),
+                SSH_HANDSHAKE_ABORT_ARMED | SSH_HANDSHAKE_ABORT_DISARMED => Poll::Pending,
+                _ => unreachable!("invalid SSH handshake abort state"),
+            },
+            ready => {
+                self.abort.clear_read();
+                ready
+            }
+        }
+    }
+}
+
+impl AsyncWrite for SshHandshakeTransport {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.poll_write_operation(context, |inner, context| {
+            Pin::new(inner).poll_write(context, buffer)
+        })
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.poll_write_operation(context, |inner, context| {
+            Pin::new(inner).poll_flush(context)
+        })
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.poll_write_operation(context, |inner, context| {
+            Pin::new(inner).poll_shutdown(context)
+        })
+    }
+}
+
+impl SshHandshakeTransport {
+    fn poll_write_operation<T>(
+        &mut self,
+        context: &mut TaskContext<'_>,
+        operation: impl FnOnce(&mut BoxedSshTransport, &mut TaskContext<'_>) -> Poll<std::io::Result<T>>,
+    ) -> Poll<std::io::Result<T>> {
+        match self.abort.status() {
+            SSH_HANDSHAKE_ABORTED => return Poll::Ready(Err(Self::aborted_error())),
+            SSH_HANDSHAKE_ABORT_DISARMED => return operation(&mut self.inner, context),
+            SSH_HANDSHAKE_ABORT_ARMED => {}
+            _ => unreachable!("invalid SSH handshake abort state"),
+        }
+        match operation(&mut self.inner, context) {
+            Poll::Pending => match self.abort.register_write(context.waker()) {
+                SSH_HANDSHAKE_ABORTED => Poll::Ready(Err(Self::aborted_error())),
+                SSH_HANDSHAKE_ABORT_ARMED | SSH_HANDSHAKE_ABORT_DISARMED => Poll::Pending,
+                _ => unreachable!("invalid SSH handshake abort state"),
+            },
+            ready => {
+                self.abort.clear_write();
+                ready
+            }
+        }
+    }
+}
+
+fn guard_ssh_handshake_transport(
+    transport: BoxedSshTransport,
+) -> (BoxedSshTransport, SshHandshakeAbortGuard) {
+    let state = Arc::new(SshHandshakeAbortState::new());
+    (
+        Box::new(SshHandshakeTransport {
+            inner: transport,
+            abort: Arc::clone(&state),
+        }),
+        SshHandshakeAbortGuard { state },
+    )
+}
 
 #[derive(Debug, Clone)]
 struct SshNodeState {
@@ -2165,6 +2412,7 @@ async fn connect_ssh_endpoint(
     in_flight: Arc<AtomicUsize>,
     payload_generation: Arc<AtomicU64>,
 ) -> anyhow::Result<(Arc<NativeSshHandle>, mpsc::UnboundedReceiver<String>)> {
+    let (transport, handshake_abort) = guard_ssh_handshake_transport(transport);
     let config = Arc::new(client::Config {
         nodelay: true,
         keepalive_interval: Some(endpoint.keep_alive),
@@ -2202,6 +2450,7 @@ async fn connect_ssh_endpoint(
     )
     .await
     .with_context(|| format!("timed out authenticating SSH host {}", endpoint.alias))??;
+    handshake_abort.disarm();
     Ok((Arc::new(handle), disconnect_rx))
 }
 
@@ -3318,6 +3567,64 @@ mod tests {
     use tokio::net::TcpStream;
 
     static NEXT_TEST_KEY_ID: AtomicU64 = AtomicU64::new(1);
+
+    struct StalledHandshakeClient;
+
+    impl client::Handler for StalledHandshakeClient {
+        type Error = anyhow::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &russh::keys::ssh_key::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    async fn start_stalled_ssh_handshake_server()
+    -> (SocketAddr, tokio::task::JoinHandle<std::io::Result<()>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            stream.write_all(b"SSH-2.0-stalled-test\r\n").await?;
+            let mut buffer = [0_u8; 4096];
+            loop {
+                if stream.read(&mut buffer).await? == 0 {
+                    return Ok(());
+                }
+            }
+        });
+        (address, task)
+    }
+
+    #[tokio::test]
+    async fn cancelled_ssh_handshake_closes_spawned_russh_transport() {
+        let (address, server_task) = start_stalled_ssh_handshake_server().await;
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (transport, handshake_abort) = guard_ssh_handshake_transport(Box::new(stream));
+        let config = Arc::new(client::Config {
+            keepalive_interval: Some(Duration::from_millis(10)),
+            ..Default::default()
+        });
+
+        let result = timeout(
+            Duration::from_millis(100),
+            client::connect_stream(config, transport, StalledHandshakeClient),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the deliberately stalled KEX must time out"
+        );
+        drop(handshake_abort);
+
+        timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("cancelled SSH handshake left its TCP transport open")
+            .unwrap()
+            .unwrap();
+    }
 
     fn detached_session(
         id: u64,
