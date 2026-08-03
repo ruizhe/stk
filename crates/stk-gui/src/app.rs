@@ -3,8 +3,8 @@ use dioxus::desktop::{use_tray_menu_event_handler, use_window};
 use dioxus::prelude::*;
 use lucide_dioxus::{
     Activity, ArrowDown, ArrowUp, ChevronDown, CircleAlert, CircleCheck, CircleDot, Clock,
-    FileText, Languages, Network, RefreshCw, Router, Save, ScrollText, Search, Server, Square,
-    Trash2, Unplug,
+    Ellipsis, FileText, Info, Languages, LogOut, Network, RefreshCw, Router, Save, ScrollText,
+    Search, Server, Square, Trash2, Unplug,
 };
 use std::{
     collections::VecDeque,
@@ -416,14 +416,12 @@ fn AppContent() -> Element {
     });
     let window = use_window();
     let window_for_menu = window.clone();
+    let window_for_app_menu = window.clone();
     let _tray_menu_handler =
         use_tray_menu_event_handler(move |event| match event.id().0.as_str() {
-            super::TRAY_SHOW_ID => {
-                super::activate_macos_application();
-                window_for_menu.window.set_visible(true);
-                window_for_menu.window.set_focus();
-            }
+            super::TRAY_SHOW_ID => super::show_main_window(&window_for_menu),
             super::TRAY_RELOAD_ID => super::request_gui_reload(),
+            super::TRAY_QUIT_ID => super::quit_application(&window_for_menu),
             _ => {}
         });
 
@@ -628,6 +626,42 @@ fn AppContent() -> Element {
                             aria_label: tr(language, "Reload configuration", "重新加载配置"),
                             onclick: move |_| super::request_gui_reload(),
                             RefreshCw { size: 17 }
+                        }
+                        details { class: "app-menu",
+                            summary {
+                                class: "icon-button app-menu-trigger",
+                                title: tr(language, "Application menu", "应用菜单"),
+                                aria_label: tr(language, "Application menu", "应用菜单"),
+                                Ellipsis { size: 17 }
+                            }
+                            div { class: "app-menu-popover", role: "menu",
+                                div { class: "app-menu-heading",
+                                    Info { size: 16 }
+                                    div {
+                                        strong { "SSH Tunnel Keeper" }
+                                        span { {tr(language, "Application information", "应用信息")} }
+                                    }
+                                }
+                                dl { class: "app-build-info",
+                                    div {
+                                        dt { {tr(language, "Version", "版本号")} }
+                                        dd { "v{super::APP_VERSION}" }
+                                    }
+                                    div {
+                                        dt { {tr(language, "Git commit", "Git commit")} }
+                                        dd { title: "{super::GIT_COMMIT}", "{super::GIT_COMMIT}" }
+                                    }
+                                }
+                                div { class: "app-menu-separator" }
+                                button {
+                                    class: "app-menu-item danger",
+                                    r#type: "button",
+                                    role: "menuitem",
+                                    onclick: move |_| super::quit_application(&window_for_app_menu),
+                                    LogOut { size: 16 }
+                                    span { {tr(language, "Quit SSH Tunnel Keeper", "退出 SSH Tunnel Keeper")} }
+                                }
+                            }
                         }
                     }
                 }

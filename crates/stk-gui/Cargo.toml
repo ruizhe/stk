@@ -8,7 +8,7 @@ version = "0.1.18"
 
 [features]
 default = []
-desktop = ["dep:dioxus", "dep:image"]
+desktop = ["dep:dioxus", "dep:gtk", "dep:image"]
 
 [dependencies]
 anyhow = "1.0.103"
@@ -65,6 +65,9 @@ objc2-foundation = {
     "NSValue"
   ]
 }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18.2", optional = true }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1.23"

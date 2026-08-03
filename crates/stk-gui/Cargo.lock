@@ -6028,6 +6028,7 @@ dependencies = [
  "clap",
  "dioxus",
  "dispatch2",
+ "gtk",
  "image",
  "lucide-dioxus",
  "objc2-app-kit",

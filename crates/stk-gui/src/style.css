@@ -343,6 +343,128 @@ textarea:focus-visible {
     border-color: var(--border-strong);
 }
 
+.app-menu {
+    position: relative;
+}
+
+.app-menu > summary {
+    list-style: none;
+}
+
+.app-menu > summary::-webkit-details-marker {
+    display: none;
+}
+
+.app-menu[open] .app-menu-trigger {
+    background: var(--surface-strong);
+    border-color: var(--border-strong);
+}
+
+.app-menu-popover {
+    position: absolute;
+    z-index: 20;
+    top: calc(100% + 7px);
+    right: 0;
+    width: 260px;
+    padding: 8px;
+    color: var(--text);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 7px;
+    box-shadow: 0 12px 30px rgba(24, 32, 36, 0.18);
+}
+
+.app-menu-heading {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 7px 8px 9px;
+}
+
+.app-menu-heading > svg {
+    flex: 0 0 16px;
+    color: var(--text-muted);
+}
+
+.app-menu-heading > div {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.app-menu-heading strong {
+    font-size: 12px;
+}
+
+.app-menu-heading span {
+    color: var(--text-muted);
+    font-size: 10px;
+}
+
+.app-build-info {
+    display: grid;
+    gap: 5px;
+    margin: 0;
+    padding: 8px;
+    background: var(--surface-muted);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+}
+
+.app-build-info > div {
+    display: grid;
+    grid-template-columns: 72px minmax(0, 1fr);
+    gap: 8px;
+    align-items: baseline;
+}
+
+.app-build-info dt {
+    color: var(--text-muted);
+    font-size: 10px;
+}
+
+.app-build-info dd {
+    min-width: 0;
+    margin: 0;
+    overflow: hidden;
+    color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 10px;
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.app-menu-separator {
+    height: 1px;
+    margin: 8px 0;
+    background: var(--border);
+}
+
+.app-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    width: 100%;
+    min-height: 34px;
+    padding: 0 9px;
+    color: var(--text);
+    background: transparent;
+    border: 0;
+    border-radius: 5px;
+    cursor: pointer;
+    text-align: left;
+}
+
+.app-menu-item:hover {
+    background: var(--surface-strong);
+}
+
+.app-menu-item.danger {
+    color: var(--red);
+}
+
 .content {
     flex: 1 1 auto;
     min-width: 0;

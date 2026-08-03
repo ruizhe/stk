@@ -54,7 +54,10 @@ use gui_config::{GuiConfig, Language};
 
 const TRAY_SHOW_ID: &str = "stk-show";
 const TRAY_RELOAD_ID: &str = "stk-reload";
+const TRAY_QUIT_ID: &str = "stk-quit";
 const STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const GIT_COMMIT: &str = env!("STK_GIT_COMMIT");
 
 #[derive(Debug, Parser)]
 #[command(
@@ -87,7 +90,7 @@ struct SystemTray {
     download_item: MenuItem,
     upload_item: MenuItem,
     reload_item: MenuItem,
-    quit_item: PredefinedMenuItem,
+    quit_item: MenuItem,
     display_state: Rc<RefCell<SystemTrayDisplayState>>,
 }
 
@@ -309,7 +312,7 @@ fn desktop_config(start_hidden: bool) -> Config {
     };
     let config = config
         .with_close_behaviour(WindowCloseBehaviour::WindowHides)
-        .with_exits_when_last_window_closes(false)
+        .with_exits_when_last_window_closes(true)
         .with_tray_icon_show_window_on_click(true);
 
     #[cfg(target_os = "macos")]
@@ -952,7 +955,9 @@ fn init_system_tray(language: Language) -> anyhow::Result<SystemTray> {
     let download_item = MenuItem::new(download_label, false, None);
     let upload_item = MenuItem::new(upload_label, false, None);
     let reload_item = MenuItem::with_id(TRAY_RELOAD_ID, reload_label, true, None);
-    let quit_item = PredefinedMenuItem::quit(Some(quit_label));
+    // Muda's predefined quit item is unsupported on Linux, so use an explicit
+    // menu command and let the Dioxus event loop perform a clean shutdown.
+    let quit_item = MenuItem::with_id(TRAY_QUIT_ID, quit_label, true, None);
     menu.append_items(&[
         &show_item,
         &PredefinedMenuItem::separator(),
@@ -1133,6 +1138,37 @@ fn current_runtime_error() -> Option<String> {
     GUI_CONTEXT
         .get()
         .and_then(|context| context.runtime.error())
+}
+
+fn show_main_window(window: &dioxus::desktop::DesktopContext) {
+    activate_macos_application();
+
+    #[cfg(target_os = "linux")]
+    {
+        use dioxus::desktop::tao::platform::unix::WindowExtUnix;
+        use gtk::prelude::{GtkWindowExt, WidgetExt};
+
+        // Tao queues set_visible and then checks the old GTK visibility before
+        // queuing focus. Calling GTK directly avoids that race after a hidden
+        // AppImage window is restored from an AppIndicator menu action.
+        let gtk_window = window.window.gtk_window();
+        gtk_window.deiconify();
+        gtk_window.show_all();
+        gtk_window.present();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        window.window.set_minimized(false);
+        window.window.set_visible(true);
+        window.window.set_focus();
+    }
+}
+
+fn quit_application(window: &dioxus::desktop::DesktopContext) {
+    info!("application quit requested");
+    window.set_close_behavior(WindowCloseBehaviour::WindowCloses);
+    window.close();
 }
 
 fn request_gui_reload() {
