@@ -196,9 +196,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            cmake \
+            gobject-introspection \
             libwebkit2gtk-4.1-dev \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
+            libdbusmenu-gtk3-dev \
+            libgirepository1.0-dev \
             librsvg2-dev \
             libxdo-dev \
             desktop-file-utils \
@@ -267,6 +271,8 @@ jobs:
           test -e "$appdir/usr/lib/libgtk-3.so.0"
           test -e "$appdir/usr/lib/libwebkit2gtk-4.1.so.0"
           test -e "$appdir/usr/lib/libayatana-appindicator3.so.1"
+          grep -a -q '<method name="Activate">' \
+            "$appdir/usr/lib/libayatana-appindicator3.so.1"
           test -x "$appdir/usr/lib/${LIB_ARCH}/webkit2gtk-4.1/WebKitNetworkProcess"
           test -x "$appdir/usr/lib/${LIB_ARCH}/webkit2gtk-4.1/WebKitWebProcess"
           sha256sum "$appimage" > "$appimage.sha256"
@@ -329,6 +335,8 @@ jobs:
               cd /tmp
               /opt/stk.appimage --appimage-extract >/dev/null
               test -e squashfs-root/usr/lib/libayatana-appindicator3.so.1
+              grep -a -q '<method name="Activate">' \
+                squashfs-root/usr/lib/libayatana-appindicator3.so.1
               LD_LIBRARY_PATH="$PWD/squashfs-root/usr/lib" \
                 ldd squashfs-root/usr/lib/libayatana-appindicator3.so.1 \
                 > /tmp/stk-appindicator-ldd.txt

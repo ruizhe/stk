@@ -61,14 +61,106 @@ pkg-config --exists ayatana-appindicator3-0.1 || {
     exit 1
 }
 
+TOOLS_DIR=${STK_APPIMAGE_TOOLS_DIR:-"$ROOT/target/appimage-tools"}
+APPINDICATOR_VERSION=0.6.0
+APPINDICATOR_SOURCE_SHA256=23be92ad8eb9625ce93b23b14f82f3cf88a4970c31d48581945ddfbac0441d06
+APPINDICATOR_SOURCE="$TOOLS_DIR/libayatana-appindicator-$APPINDICATOR_VERSION.tar.gz"
+APPINDICATOR_BUILD_ROOT="$ROOT/target/appimage-deps/libayatana-appindicator-$APPINDICATOR_VERSION"
+APPINDICATOR_PREFIX="$APPINDICATOR_BUILD_ROOT/prefix"
+
 APPINDICATOR_LIB_DIR=$(pkg-config --variable=libdir ayatana-appindicator3-0.1)
 APPINDICATOR_LIBRARY="$APPINDICATOR_LIB_DIR/libayatana-appindicator3.so.1"
+
+# Ubuntu 22.04 provides libayatana-appindicator 0.5.90, which has no
+# StatusNotifierItem.Activate method. Build 0.6.0 against the packaging
+# host's older GTK/GLib baseline so primary-click handling remains available
+# without importing libraries from a rolling distribution.
+if ! pkg-config --atleast-version="$APPINDICATOR_VERSION" ayatana-appindicator3-0.1 || \
+    [ ! -e "$APPINDICATOR_LIBRARY" ] || \
+    ! grep -a -q '<method name="Activate">' "$APPINDICATOR_LIBRARY"
+then
+    command -v cmake >/dev/null 2>&1 || {
+        echo "cmake is required to build portable Ayatana AppIndicator support" >&2
+        exit 1
+    }
+    command -v g-ir-scanner >/dev/null 2>&1 || {
+        echo "gobject-introspection is required to build portable Ayatana AppIndicator support" >&2
+        exit 1
+    }
+    command -v tar >/dev/null 2>&1 || {
+        echo "tar is required to build portable Ayatana AppIndicator support" >&2
+        exit 1
+    }
+    pkg-config --exists dbusmenu-gtk3-0.4 || {
+        echo "DBusMenu GTK 3 development metadata is required to build Ayatana AppIndicator" >&2
+        exit 1
+    }
+    pkg-config --exists gobject-introspection-1.0 || {
+        echo "GObject Introspection development metadata is required to build Ayatana AppIndicator" >&2
+        exit 1
+    }
+
+    if [ ! -s "$APPINDICATOR_SOURCE" ]; then
+        mkdir -p "$(dirname -- "$APPINDICATOR_SOURCE")"
+        temporary="$APPINDICATOR_SOURCE.download"
+        if ! curl --fail --location \
+            --connect-timeout 20 \
+            --speed-limit 1024 \
+            --speed-time 30 \
+            --retry 5 \
+            --retry-all-errors \
+            --retry-delay 2 \
+            --output "$temporary" \
+            "https://github.com/AyatanaIndicators/libayatana-appindicator/archive/refs/tags/$APPINDICATOR_VERSION.tar.gz"
+        then
+            rm -f "$temporary"
+            exit 1
+        fi
+        mv "$temporary" "$APPINDICATOR_SOURCE"
+    fi
+
+    appindicator_source_sha256=$(sha256sum "$APPINDICATOR_SOURCE" | awk '{print $1}')
+    if [ "$appindicator_source_sha256" != "$APPINDICATOR_SOURCE_SHA256" ]; then
+        echo "Ayatana AppIndicator source checksum mismatch: $APPINDICATOR_SOURCE" >&2
+        exit 1
+    fi
+
+    APPINDICATOR_SOURCE_DIR="$APPINDICATOR_BUILD_ROOT/source"
+    APPINDICATOR_BUILD_DIR="$APPINDICATOR_BUILD_ROOT/build"
+    rm -rf "$APPINDICATOR_SOURCE_DIR" "$APPINDICATOR_BUILD_DIR" "$APPINDICATOR_PREFIX"
+    mkdir -p "$APPINDICATOR_SOURCE_DIR"
+    tar -xzf "$APPINDICATOR_SOURCE" \
+        --strip-components=1 \
+        -C "$APPINDICATOR_SOURCE_DIR"
+
+    cmake \
+        -S "$APPINDICATOR_SOURCE_DIR" \
+        -B "$APPINDICATOR_BUILD_DIR" \
+        -DCMAKE_INSTALL_PREFIX="$APPINDICATOR_PREFIX" \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DENABLE_GTKDOC=OFF \
+        -DENABLE_BINDINGS_VALA=OFF \
+        -DENABLE_BINDINGS_MONO=OFF \
+        -DENABLE_TESTS=OFF
+    cmake --build "$APPINDICATOR_BUILD_DIR" --parallel
+    cmake --install "$APPINDICATOR_BUILD_DIR"
+
+    APPINDICATOR_LIB_DIR="$APPINDICATOR_PREFIX/lib"
+    APPINDICATOR_LIBRARY="$APPINDICATOR_LIB_DIR/libayatana-appindicator3.so.1"
+    PKG_CONFIG_PATH="$APPINDICATOR_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    LD_LIBRARY_PATH="$APPINDICATOR_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export PKG_CONFIG_PATH LD_LIBRARY_PATH
+fi
+
 if [ ! -e "$APPINDICATOR_LIBRARY" ]; then
     echo "Ayatana AppIndicator runtime library was not found: $APPINDICATOR_LIBRARY" >&2
     exit 1
 fi
+if ! grep -a -q '<method name="Activate">' "$APPINDICATOR_LIBRARY"; then
+    echo "Ayatana AppIndicator does not provide primary activation: $APPINDICATOR_LIBRARY" >&2
+    exit 1
+fi
 
-TOOLS_DIR=${STK_APPIMAGE_TOOLS_DIR:-"$ROOT/target/appimage-tools"}
 APP_DIR="$ROOT/target/appimage/SSH_Tunnel_Keeper.AppDir"
 DESKTOP_FILE="$APP_DIR/usr/share/applications/ssh-tunnel-keeper.desktop"
 ICON_FILE="$APP_DIR/usr/share/icons/hicolor/256x256/apps/ssh-tunnel-keeper.png"
@@ -189,6 +281,12 @@ export DEPLOY_GTK_VERSION=3
 
 if [ ! -e "$APP_DIR/usr/lib/libayatana-appindicator3.so.1" ]; then
     echo "linuxdeploy did not bundle libayatana-appindicator3.so.1" >&2
+    exit 1
+fi
+if ! grep -a -q '<method name="Activate">' \
+    "$APP_DIR/usr/lib/libayatana-appindicator3.so.1"
+then
+    echo "bundled libayatana-appindicator3.so.1 does not support primary activation" >&2
     exit 1
 fi
 
