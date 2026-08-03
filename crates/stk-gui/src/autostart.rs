@@ -1,8 +1,11 @@
 use anyhow::Context as _;
-use std::{env, fs, io::Write as _, path::Path};
+use std::env;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::{fs, io::Write as _, path::Path};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use tempfile::NamedTempFile;
 
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 const APP_NAME: &str = "SSH Tunnel Keeper";
 
 pub fn is_supported() -> bool {
@@ -26,6 +29,7 @@ fn current_executable() -> anyhow::Result<std::path::PathBuf> {
     env::current_exe().context("failed to resolve the GUI executable path")
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
     let parent = path
         .parent()
@@ -42,6 +46,7 @@ fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn remove_if_present(path: &Path) -> anyhow::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -154,60 +159,17 @@ mod platform {
 #[cfg(target_os = "windows")]
 mod platform {
     use super::*;
-    use anyhow::bail;
-    use std::process::Command;
-
-    const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
     pub fn is_enabled() -> anyhow::Result<bool> {
-        let output = Command::new("reg.exe")
-            .args(["query", RUN_KEY, "/v", APP_NAME])
-            .output()
-            .context("failed to query the Windows startup registry")?;
-        match output.status.code() {
-            Some(0) => Ok(true),
-            Some(1) => Ok(false),
-            _ => bail!(
-                "failed to query the Windows startup registry: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        }
+        super::super::windows::autostart_is_enabled()
     }
 
     pub fn set_enabled(enabled: bool) -> anyhow::Result<()> {
         if enabled {
             let executable = current_executable()?;
-            let command_line = format!("\"{}\" --hidden", executable.display());
-            run_registry_command(&[
-                "add",
-                RUN_KEY,
-                "/v",
-                APP_NAME,
-                "/t",
-                "REG_SZ",
-                "/d",
-                &command_line,
-                "/f",
-            ])
-        } else if is_enabled()? {
-            run_registry_command(&["delete", RUN_KEY, "/v", APP_NAME, "/f"])
+            super::super::windows::set_autostart(Some(&executable))
         } else {
-            Ok(())
-        }
-    }
-
-    fn run_registry_command(arguments: &[&str]) -> anyhow::Result<()> {
-        let output = Command::new("reg.exe")
-            .args(arguments)
-            .output()
-            .context("failed to update the Windows startup registry")?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            bail!(
-                "failed to update the Windows startup registry: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
+            super::super::windows::set_autostart(None)
         }
     }
 }

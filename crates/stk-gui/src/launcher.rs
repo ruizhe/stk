@@ -1650,31 +1650,7 @@ fn convert_macos_icon(path: &Path) -> Option<Vec<u8>> {
 
 #[cfg(target_os = "windows")]
 fn extract_windows_icon(path: &Path) -> Option<Vec<u8>> {
-    let directory = tempfile::tempdir().ok()?;
-    let output = directory.path().join("launcher-icon.png");
-    let script = concat!(
-        "Add-Type -AssemblyName System.Drawing; ",
-        "$icon=[System.Drawing.Icon]::ExtractAssociatedIcon($env:STK_ICON_SOURCE); ",
-        "if ($null -eq $icon) { exit 1 }; ",
-        "$bitmap=$icon.ToBitmap(); ",
-        "$bitmap.Save($env:STK_ICON_OUTPUT,[System.Drawing.Imaging.ImageFormat]::Png); ",
-        "$bitmap.Dispose(); $icon.Dispose()"
-    );
-    let status = Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            script,
-        ])
-        .env("STK_ICON_SOURCE", path)
-        .env("STK_ICON_OUTPUT", &output)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?;
-    status.success().then(|| fs::read(output).ok()).flatten()
+    super::windows::extract_executable_icon(path)
 }
 
 #[cfg(target_os = "macos")]

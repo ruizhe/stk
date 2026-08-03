@@ -48,6 +48,8 @@ mod autostart;
 mod gui_config;
 mod launcher;
 mod logging;
+#[cfg(target_os = "windows")]
+mod windows;
 
 use app::App;
 use gui_config::{GuiConfig, Language};
