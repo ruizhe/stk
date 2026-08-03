@@ -298,7 +298,7 @@ jobs:
                 cd /tmp
                 /opt/stk.appimage --appimage-extract >/dev/null
                 test -e squashfs-root/usr/lib/libayatana-appindicator3.so.1
-                grep -a -q '<method name="Activate">' \
+                grep -a -q "<method name=\"Activate\">" \
                   squashfs-root/usr/lib/libayatana-appindicator3.so.1
                 LD_LIBRARY_PATH="$PWD/squashfs-root/usr/lib" \
                   ldd squashfs-root/usr/lib/libayatana-appindicator3.so.1 \
