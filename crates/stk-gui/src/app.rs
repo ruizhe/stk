@@ -338,6 +338,23 @@ fn handle_system_tray_menu_event(event_id: &str, window: &dioxus::desktop::Deskt
     }
 }
 
+async fn scan_launcher_catalog(path: PathBuf) -> LauncherCatalog {
+    match tokio::task::spawn_blocking(move || LauncherCatalog::load(&path)).await {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            warn!(%error, "launcher catalog scan task failed");
+            LauncherCatalog::failed(format!("failed to scan browsers and applications: {error}"))
+        }
+    }
+}
+
+fn refresh_launcher_catalog(mut catalog: Signal<LauncherCatalog>, path: PathBuf) {
+    catalog.set(LauncherCatalog::loading());
+    spawn(async move {
+        catalog.set(scan_launcher_catalog(path).await);
+    });
+}
+
 pub(super) fn update_system_tray_throughput(
     tray: &super::SystemTray,
     upload_bps: f64,
@@ -424,6 +441,24 @@ fn AppContent() -> Element {
         }
     });
     let window = use_window();
+    #[cfg(target_os = "linux")]
+    {
+        let tray_for_primary_activation = system_tray.clone();
+        let window_for_primary_activation = window.clone();
+        use_hook(move || {
+            if let Some(tray) = tray_for_primary_activation.as_ref()
+                && let Err(error) = super::configure_linux_tray_primary_activation(
+                    &tray.tray,
+                    window_for_primary_activation,
+                )
+            {
+                warn!(
+                    error = %format_args!("{error:#}"),
+                    "failed to configure Linux tray primary activation"
+                );
+            }
+        });
+    }
     let window_for_muda_menu = window.clone();
     let window_for_tray_menu = window.clone();
     let window_for_app_menu = window.clone();
@@ -462,8 +497,15 @@ fn AppContent() -> Element {
     });
     let mut logs = use_signal(super::logging::snapshot);
     let mut editor = use_signal(move || ConfigEditorState::load(&editor_path, initial_language));
-    let mut launchers = use_signal(move || LauncherCatalog::load(&launcher_config_path));
+    let mut launchers = use_signal(LauncherCatalog::loading);
     let auto_start = use_signal(AutoStartUiState::load);
+
+    use_future(move || {
+        let launcher_config_path = launcher_config_path.clone();
+        async move {
+            launchers.set(scan_launcher_catalog(launcher_config_path).await);
+        }
+    });
 
     let config_path_for_poll = config_path.clone();
     let runtime_for_poll = Arc::clone(&context.runtime);
@@ -485,7 +527,7 @@ fn AppContent() -> Element {
                 append_runtime_events(&mut events, &previous, &next);
                 if next.config_generation != previous.config_generation {
                     observe_configuration_change(&config_path_for_poll, &mut editor, language);
-                    launchers.set(LauncherCatalog::load(&config_path_for_poll));
+                    refresh_launcher_catalog(launchers, config_path_for_poll.clone());
                 }
 
                 throughput.set(next_throughput);
@@ -1039,7 +1081,7 @@ fn QuickLauncherBar(
 
     let current_catalog = catalog.read().clone();
     let current_notice = notice.read().clone();
-    let busy = launching.read().is_some();
+    let busy = current_catalog.loading || launching.read().is_some();
     let any_menu_open = open_menu.read().is_some();
     let config_path_for_refresh = config_path.clone();
 
@@ -1069,12 +1111,12 @@ fn QuickLauncherBar(
                         }
                     }
                     button {
-                        class: "quick-launcher-refresh",
+                        class: if current_catalog.loading { "quick-launcher-refresh loading" } else { "quick-launcher-refresh" },
                         title: tr(language, "Detect browsers and reload launchers", "重新探测浏览器并加载启动器"),
                         aria_label: tr(language, "Refresh launchers", "刷新启动器"),
                         disabled: busy,
                         onclick: move |_| {
-                            catalog.set(LauncherCatalog::load(&config_path_for_refresh));
+                            refresh_launcher_catalog(catalog, config_path_for_refresh.clone());
                             notice.set(None);
                             open_menu.set(None);
                         },
@@ -1082,7 +1124,18 @@ fn QuickLauncherBar(
                     }
                 }
             }
-            if let Some(error) = current_catalog.error.as_deref() {
+            if current_catalog.loading {
+                div { class: "quick-launcher-message loading", role: "status",
+                    RefreshCw { size: 14 }
+                    span {
+                        {tr(
+                            language,
+                            "Detecting browsers and applications…",
+                            "正在探测浏览器与应用…",
+                        )}
+                    }
+                }
+            } else if let Some(error) = current_catalog.error.as_deref() {
                 div { class: "quick-launcher-message error", role: "alert", title: "{error}",
                     CircleAlert { size: 14 }
                     span { "{error}" }

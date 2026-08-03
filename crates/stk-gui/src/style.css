@@ -617,6 +617,17 @@ textarea:focus-visible {
     cursor: default;
 }
 
+.quick-launcher-refresh.loading svg,
+.quick-launcher-message.loading svg {
+    animation: launcher-spin 0.9s linear infinite;
+}
+
+@keyframes launcher-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
 .quick-launcher-items {
     display: flex;
     max-height: 132px;

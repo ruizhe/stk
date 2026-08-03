@@ -92,15 +92,37 @@ pub(super) enum LauncherKind {
 pub(super) struct LauncherCatalog {
     pub items: Vec<LauncherItem>,
     pub error: Option<String>,
+    pub loading: bool,
 }
 
 impl LauncherCatalog {
+    pub fn loading() -> Self {
+        Self {
+            items: Vec::new(),
+            error: None,
+            loading: true,
+        }
+    }
+
+    pub fn failed(error: impl Into<String>) -> Self {
+        Self {
+            items: Vec::new(),
+            error: Some(error.into()),
+            loading: false,
+        }
+    }
+
     pub fn load(path: &Path) -> Self {
         match load_launcher_catalog(path) {
-            Ok(items) => Self { items, error: None },
+            Ok(items) => Self {
+                items,
+                error: None,
+                loading: false,
+            },
             Err(error) => Self {
                 items: Vec::new(),
                 error: Some(format!("{error:#}")),
+                loading: false,
             },
         }
     }

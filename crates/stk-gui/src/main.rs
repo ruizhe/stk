@@ -305,6 +305,8 @@ fn desktop_config(start_hidden: bool) -> Config {
         .with_visible(!start_hidden)
         .with_always_on_top(false);
     let config = Config::new().with_window(window);
+    #[cfg(not(target_os = "macos"))]
+    let config = config.with_menu(None);
     let config = match create_window_icon() {
         Ok(icon) => config.with_icon(icon),
         Err(error) => {
@@ -991,6 +993,57 @@ fn init_system_tray(language: Language) -> anyhow::Result<SystemTray> {
     })
 }
 
+#[cfg(target_os = "linux")]
+fn configure_linux_tray_primary_activation(
+    tray: &DioxusTray,
+    window: dioxus::desktop::DesktopContext,
+) -> anyhow::Result<()> {
+    use gtk::glib::{self, gobject_ffi, prelude::ObjectExt, translate::from_glib_none};
+    use std::{mem, ptr};
+
+    // tray-icon exposes its libappindicator wrapper but the wrapper crate does
+    // not expose the underlying GObject pointer. libappindicator 0.9's wrapper
+    // is a single pointer field, so read that field locally and validate the
+    // signal before connecting it. The pointer remains owned by the tray icon.
+    let wrapper = unsafe { tray.app_indicator() };
+    anyhow::ensure!(!wrapper.is_null(), "Linux AppIndicator is unavailable");
+    anyhow::ensure!(
+        unsafe { mem::size_of_val(&*wrapper) } == mem::size_of::<*mut gobject_ffi::GObject>(),
+        "unsupported libappindicator wrapper layout"
+    );
+    let indicator = unsafe {
+        ptr::read(wrapper.cast::<*mut gobject_ffi::GObject>())
+    };
+    anyhow::ensure!(!indicator.is_null(), "Linux AppIndicator GObject is unavailable");
+
+    let class = unsafe { (*indicator).g_type_instance.g_class };
+    anyhow::ensure!(!class.is_null(), "Linux AppIndicator GType is unavailable");
+    let signal_id = unsafe {
+        gobject_ffi::g_signal_lookup(c"activate".as_ptr(), (*class).g_type)
+    };
+    anyhow::ensure!(
+        signal_id != 0,
+        "installed AppIndicator library does not support primary activation"
+    );
+
+    // Convert the borrowed raw instance into a temporary GLib object wrapper
+    // so GLib owns the signal closure and validates its arguments. Deferring
+    // the window operation until the current D-Bus dispatch finishes avoids
+    // re-entrant GTK visibility updates from the panel's Activate call.
+    let indicator: glib::Object = unsafe { from_glib_none(indicator) };
+    indicator.connect_closure(
+        "activate",
+        false,
+        glib::closure_local!(
+            move |_indicator: &glib::Object, _x: i32, _y: i32| {
+                let window = window.clone();
+                glib::idle_add_local_once(move || show_main_window(&window));
+            }
+        ),
+    );
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn configure_macos_tray_title(tray: &DioxusTray) {
     use objc2_app_kit::{NSFont, NSLineBreakMode};
@@ -1153,6 +1206,8 @@ fn show_main_window(window: &dioxus::desktop::DesktopContext) {
         // Tao queues set_visible and then checks the old GTK visibility before
         // queuing focus. Calling GTK directly avoids that race after a hidden
         // AppImage window is restored from an AppIndicator menu action.
+        window.window.set_minimized(false);
+        window.window.set_visible(true);
         let gtk_window = window.window.gtk_window();
         gtk_window.deiconify();
         gtk_window.show_all();
