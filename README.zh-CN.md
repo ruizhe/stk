@@ -653,19 +653,14 @@ packaging        系统服务文件
 scripts          图标和 macOS 应用构建脚本
 ```
 
-本地检查与测试：
+提交前运行与 CI 相同的格式、Clippy 和测试检查：
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-targets --locked
-
-cargo fmt --manifest-path crates/stk-gui/Cargo.toml -- --check
-cargo clippy --manifest-path crates/stk-gui/Cargo.toml \
-  --features desktop --all-targets --locked -- -D warnings
-cargo test --manifest-path crates/stk-gui/Cargo.toml \
-  --features desktop --locked
+./scripts/check.sh
 ```
+
+脚本会先检查两个 Cargo 工作区的 `rustfmt`，格式有问题时会在耗时更长的
+Clippy 和测试开始前直接报错。
 
 修改图标后重新生成所有平台资源：
 

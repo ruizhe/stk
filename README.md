@@ -652,19 +652,14 @@ packaging        Service manager files
 scripts          Icon generation and macOS packaging scripts
 ```
 
-Local checks:
+Run the same formatting, lint, and test checks used by CI before committing:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-targets --locked
-
-cargo fmt --manifest-path crates/stk-gui/Cargo.toml -- --check
-cargo clippy --manifest-path crates/stk-gui/Cargo.toml \
-  --features desktop --all-targets --locked -- -D warnings
-cargo test --manifest-path crates/stk-gui/Cargo.toml \
-  --features desktop --locked
+./scripts/check.sh
 ```
+
+The script checks `rustfmt` for both Cargo workspaces first, so formatting failures are
+reported before the longer Clippy and test steps run.
 
 Regenerate all platform icon resources after changing the SVG sources:
 
