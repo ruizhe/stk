@@ -1,5 +1,5 @@
 use anyhow::Context as _;
-use dioxus::desktop::{use_tray_menu_event_handler, use_window};
+use dioxus::desktop::{use_muda_event_handler, use_tray_menu_event_handler, use_window};
 use dioxus::prelude::*;
 use lucide_dioxus::{
     Activity, ArrowDown, ArrowUp, ChevronDown, CircleAlert, CircleCheck, CircleDot, Clock,
@@ -329,6 +329,15 @@ fn update_system_tray(
     update_system_tray_throughput(tray, rates.upload_bps, rates.download_bps);
 }
 
+fn handle_system_tray_menu_event(event_id: &str, window: &dioxus::desktop::DesktopContext) {
+    match event_id {
+        super::TRAY_SHOW_ID => super::show_main_window(window),
+        super::TRAY_RELOAD_ID => super::request_gui_reload(),
+        super::TRAY_QUIT_ID => super::quit_application(window),
+        _ => {}
+    }
+}
+
 pub(super) fn update_system_tray_throughput(
     tray: &super::SystemTray,
     upload_bps: f64,
@@ -415,15 +424,20 @@ fn AppContent() -> Element {
         }
     });
     let window = use_window();
-    let window_for_menu = window.clone();
+    let window_for_muda_menu = window.clone();
+    let window_for_tray_menu = window.clone();
     let window_for_app_menu = window.clone();
-    let _tray_menu_handler =
-        use_tray_menu_event_handler(move |event| match event.id().0.as_str() {
-            super::TRAY_SHOW_ID => super::show_main_window(&window_for_menu),
-            super::TRAY_RELOAD_ID => super::request_gui_reload(),
-            super::TRAY_QUIT_ID => super::quit_application(&window_for_menu),
-            _ => {}
-        });
+
+    // tray-icon re-exports muda's MenuEvent. Dioxus 0.7 registers its regular
+    // muda receiver first, so current releases deliver Linux AppIndicator menu
+    // commands as MudaMenuEvent instead of TrayMenuEvent. Listen on both paths
+    // so hidden windows can be restored across Dioxus versions and platforms.
+    let _muda_menu_handler = use_muda_event_handler(move |event| {
+        handle_system_tray_menu_event(event.id().0.as_str(), &window_for_muda_menu);
+    });
+    let _tray_menu_handler = use_tray_menu_event_handler(move |event| {
+        handle_system_tray_menu_event(event.id().0.as_str(), &window_for_tray_menu);
+    });
 
     let config_path = context.runtime.config_path.clone();
     let gui_config_path = context.gui_config_path.clone();
