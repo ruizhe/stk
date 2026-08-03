@@ -346,21 +346,30 @@ jobs:
           set -euo pipefail
           appimage="dist/stk-linux-x86_64.appimage"
           for attempt in 1 2 3; do
+            log_file="$(mktemp)"
             if docker run --rm \
               -e APPIMAGE_EXTRACT_AND_RUN=1 \
               -v "$PWD/$appimage:/opt/stk.appimage:ro" \
-              archlinux:base \
+              ghcr.io/archlinux/archlinux:base \
               sh -eu -c '
                 sed -i "s/^#DisableSandboxSyscalls/DisableSandboxSyscalls/" /etc/pacman.conf
-                sed -i "s/^#ParallelDownloads/ParallelDownloads/" /etc/pacman.conf
-                printf "%s\n" \
-                  "Server = https://mirror.lug.umbc.edu/archlinux/\$repo/os/\$arch" \
-                  "Server = https://opencolo.mm.fcix.net/archlinux/\$repo/os/\$arch" \
-                  "Server = https://mirrors.kernel.org/archlinux/\$repo/os/\$arch" \
-                  "Server = https://mirror.umd.edu/archlinux/\$repo/os/\$arch" \
-                  > /etc/pacman.d/mirrorlist
-                pacman -Sy --noconfirm --needed \
-                  gtk3 librsvg webkit2gtk-4.1 xdotool >/dev/null
+                installed=false
+                for mirror in \
+                  "https://mirror.osbeck.com/archlinux/\$repo/os/\$arch" \
+                  "https://mirror.clarkson.edu/archlinux/\$repo/os/\$arch" \
+                  "https://mirrors.iu13.net/archlinux/\$repo/os/\$arch" \
+                  "https://mirror.lug.umbc.edu/archlinux/\$repo/os/\$arch" \
+                  "https://mirrors.kernel.org/archlinux/\$repo/os/\$arch"
+                do
+                  printf "Server = %s\n" "$mirror" > /etc/pacman.d/mirrorlist
+                  if pacman -Sy --noconfirm --needed \
+                    gtk3 librsvg webkit2gtk-4.1 xdotool >/dev/null
+                  then
+                    installed=true
+                    break
+                  fi
+                done
+                $installed
                 /opt/stk.appimage --help
                 cd /tmp
                 /opt/stk.appimage --appimage-extract >/dev/null
@@ -371,14 +380,19 @@ jobs:
                   ldd squashfs-root/usr/lib/libayatana-appindicator3.so.1 \
                   > /tmp/stk-appindicator-ldd.txt
                 ! grep -q "not found" /tmp/stk-appindicator-ldd.txt
-              '
+              ' 2>&1 | tee "$log_file"
             then
               break
             fi
+            last_line="$(tail -n 1 "$log_file" | sed -e "s/%/%25/g" -e "s/\r/%0D/g")"
+            if [[ -z "$last_line" ]]; then
+              last_line="docker run exited without output"
+            fi
             if [[ "$attempt" == 3 ]]; then
+              echo "::error title=Arch Linux AppImage test failed::$last_line"
               exit 1
             fi
-            echo "::warning::Arch Linux AppImage test attempt $attempt failed; retrying"
+            echo "::warning title=Arch Linux AppImage test attempt $attempt failed::$last_line"
             sleep "$((attempt * 10))"
           done
 

@@ -209,13 +209,21 @@ jobs:
             shift
             local attempt
             for attempt in 1 2 3; do
-              if docker run "$@"; then
+              local log_file
+              log_file="$(mktemp)"
+              if docker run "$@" 2>&1 | tee "$log_file"; then
                 return 0
               fi
+              local last_line
+              last_line="$(tail -n 1 "$log_file" | sed -e "s/%/%25/g" -e "s/\r/%0D/g")"
+              if [[ -z "$last_line" ]]; then
+                last_line="docker run exited without output"
+              fi
               if [[ "$attempt" == 3 ]]; then
+                echo "::error title=$label failed::$last_line"
                 return 1
               fi
-              echo "::warning::$label attempt $attempt failed; retrying"
+              echo "::warning title=$label attempt $attempt failed::$last_line"
               sleep "$((attempt * 10))"
             done
           }
@@ -238,18 +246,26 @@ jobs:
             run_docker_test "Arch Linux AppImage test" --rm \
               -e APPIMAGE_EXTRACT_AND_RUN=1 \
               -v "$PWD/$appimage:/opt/stk.appimage:ro" \
-              archlinux:base \
+              ghcr.io/archlinux/archlinux:base \
               sh -eu -c '
                 sed -i "s/^#DisableSandboxSyscalls/DisableSandboxSyscalls/" /etc/pacman.conf
-                sed -i "s/^#ParallelDownloads/ParallelDownloads/" /etc/pacman.conf
-                printf "%s\n" \
-                  "Server = https://mirror.lug.umbc.edu/archlinux/\$repo/os/\$arch" \
-                  "Server = https://opencolo.mm.fcix.net/archlinux/\$repo/os/\$arch" \
-                  "Server = https://mirrors.kernel.org/archlinux/\$repo/os/\$arch" \
-                  "Server = https://mirror.umd.edu/archlinux/\$repo/os/\$arch" \
-                  > /etc/pacman.d/mirrorlist
-                pacman -Sy --noconfirm --needed \
-                  gtk3 librsvg webkit2gtk-4.1 xdotool >/dev/null
+                installed=false
+                for mirror in \
+                  "https://mirror.osbeck.com/archlinux/\$repo/os/\$arch" \
+                  "https://mirror.clarkson.edu/archlinux/\$repo/os/\$arch" \
+                  "https://mirrors.iu13.net/archlinux/\$repo/os/\$arch" \
+                  "https://mirror.lug.umbc.edu/archlinux/\$repo/os/\$arch" \
+                  "https://mirrors.kernel.org/archlinux/\$repo/os/\$arch"
+                do
+                  printf "Server = %s\n" "$mirror" > /etc/pacman.d/mirrorlist
+                  if pacman -Sy --noconfirm --needed \
+                    gtk3 librsvg webkit2gtk-4.1 xdotool >/dev/null
+                  then
+                    installed=true
+                    break
+                  fi
+                done
+                $installed
                 /opt/stk.appimage --help >/dev/null
                 cd /tmp
                 /opt/stk.appimage --appimage-extract >/dev/null
