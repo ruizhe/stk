@@ -287,16 +287,27 @@ jobs:
         run: |
           set -euo pipefail
           appimage="dist/stk-linux-${ARCH}.appimage"
-          docker run --rm \
-            -e APPIMAGE_EXTRACT_AND_RUN=1 \
-            -v "$PWD/$appimage:/opt/stk.appimage:ro" \
-            ubuntu:22.04 \
-            sh -eu -c '
-              apt-get update >/dev/null
-              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                libwebkit2gtk-4.1-0 librsvg2-2 libxdo3 >/dev/null
-              /opt/stk.appimage --help
-            '
+          for attempt in 1 2 3; do
+            if docker run --rm \
+              -e APPIMAGE_EXTRACT_AND_RUN=1 \
+              -v "$PWD/$appimage:/opt/stk.appimage:ro" \
+              ubuntu:22.04 \
+              sh -eu -c '
+                apt-get -o Acquire::Retries=5 update >/dev/null
+                DEBIAN_FRONTEND=noninteractive apt-get \
+                  -o Acquire::Retries=5 install -y --no-install-recommends \
+                  libwebkit2gtk-4.1-0 librsvg2-2 libxdo3 >/dev/null
+                /opt/stk.appimage --help
+              '
+            then
+              break
+            fi
+            if [[ "$attempt" == 3 ]]; then
+              exit 1
+            fi
+            echo "::warning::Ubuntu 22.04 AppImage test attempt $attempt failed; retrying"
+            sleep "$((attempt * 10))"
+          done
 
       - name: Verify AppImage extraction on Ubuntu 24.04
         if: runner.os == 'Linux'
@@ -306,16 +317,27 @@ jobs:
         run: |
           set -euo pipefail
           appimage="dist/stk-linux-${ARCH}.appimage"
-          docker run --rm \
-            -e APPIMAGE_EXTRACT_AND_RUN=1 \
-            -v "$PWD/$appimage:/opt/stk.appimage:ro" \
-            ubuntu:24.04 \
-            sh -eu -c '
-              apt-get update >/dev/null
-              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                libwebkit2gtk-4.1-0 librsvg2-2 libxdo3 >/dev/null
-              /opt/stk.appimage --help
-            '
+          for attempt in 1 2 3; do
+            if docker run --rm \
+              -e APPIMAGE_EXTRACT_AND_RUN=1 \
+              -v "$PWD/$appimage:/opt/stk.appimage:ro" \
+              ubuntu:24.04 \
+              sh -eu -c '
+                apt-get -o Acquire::Retries=5 update >/dev/null
+                DEBIAN_FRONTEND=noninteractive apt-get \
+                  -o Acquire::Retries=5 install -y --no-install-recommends \
+                  libwebkit2gtk-4.1-0 librsvg2-2 libxdo3 >/dev/null
+                /opt/stk.appimage --help
+              '
+            then
+              break
+            fi
+            if [[ "$attempt" == 3 ]]; then
+              exit 1
+            fi
+            echo "::warning::Ubuntu 24.04 AppImage test attempt $attempt failed; retrying"
+            sleep "$((attempt * 10))"
+          done
 
       - name: Verify AppImage extraction on Arch Linux
         if: runner.os == 'Linux' && matrix.arch == 'x86_64'
@@ -323,25 +345,35 @@ jobs:
         run: |
           set -euo pipefail
           appimage="dist/stk-linux-x86_64.appimage"
-          docker run --rm \
-            -e APPIMAGE_EXTRACT_AND_RUN=1 \
-            -v "$PWD/$appimage:/opt/stk.appimage:ro" \
-            archlinux:base \
-            sh -eu -c '
-              sed -i "s/^#DisableSandboxSyscalls/DisableSandboxSyscalls/" /etc/pacman.conf
-              pacman -Sy --noconfirm --needed \
-                gtk3 librsvg webkit2gtk-4.1 xdotool >/dev/null
-              /opt/stk.appimage --help
-              cd /tmp
-              /opt/stk.appimage --appimage-extract >/dev/null
-              test -e squashfs-root/usr/lib/libayatana-appindicator3.so.1
-              grep -a -q '<method name="Activate">' \
-                squashfs-root/usr/lib/libayatana-appindicator3.so.1
-              LD_LIBRARY_PATH="$PWD/squashfs-root/usr/lib" \
-                ldd squashfs-root/usr/lib/libayatana-appindicator3.so.1 \
-                > /tmp/stk-appindicator-ldd.txt
-              ! grep -q "not found" /tmp/stk-appindicator-ldd.txt
-            '
+          for attempt in 1 2 3; do
+            if docker run --rm \
+              -e APPIMAGE_EXTRACT_AND_RUN=1 \
+              -v "$PWD/$appimage:/opt/stk.appimage:ro" \
+              archlinux:base \
+              sh -eu -c '
+                sed -i "s/^#DisableSandboxSyscalls/DisableSandboxSyscalls/" /etc/pacman.conf
+                pacman -Sy --noconfirm --needed \
+                  gtk3 librsvg webkit2gtk-4.1 xdotool >/dev/null
+                /opt/stk.appimage --help
+                cd /tmp
+                /opt/stk.appimage --appimage-extract >/dev/null
+                test -e squashfs-root/usr/lib/libayatana-appindicator3.so.1
+                grep -a -q '<method name="Activate">' \
+                  squashfs-root/usr/lib/libayatana-appindicator3.so.1
+                LD_LIBRARY_PATH="$PWD/squashfs-root/usr/lib" \
+                  ldd squashfs-root/usr/lib/libayatana-appindicator3.so.1 \
+                  > /tmp/stk-appindicator-ldd.txt
+                ! grep -q "not found" /tmp/stk-appindicator-ldd.txt
+              '
+            then
+              break
+            fi
+            if [[ "$attempt" == 3 ]]; then
+              exit 1
+            fi
+            echo "::warning::Arch Linux AppImage test attempt $attempt failed; retrying"
+            sleep "$((attempt * 10))"
+          done
 
       - name: Verify macOS application and DMG packaging
         if: runner.os == 'macOS'
