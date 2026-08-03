@@ -1011,16 +1011,15 @@ fn configure_linux_tray_primary_activation(
         unsafe { mem::size_of_val(&*wrapper) } == mem::size_of::<*mut gobject_ffi::GObject>(),
         "unsupported libappindicator wrapper layout"
     );
-    let indicator = unsafe {
-        ptr::read(wrapper.cast::<*mut gobject_ffi::GObject>())
-    };
-    anyhow::ensure!(!indicator.is_null(), "Linux AppIndicator GObject is unavailable");
+    let indicator = unsafe { ptr::read(wrapper.cast::<*mut gobject_ffi::GObject>()) };
+    anyhow::ensure!(
+        !indicator.is_null(),
+        "Linux AppIndicator GObject is unavailable"
+    );
 
     let class = unsafe { (*indicator).g_type_instance.g_class };
     anyhow::ensure!(!class.is_null(), "Linux AppIndicator GType is unavailable");
-    let signal_id = unsafe {
-        gobject_ffi::g_signal_lookup(c"activate".as_ptr(), (*class).g_type)
-    };
+    let signal_id = unsafe { gobject_ffi::g_signal_lookup(c"activate".as_ptr(), (*class).g_type) };
     anyhow::ensure!(
         signal_id != 0,
         "installed AppIndicator library does not support primary activation"
@@ -1034,12 +1033,10 @@ fn configure_linux_tray_primary_activation(
     indicator.connect_closure(
         "activate",
         false,
-        glib::closure_local!(
-            move |_indicator: &glib::Object, _x: i32, _y: i32| {
-                let window = window.clone();
-                glib::idle_add_local_once(move || show_main_window(&window));
-            }
-        ),
+        glib::closure_local!(move |_indicator: &glib::Object, _x: i32, _y: i32| {
+            let window = window.clone();
+            glib::idle_add_local_once(move || show_main_window(&window));
+        }),
     );
     Ok(())
 }
