@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write
+  packages: read
 
 concurrency:
   group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
@@ -173,6 +174,27 @@ jobs:
           --release
           --locked
 
+      - name: Pull Arch Linux compatibility image
+        if: matrix.arch == 'x86_64'
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/archlinux/archlinux:base"
+          printf '%s' "$GHCR_TOKEN" | \
+            docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+          for attempt in 1 2 3; do
+            if docker pull "$image"; then
+              break
+            fi
+            if [[ "$attempt" == 3 ]]; then
+              exit 1
+            fi
+            echo "::warning::Arch Linux image pull attempt $attempt failed; retrying"
+            sleep "$((attempt * 10))"
+          done
+
       - name: Create Linux AppImage
         shell: bash
         env:
@@ -208,17 +230,21 @@ jobs:
             local label=$1
             shift
             local attempt
+            local docker_status
+            local last_line
+            local log_file
             for attempt in 1 2 3; do
-              local log_file
               log_file="$(mktemp)"
               if docker run "$@" 2>&1 | tee "$log_file"; then
                 return 0
+              else
+                docker_status=$?
               fi
-              local last_line
               last_line="$(tail -n 1 "$log_file" | sed -e "s/%/%25/g" -e "s/\r/%0D/g")"
               if [[ -z "$last_line" ]]; then
                 last_line="docker run exited without output"
               fi
+              last_line="docker exit $docker_status: $last_line"
               if [[ "$attempt" == 3 ]]; then
                 echo "::error title=$label failed::$last_line"
                 return 1
@@ -243,11 +269,12 @@ jobs:
           done
 
           if [[ "$ARCH" == x86_64 ]]; then
-            run_docker_test "Arch Linux AppImage test" --rm \
+            run_docker_test "Arch Linux AppImage test" --pull=never --rm \
               -e APPIMAGE_EXTRACT_AND_RUN=1 \
               -v "$PWD/$appimage:/opt/stk.appimage:ro" \
               ghcr.io/archlinux/archlinux:base \
               sh -eu -c '
+                echo "Arch compatibility container started"
                 sed -i "s/^#DisableSandboxSyscalls/DisableSandboxSyscalls/" /etc/pacman.conf
                 installed=false
                 for mirror in \
@@ -257,6 +284,7 @@ jobs:
                   "https://mirror.lug.umbc.edu/archlinux/\$repo/os/\$arch" \
                   "https://mirrors.kernel.org/archlinux/\$repo/os/\$arch"
                 do
+                  echo "Trying Arch package mirror: $mirror"
                   printf "Server = %s\n" "$mirror" > /etc/pacman.d/mirrorlist
                   if pacman -Sy --noconfirm --needed \
                     gtk3 librsvg webkit2gtk-4.1 xdotool >/dev/null

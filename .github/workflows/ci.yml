@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  packages: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -339,6 +340,27 @@ jobs:
             sleep "$((attempt * 10))"
           done
 
+      - name: Pull Arch Linux compatibility image
+        if: runner.os == 'Linux' && matrix.arch == 'x86_64'
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/archlinux/archlinux:base"
+          printf '%s' "$GHCR_TOKEN" | \
+            docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+          for attempt in 1 2 3; do
+            if docker pull "$image"; then
+              break
+            fi
+            if [[ "$attempt" == 3 ]]; then
+              exit 1
+            fi
+            echo "::warning::Arch Linux image pull attempt $attempt failed; retrying"
+            sleep "$((attempt * 10))"
+          done
+
       - name: Verify AppImage extraction on Arch Linux
         if: runner.os == 'Linux' && matrix.arch == 'x86_64'
         shell: bash
@@ -347,11 +369,12 @@ jobs:
           appimage="dist/stk-linux-x86_64.appimage"
           for attempt in 1 2 3; do
             log_file="$(mktemp)"
-            if docker run --rm \
+            if docker run --pull=never --rm \
               -e APPIMAGE_EXTRACT_AND_RUN=1 \
               -v "$PWD/$appimage:/opt/stk.appimage:ro" \
               ghcr.io/archlinux/archlinux:base \
               sh -eu -c '
+                echo "Arch compatibility container started"
                 sed -i "s/^#DisableSandboxSyscalls/DisableSandboxSyscalls/" /etc/pacman.conf
                 installed=false
                 for mirror in \
@@ -361,6 +384,7 @@ jobs:
                   "https://mirror.lug.umbc.edu/archlinux/\$repo/os/\$arch" \
                   "https://mirrors.kernel.org/archlinux/\$repo/os/\$arch"
                 do
+                  echo "Trying Arch package mirror: $mirror"
                   printf "Server = %s\n" "$mirror" > /etc/pacman.d/mirrorlist
                   if pacman -Sy --noconfirm --needed \
                     gtk3 librsvg webkit2gtk-4.1 xdotool >/dev/null
@@ -383,11 +407,14 @@ jobs:
               ' 2>&1 | tee "$log_file"
             then
               break
+            else
+              docker_status=$?
             fi
             last_line="$(tail -n 1 "$log_file" | sed -e "s/%/%25/g" -e "s/\r/%0D/g")"
             if [[ -z "$last_line" ]]; then
               last_line="docker run exited without output"
             fi
+            last_line="docker exit $docker_status: $last_line"
             if [[ "$attempt" == 3 ]]; then
               echo "::error title=Arch Linux AppImage test failed::$last_line"
               exit 1
