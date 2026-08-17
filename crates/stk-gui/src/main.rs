@@ -60,6 +60,8 @@ const TRAY_QUIT_ID: &str = "stk-quit";
 const STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_COMMIT: &str = env!("STK_GIT_COMMIT");
+#[cfg(unix)]
+const DESIRED_OPEN_FILE_LIMIT: libc::rlim_t = 8192;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -205,9 +207,21 @@ impl GuiErrors {
 static GUI_CONTEXT: OnceLock<GuiContext> = OnceLock::new();
 
 fn main() {
+    #[cfg(unix)]
+    let open_file_limit_result = raise_open_file_limit();
     let gui_config_path = gui_config::gui_config_path();
     let log_path = default_config_directory(ConfigScope::User).join("stk.log");
     logging::init(log_path.clone());
+    #[cfg(unix)]
+    match open_file_limit_result {
+        Ok(Some((previous, current))) => info!(
+            previous_open_file_limit = previous,
+            current_open_file_limit = current,
+            "raised process open-file limit"
+        ),
+        Ok(None) => {}
+        Err(error) => warn!(%error, "failed to raise process open-file limit"),
+    }
     let gui_config_exists = gui_config_path.exists();
     let gui_config = match GuiConfig::load(&gui_config_path) {
         Ok(config) => config,
@@ -289,6 +303,30 @@ fn main() {
     }
     launch_desktop(desktop_config(args.hidden));
     runtime.stop();
+}
+
+#[cfg(unix)]
+fn raise_open_file_limit() -> io::Result<Option<(libc::rlim_t, libc::rlim_t)>> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid writable `rlimit` and the resource is fixed.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let target = DESIRED_OPEN_FILE_LIMIT.min(limit.rlim_max);
+    if limit.rlim_cur >= target {
+        return Ok(None);
+    }
+    let previous = limit.rlim_cur;
+    limit.rlim_cur = target;
+    // SAFETY: `limit` was initialized by `getrlimit` and only its soft limit
+    // was raised to a value no greater than the process hard limit.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Some((previous, target)))
 }
 
 fn launch_desktop(config: Config) {

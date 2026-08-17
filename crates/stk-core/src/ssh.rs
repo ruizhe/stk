@@ -49,6 +49,7 @@ use tokio::{
 use tracing::{Instrument, debug, info, info_span, warn};
 
 const MAX_CONCURRENT_SESSION_STARTS_PER_HOST: usize = 2;
+const MAX_CHANNEL_OPEN_ATTEMPTS_PER_DIAL: usize = 3;
 const SESSION_SCALE_UP_UTILIZATION_NUMERATOR: usize = 3;
 const SESSION_SCALE_UTILIZATION_DENOMINATOR: usize = 4;
 const SESSION_SCALE_DOWN_UTILIZATION_NUMERATOR: usize = 1;
@@ -106,6 +107,10 @@ fn session_establish_wait_timeout(plan: &ResolvedSshPlan) -> Duration {
 
 fn can_start_another_session(connecting: usize) -> bool {
     connecting < MAX_CONCURRENT_SESSION_STARTS_PER_HOST
+}
+
+fn channel_open_attempt_count(healthy_sessions: usize) -> usize {
+    healthy_sessions.min(MAX_CHANNEL_OPEN_ATTEMPTS_PER_DIAL)
 }
 
 fn session_spawn_authorized(
@@ -610,6 +615,7 @@ impl NativeSshNode {
             }
         }
         preferred.sort_by_key(|(score, _)| *score);
+        preferred.truncate(channel_open_attempt_count(preferred.len()));
 
         let mut last_error = None;
         for (_, session) in preferred {
@@ -3672,6 +3678,14 @@ mod tests {
         assert_eq!(initial_session_start_count(10), 2);
         assert!(can_start_another_session(1));
         assert!(!can_start_another_session(2));
+    }
+
+    #[test]
+    fn channel_open_failover_is_bounded_per_dial() {
+        assert_eq!(channel_open_attempt_count(0), 0);
+        assert_eq!(channel_open_attempt_count(2), 2);
+        assert_eq!(channel_open_attempt_count(3), 3);
+        assert_eq!(channel_open_attempt_count(10), 3);
     }
 
     #[test]

@@ -6030,6 +6030,7 @@ dependencies = [
  "dispatch2",
  "gtk",
  "image",
+ "libc",
  "lucide-dioxus",
  "objc2-app-kit",
  "objc2-foundation",

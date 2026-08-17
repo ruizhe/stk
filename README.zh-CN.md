@@ -612,6 +612,8 @@ macOS 主窗口显示时会出现在 Dock 和 Cmd+Tab；关闭窗口后切换为
 
 每个 SSH host 默认维持 session pool。新 channel 会按 session RTT、活跃 channel、容量和健康状态自动调度，因此同一 host 的并发请求会分散到合适的健康 session，而不是固定使用一条连接。
 
+channel 建立失败时，一次代理 dial 最多尝试三条健康 session。这样在目标地址或链路故障时，请求延迟和资源占用都有明确上限，不会因为 session pool 较大而把单条 session 的 channel 超时乘以池中全部 session 数量。
+
 `min-sessions` 是始终维持的常驻基线，`max-sessions` 是压力扩容上限。内置默认值为 3 条常驻 session、最多 10 条 session；这两个值都可以通过 `override-default` 或单个 host 修改。配置较大的 `min-sessions`（例如 10）时，STK 不会主动降到内置默认值。健康 session 的 channel 利用率达到 75% 并持续 2 秒后，池会在建连冷却和并发握手限制下逐条扩容，直到压力缓解或达到 `max-sessions`。负载下降到缩容后一条 session 容量的 25% 以下并持续空闲 5 分钟后，额外 session 会每 30 秒优雅排空一条，且永远不会低于 `min-sessions`。
 
 探针接近失败阈值时，runtime 会请求创建 replacement，可疑 session 立即停止接收新 channel，但已有 channel 继续留在原 session。实际 payload 仍有进展就视为 session 仍在工作，因此活跃传输可以跳过一次多余的 ping，探针失败也不会直接断开它。替换容量恢复后，旧 session 会一直排空到 channel 自然结束，或者连续 `session-drain-timeout-secs` 没有任何 payload 进展；默认无进展超时为 300 秒。质量替换仍受建连冷却、指数退避和每 host 最多两个并发 SSH 握手的限制，避免弱网下形成重连风暴。
