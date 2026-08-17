@@ -612,7 +612,7 @@ macOS 主窗口显示时会出现在 Dock 和 Cmd+Tab；关闭窗口后切换为
 
 每个 SSH host 默认维持 session pool。新 channel 会按 session RTT、活跃 channel、容量和健康状态自动调度，因此同一 host 的并发请求会分散到合适的健康 session，而不是固定使用一条连接。
 
-channel 建立失败时，一次代理 dial 最多尝试三条健康 session。这样在目标地址或链路故障时，请求延迟和资源占用都有明确上限，不会因为 session pool 较大而把单条 session 的 channel 超时乘以池中全部 session 数量。
+STK 不会为 listener 设置固定的活跃连接上限。没有健康 SSH session 时，已经 accept 的连接会保持等待，并由 session 或网络恢复事件唤醒，不会因为应用层恢复 deadline 到期而主动失败。已有 channel 继续留在原 session，runtime 会先准备 replacement 容量。listener 的瞬时 `accept` 错误也会保留现有监听 socket 并原地重试，避免重新 bind 期间拒绝新的 TCP 连接。
 
 `min-sessions` 是始终维持的常驻基线，`max-sessions` 是压力扩容上限。内置默认值为 3 条常驻 session、最多 10 条 session；这两个值都可以通过 `override-default` 或单个 host 修改。配置较大的 `min-sessions`（例如 10）时，STK 不会主动降到内置默认值。健康 session 的 channel 利用率达到 75% 并持续 2 秒后，池会在建连冷却和并发握手限制下逐条扩容，直到压力缓解或达到 `max-sessions`。负载下降到缩容后一条 session 容量的 25% 以下并持续空闲 5 分钟后，额外 session 会每 30 秒优雅排空一条，且永远不会低于 `min-sessions`。
 

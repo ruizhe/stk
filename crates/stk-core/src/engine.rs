@@ -40,16 +40,14 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader, copy_bidirectional},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::oneshot,
     task::JoinSet,
 };
 use tracing::{Instrument, debug, info, info_span, warn};
 
-#[cfg(test)]
-use tokio::net::TcpStream;
-
 const HTTP_MAX_BUFFER_SIZE: usize = 16 * 1024;
+const LOCAL_LISTENER_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 type ProxyBody = UnsyncBoxBody<Bytes, hyper::Error>;
 
@@ -420,7 +418,14 @@ async fn serve_proxy_listener(
     );
 
     loop {
-        let (stream, peer_addr) = listener.accept().await?;
+        let (stream, peer_addr) = accept_local_connection(
+            &listener,
+            &runtime.host_name,
+            &runtime.tunnel_id,
+            &runtime.name,
+            runtime.listen,
+        )
+        .await;
         let connection_id = next_connection_id();
         let local_forward_name = runtime.name.clone();
         let connection_tunnel_id = runtime.tunnel_id.clone();
@@ -546,7 +551,14 @@ async fn serve_tcp_listener(
     );
 
     loop {
-        let (mut local_stream, peer_addr) = listener.accept().await?;
+        let (mut local_stream, peer_addr) = accept_local_connection(
+            &listener,
+            &forward.host_name,
+            &forward.tunnel_id,
+            &forward.name,
+            forward.listen,
+        )
+        .await;
         let connection_id = next_connection_id();
         let connection_name = forward.name.clone();
         let connection_tunnel_id = forward.tunnel_id.clone();
@@ -646,6 +658,32 @@ async fn serve_tcp_listener(
             }
             .instrument(span),
         );
+    }
+}
+
+async fn accept_local_connection(
+    listener: &TcpListener,
+    host_name: &str,
+    tunnel_id: &str,
+    name: &str,
+    listen: SocketAddr,
+) -> (TcpStream, SocketAddr) {
+    loop {
+        match listener.accept().await {
+            Ok(connection) => return connection,
+            Err(error) => {
+                let error = format!("listener at {listen} failed to accept a connection: {error}");
+                stats::record_tunnel_error(host_name, tunnel_id, &error);
+                warn!(
+                    local_forward = %name,
+                    %host_name,
+                    %listen,
+                    %error,
+                    "local listener accept failed; retaining listener and retrying"
+                );
+                tokio::time::sleep(LOCAL_LISTENER_ACCEPT_RETRY_DELAY).await;
+            }
+        }
     }
 }
 

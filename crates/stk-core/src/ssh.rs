@@ -49,7 +49,6 @@ use tokio::{
 use tracing::{Instrument, debug, info, info_span, warn};
 
 const MAX_CONCURRENT_SESSION_STARTS_PER_HOST: usize = 2;
-const MAX_CHANNEL_OPEN_ATTEMPTS_PER_DIAL: usize = 3;
 const SESSION_SCALE_UP_UTILIZATION_NUMERATOR: usize = 3;
 const SESSION_SCALE_UTILIZATION_DENOMINATOR: usize = 4;
 const SESSION_SCALE_DOWN_UTILIZATION_NUMERATOR: usize = 1;
@@ -95,7 +94,7 @@ fn initial_session_start_count(minimum: usize) -> usize {
     minimum.min(MAX_CONCURRENT_SESSION_STARTS_PER_HOST)
 }
 
-fn session_establish_wait_timeout(plan: &ResolvedSshPlan) -> Duration {
+fn session_recovery_poll_interval(plan: &ResolvedSshPlan) -> Duration {
     plan.jumps
         .iter()
         .chain(std::iter::once(&plan.target))
@@ -107,10 +106,6 @@ fn session_establish_wait_timeout(plan: &ResolvedSshPlan) -> Duration {
 
 fn can_start_another_session(connecting: usize) -> bool {
     connecting < MAX_CONCURRENT_SESSION_STARTS_PER_HOST
-}
-
-fn channel_open_attempt_count(healthy_sessions: usize) -> usize {
-    healthy_sessions.min(MAX_CHANNEL_OPEN_ATTEMPTS_PER_DIAL)
 }
 
 fn session_spawn_authorized(
@@ -615,7 +610,6 @@ impl NativeSshNode {
             }
         }
         preferred.sort_by_key(|(score, _)| *score);
-        preferred.truncate(channel_open_attempt_count(preferred.len()));
 
         let mut last_error = None;
         for (_, session) in preferred {
@@ -731,7 +725,7 @@ pub(crate) struct SshPoolDialer {
     balancer: LoadBalancer,
     connectivity: ConnectivityHandle,
     session_events: watch::Sender<u64>,
-    session_wait_timeout: Duration,
+    session_recovery_poll_interval: Duration,
     tasks: Vec<AbortHandle>,
 }
 
@@ -757,9 +751,9 @@ impl SshPoolDialer {
             .iter()
             .map(|upstream| resolve_ssh_plan(upstream, &pool).map(Arc::new))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let session_wait_timeout = plans
+        let session_recovery_poll_interval = plans
             .iter()
-            .map(|plan| session_establish_wait_timeout(plan))
+            .map(|plan| session_recovery_poll_interval(plan))
             .max()
             .unwrap_or_else(|| Duration::from_secs(1));
         let (session_events, _) = watch::channel(0_u64);
@@ -822,7 +816,7 @@ impl SshPoolDialer {
             balancer: LoadBalancer::new(pool.policy),
             connectivity,
             session_events,
-            session_wait_timeout,
+            session_recovery_poll_interval,
             tasks,
         })
     }
@@ -970,6 +964,9 @@ impl OutboundDialer for SshPoolDialer {
             return self.dial_available(&context).await;
         }
 
+        let mut session_events = self.session_events.subscribe();
+        let mut connectivity_events = self.connectivity.subscribe();
+        let mut connectivity_events_open = true;
         let mut connectivity = self.connectivity.current();
         if connectivity.is_offline()
             || connectivity.availability == NetworkAvailability::Unknown
@@ -977,32 +974,14 @@ impl OutboundDialer for SshPoolDialer {
         {
             connectivity = self.connectivity.refresh().await;
         }
-        if connectivity.is_offline() {
-            bail!(
-                "SSH host {} cannot connect while the system network is offline",
-                self.name
-            );
-        }
-
-        let mut session_events = self.session_events.subscribe();
-        let mut connectivity_events = self.connectivity.subscribe();
-        let mut connectivity_events_open = true;
-        self.request_session_capacity();
-        let deadline = Instant::now() + self.session_wait_timeout;
 
         loop {
             if self.has_available_session().await {
                 return self.dial_available(&context).await;
             }
-            let now = Instant::now();
-            if now >= deadline {
-                bail!(
-                    "SSH host {} did not establish a healthy session within {} ms",
-                    self.name,
-                    self.session_wait_timeout.as_millis()
-                );
+            if !connectivity.is_offline() {
+                self.request_session_capacity();
             }
-            let remaining = deadline.saturating_duration_since(now);
             tokio::select! {
                 changed = session_events.changed() => {
                     if changed.is_err() {
@@ -1015,19 +994,21 @@ impl OutboundDialer for SshPoolDialer {
                         continue;
                     }
                     connectivity = *connectivity_events.borrow_and_update();
-                    if connectivity.is_offline() {
-                        bail!(
-                            "SSH host {} cannot connect while the system network is offline",
-                            self.name
-                        );
+                    if !connectivity.is_offline() {
+                        self.request_session_capacity();
                     }
-                    self.request_session_capacity();
                 }
-                _ = sleep(remaining) => {
-                    bail!(
-                        "SSH host {} did not establish a healthy session within {} ms",
-                        self.name,
-                        self.session_wait_timeout.as_millis()
+                _ = sleep(self.session_recovery_poll_interval) => {
+                    connectivity = self.connectivity.refresh().await;
+                    if !connectivity.is_offline() {
+                        self.request_session_capacity();
+                    }
+                    debug!(
+                        host_name = %self.name,
+                        target = %context.target,
+                        network_availability = ?connectivity.availability,
+                        poll_interval_ms = self.session_recovery_poll_interval.as_millis(),
+                        "SSH dial is waiting for session recovery"
                     );
                 }
             }
@@ -3681,14 +3662,6 @@ mod tests {
     }
 
     #[test]
-    fn channel_open_failover_is_bounded_per_dial() {
-        assert_eq!(channel_open_attempt_count(0), 0);
-        assert_eq!(channel_open_attempt_count(2), 2);
-        assert_eq!(channel_open_attempt_count(3), 3);
-        assert_eq!(channel_open_attempt_count(10), 3);
-    }
-
-    #[test]
     fn resume_settle_deadline_survives_intermediate_manager_events() {
         let now = Instant::now();
         let deadline = now + RESUME_SETTLE_INTERVAL;
@@ -3755,25 +3728,52 @@ mod tests {
         let key_path = write_test_key("offline-gate");
         let (connectivity, controller) =
             ConnectivityHandle::controlled(NetworkAvailability::Offline, true);
-        let pool = SshPoolDialer::start_with_connectivity(
-            "offline-gate",
-            test_pool_config(ssh_address, &key_path, 1, 1, 8, Vec::new()),
-            ProbeConfig {
-                enabled: false,
-                ..ProbeConfig::default()
-            },
-            connectivity,
-        )
-        .unwrap();
+        let pool = Arc::new(
+            SshPoolDialer::start_with_connectivity(
+                "offline-gate",
+                test_pool_config(ssh_address, &key_path, 1, 1, 8, Vec::new()),
+                ProbeConfig {
+                    enabled: false,
+                    ..ProbeConfig::default()
+                },
+                connectivity,
+            )
+            .unwrap(),
+        );
+        let (target, echo) = start_echo_server().await;
+        let dial_pool = Arc::clone(&pool);
+        let dial = tokio::spawn(async move {
+            dial_pool
+                .dial(DialContext {
+                    host_name: "offline-gate".to_string(),
+                    target: TargetAddr::Socket(target),
+                    connection_id: None,
+                })
+                .await
+        });
 
         sleep(Duration::from_millis(100)).await;
         assert!(pool.nodes[0].sessions.read().await.is_empty());
+        assert!(
+            !dial.is_finished(),
+            "an accepted connection must wait rather than fail while offline"
+        );
 
         controller.set(NetworkAvailability::Online);
-        wait_for_healthy_sessions(&pool.nodes[0], 1).await;
+        let mut stream = timeout(Duration::from_secs(3), dial)
+            .await
+            .expect("pending dial did not recover with the network")
+            .unwrap()
+            .unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        let mut reply = [0_u8; 4];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"ping");
 
+        drop(stream);
         drop(pool);
         let _ = std::fs::remove_file(key_path);
+        echo.await.unwrap();
         server.abort();
     }
 
