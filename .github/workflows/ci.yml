@@ -162,11 +162,26 @@ jobs:
             "$RUNNER" "$binary" --help >/dev/null
           fi
 
+      - name: Remove host-only ARM64 emulator registration
+        if: matrix.docker_arch == 'arm64'
+        shell: bash
+        run: |
+          # qemu-user registers a host interpreter that containers cannot access.
+          # Let setup-qemu replace it with a static interpreter using the F flag.
+          registration=/proc/sys/fs/binfmt_misc/qemu-aarch64
+          if [[ -f "$registration" ]]; then
+            echo -1 | sudo tee "$registration" >/dev/null
+          fi
+
       - name: Set up QEMU for ARM64 containers
         if: matrix.docker_arch == 'arm64'
         uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
+
+      - name: Verify ARM64 container emulator
+        if: matrix.docker_arch == 'arm64'
+        run: grep -q '^flags:.*F' /proc/sys/fs/binfmt_misc/qemu-aarch64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
