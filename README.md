@@ -121,7 +121,7 @@ These GUI packages are not required when using only the `stk` CLI.
 
 ### Docker
 
-The CLI image is published to `ghcr.io/ruizhe/stk` for `linux/amd64` and `linux/arm64`, using `debian:latest` as its base. Version tags match GitHub Releases, such as `vX.Y.Z`; `latest` tracks the most recently published stable release. Prereleases only receive their version tag.
+The CLI image is published to `ghcr.io/ruizhe/stk` for `linux/amd64` and `linux/arm64`, using `debian:13.7` as its base. Version tags match GitHub Releases, such as `vX.Y.Z`; `latest` tracks the most recently published stable release. Prereleases only receive their version tag.
 
 ```bash
 docker pull ghcr.io/ruizhe/stk:latest
@@ -133,20 +133,25 @@ Edit `stk-config/config.yaml` to set the SSH host, username, and private key pat
 
 ```bash
 docker run -d --name stk --restart unless-stopped \
+  -e STK_SYSTEM=true \
   -p 127.0.0.1:17890:17890 \
   --mount "type=bind,src=$(pwd)/stk-config,dst=/etc/stk,readonly" \
   --mount "type=bind,src=$HOME/.ssh,dst=/root/.ssh,readonly" \
   ghcr.io/ruizhe/stk:latest
 
 docker logs -f stk
-docker exec stk stk status --system
-docker exec stk stk reload --system
+docker exec stk stk status
+docker exec stk stk reload
 docker stop stk
 ```
 
 The default command is `stk serve --system --config /etc/stk`. Mount the configuration directory so that host-side file replacements remain visible to automatic reload. Local listeners inside the container must bind to `0.0.0.0` for Docker port publishing to reach them; the example publishes the proxy only on the host's `127.0.0.1`. Add port mappings for any additional listeners. For remote forwards, local target addresses refer to the container's network.
 
-The image runs as root by default, reads SSH files from `/root/.ssh`, and keeps its control socket at `/run/stk/control.sock`. Mounted SSH configuration must use paths available inside the container. SSH agent authentication requires mounting the agent socket and setting `SSH_AUTH_SOCK`; external `ProxyCommand` programs must be installed in a derived image. `docker stop` sends SIGINT so the CLI can shut down gracefully.
+Set `STK_SYSTEM=true` in the deployment, using `docker run -e` as above or `STK_SYSTEM: "true"` under Compose's `environment`. This makes `serve`, `status`, `top`, `reload`, `check`, and `env` default to the system config in `/etc/stk` and control socket at `/run/stk/control.sock`, including commands run through `docker exec`. The image does not set this environment variable. Without it, control commands need `--system` to reach the default container service; user defaults apply when neither `STK_SYSTEM=true` nor `--system` is set. An explicit `--system` takes precedence over `STK_SYSTEM=false`.
+
+The image runs as root by default, reads SSH files from `/root/.ssh`, and keeps its control socket at `/run/stk/control.sock`. Mounted SSH configuration must use paths available inside the container. SSH agent authentication requires mounting the agent socket and setting `SSH_AUTH_SOCK`; any additional `ProxyCommand` programs must be installed in a derived image. `docker stop` sends SIGINT so the CLI can shut down gracefully.
+
+The image includes common troubleshooting tools: `ss`, `ip`, `ping`, `curl`, `wget`, `ps`, `top`, `dig`, `nslookup`, `nc`, `socat`, `wscat`, `traceroute`, `mtr`, `netstat`, `tcpdump`, `lsof`, `strace`, and the OpenSSH client (`ssh`). It also includes `jq`, `less`, `vi`, `file`, `zip`, and `unzip`. Run them with `docker exec`, for example `docker exec stk ss -lntp` or `docker exec stk ps aux`. For an interactive WebSocket connection, use `docker exec -it stk wscat -c wss://your-server.example/ws`.
 
 To validate configuration without starting the service:
 

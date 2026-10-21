@@ -67,10 +67,14 @@ pub(super) struct EnvArgs {
     #[arg(
         short,
         long,
-        help = "Config file or directory; defaults to the user config directory"
+        help = "Config file or directory; defaults depend on --system or STK_SYSTEM"
     )]
     config: Option<PathBuf>,
-    #[arg(long, help = "Use the system config and control endpoint")]
+    #[arg(
+        long,
+        env = "STK_SYSTEM",
+        help = "Use the system config and control endpoint"
+    )]
     system: bool,
     #[arg(
         long,

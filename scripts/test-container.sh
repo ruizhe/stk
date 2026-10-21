@@ -19,8 +19,9 @@ trap cleanup EXIT
 docker run --rm --platform "$platform" "$image" --help >/dev/null
 docker run --rm --platform "$platform" "$image" --version
 docker run --rm --platform "$platform" \
+    -e STK_SYSTEM=true \
     --mount "type=bind,src=$root/examples/docker,dst=/etc/stk,readonly" \
-    "$image" check --config /etc/stk
+    "$image" check
 
 # Exercise the default command and read-only config mount without an SSH server.
 cat > "$test_dir/config.yaml" <<'YAML'
@@ -29,11 +30,12 @@ hosts:
     auto: false
 YAML
 container=$(docker run -d --platform "$platform" --network none \
+    -e STK_SYSTEM=true \
     --mount "type=bind,src=$test_dir,dst=/etc/stk,readonly" "$image")
 
 ready=false
 for _ in {1..30}; do
-    if docker exec "$container" stk status --system > "$test_dir/status" 2>/dev/null; then
+    if docker exec "$container" stk status > "$test_dir/status" 2>/dev/null; then
         ready=true
         break
     fi
@@ -44,7 +46,9 @@ if [[ "$ready" != true ]]; then
     exit 1
 fi
 cat "$test_dir/status"
-docker exec "$container" stk reload --system
+docker exec "$container" stk reload
+# Explicit system scope remains available when the environment default is disabled.
+docker exec -e STK_SYSTEM=false "$container" stk status --system >/dev/null
 
 docker stop --time 10 "$container" >/dev/null
 exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container")

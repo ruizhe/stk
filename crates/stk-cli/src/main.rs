@@ -36,11 +36,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    #[command(about = "Run the runtime in the foreground; defaults to the user config directory")]
+    #[command(about = "Run the runtime in the foreground")]
     Serve(ServeArgs),
     #[command(about = "Run a command with proxy environment variables")]
     Env(proxy_env::EnvArgs),
-    #[command(about = "Validate a config; defaults to the user config directory")]
+    #[command(about = "Validate a config")]
     Check(ConfigArgs),
     #[command(about = "Show the running GUI, foreground, or service runtime status")]
     Status(StatusArgs),
@@ -56,9 +56,11 @@ struct ConfigArgs {
     #[arg(
         short,
         long,
-        help = "Config file or directory; defaults to the user config directory"
+        help = "Config file or directory; defaults depend on --system or STK_SYSTEM"
     )]
     config: Option<PathBuf>,
+    #[arg(long, env = "STK_SYSTEM", help = "Use the system config directory")]
+    system: bool,
 }
 
 #[derive(Debug, Args)]
@@ -66,11 +68,12 @@ struct ServeArgs {
     #[arg(
         short,
         long,
-        help = "Config file or directory; defaults depend on --system"
+        help = "Config file or directory; defaults depend on --system or STK_SYSTEM"
     )]
     config: Option<PathBuf>,
     #[arg(
         long,
+        env = "STK_SYSTEM",
         help = "Use the system config directory and system control endpoint"
     )]
     system: bool,
@@ -86,6 +89,7 @@ struct ControlArgs {
     config: Option<PathBuf>,
     #[arg(
         long,
+        env = "STK_SYSTEM",
         help = "Use the system config and system control endpoint instead of the user endpoint"
     )]
     system: bool,
@@ -140,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
     match command {
         Command::Serve(args) => serve(args).await,
         Command::Env(args) => proxy_env::run(args).await,
-        Command::Check(args) => check(args, ConfigScope::User),
+        Command::Check(args) => check(args),
         Command::Status(args) => status(args).await,
         Command::Top(args) => top(args).await,
         Command::Reload(args) => reload(args).await,
@@ -640,7 +644,12 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     run_config_file_until_shutdown(config, profile, shutdown_signal()).await
 }
 
-fn check(args: ConfigArgs, scope: ConfigScope) -> anyhow::Result<()> {
+fn check(args: ConfigArgs) -> anyhow::Result<()> {
+    let scope = if args.system {
+        ConfigScope::System
+    } else {
+        ConfigScope::User
+    };
     let path = resolve_config_path(args.config.as_deref(), scope);
     let config = load_config(path)?;
     config.validate()?;
@@ -725,6 +734,49 @@ mod tests {
 
         assert!(Cli::try_parse_from(["stk", "env", "-P", "0", "curl"]).is_err());
         assert!(Cli::try_parse_from(["stk", "env", "-P", "65536", "curl"]).is_err());
+    }
+
+    #[test]
+    fn system_scope_environment_applies_to_all_commands() {
+        // Subprocesses isolate environment changes from the other parser tests.
+        const CHILD_ENV: &str = "STK_SCOPE_TEST_CHILD";
+        const TEST_NAME: &str = "tests::system_scope_environment_applies_to_all_commands";
+        if let Ok(expected) = std::env::var(CHILD_ENV) {
+            for command in ["serve", "status", "top", "reload", "check", "env"] {
+                for explicit_system in [false, true] {
+                    let mut arguments = vec!["stk", command];
+                    if explicit_system {
+                        arguments.push("--system");
+                    }
+                    let matches = Cli::command().try_get_matches_from(arguments).unwrap();
+                    let (_, arguments) = matches.subcommand().unwrap();
+                    assert_eq!(
+                        arguments.get_one::<bool>("system"),
+                        Some(&(explicit_system || expected == "true")),
+                        "{command}: explicit_system={explicit_system}"
+                    );
+                }
+            }
+            return;
+        }
+
+        for setting in [None, Some("false"), Some("true")] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", TEST_NAME])
+                .env(CHILD_ENV, setting.unwrap_or("false"))
+                .env_remove("STK_SYSTEM");
+            if let Some(setting) = setting {
+                child.env("STK_SYSTEM", setting);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "STK_SYSTEM={setting:?}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

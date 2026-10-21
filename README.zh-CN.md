@@ -121,7 +121,7 @@ sudo apt-get install -y \
 
 ### Docker
 
-CLI 镜像发布到 `ghcr.io/ruizhe/stk`，支持 `linux/amd64` 和 `linux/arm64`，基础镜像使用 `debian:latest`。版本标签与 GitHub Release 一致，例如 `vX.Y.Z`；`latest` 指向最近发布的正式版，预发布版本只更新对应的版本标签。
+CLI 镜像发布到 `ghcr.io/ruizhe/stk`，支持 `linux/amd64` 和 `linux/arm64`，基础镜像使用 `debian:13.7`。版本标签与 GitHub Release 一致，例如 `vX.Y.Z`；`latest` 指向最近发布的正式版，预发布版本只更新对应的版本标签。
 
 ```bash
 docker pull ghcr.io/ruizhe/stk:latest
@@ -133,20 +133,25 @@ cp examples/docker/config.yaml stk-config/config.yaml
 
 ```bash
 docker run -d --name stk --restart unless-stopped \
+  -e STK_SYSTEM=true \
   -p 127.0.0.1:17890:17890 \
   --mount "type=bind,src=$(pwd)/stk-config,dst=/etc/stk,readonly" \
   --mount "type=bind,src=$HOME/.ssh,dst=/root/.ssh,readonly" \
   ghcr.io/ruizhe/stk:latest
 
 docker logs -f stk
-docker exec stk stk status --system
-docker exec stk stk reload --system
+docker exec stk stk status
+docker exec stk stk reload
 docker stop stk
 ```
 
 默认命令为 `stk serve --system --config /etc/stk`。请挂载整个配置目录，以便宿主机替换配置文件时仍能触发自动重载。容器内的本地 listener 需要监听 `0.0.0.0`，Docker 端口映射才能访问；样例仅将代理端口发布到宿主机的 `127.0.0.1`。其他 listener 需要添加相应端口映射。对于远程转发，本地目标地址以容器网络为准。
 
-镜像默认以 root 运行，从 `/root/.ssh` 读取 SSH 文件，control socket 位于 `/run/stk/control.sock`。挂载的 SSH 配置必须使用容器内可访问的路径。使用 SSH agent 认证时，需要挂载 agent socket 并设置 `SSH_AUTH_SOCK`；使用外部 `ProxyCommand` 程序时，需要在派生镜像中安装对应程序。`docker stop` 会发送 SIGINT，使 CLI 正常退出。
+请在部署时设置 `STK_SYSTEM=true`，例如上面的 `docker run -e`，或在 Compose 的 `environment` 中添加 `STK_SYSTEM: "true"`。这样 `serve`、`status`、`top`、`reload`、`check` 和 `env` 默认使用系统配置 `/etc/stk` 和 control socket `/run/stk/control.sock`，通过 `docker exec` 执行的命令也会生效。镜像本身不设置此环境变量；未设置时，控制命令需加 `--system` 才能连接默认容器服务。未设置 `STK_SYSTEM=true` 且未传入 `--system` 时使用用户级默认值；显式传入的 `--system` 优先于 `STK_SYSTEM=false`。
+
+镜像默认以 root 运行，从 `/root/.ssh` 读取 SSH 文件，control socket 位于 `/run/stk/control.sock`。挂载的 SSH 配置必须使用容器内可访问的路径。使用 SSH agent 认证时，需要挂载 agent socket 并设置 `SSH_AUTH_SOCK`；使用镜像未附带的 `ProxyCommand` 程序时，需要在派生镜像中安装对应程序。`docker stop` 会发送 SIGINT，使 CLI 正常退出。
+
+镜像内置常用排查工具：`ss`、`ip`、`ping`、`curl`、`wget`、`ps`、`top`、`dig`、`nslookup`、`nc`、`socat`、`wscat`、`traceroute`、`mtr`、`netstat`、`tcpdump`、`lsof`、`strace` 和 OpenSSH 客户端（`ssh`）；同时提供 `jq`、`less`、`vi`、`file`、`zip`、`unzip`。可通过 `docker exec` 使用，例如 `docker exec stk ss -lntp` 或 `docker exec stk ps aux`。交互式连接 WebSocket 可使用 `docker exec -it stk wscat -c wss://your-server.example/ws`。
 
 只校验配置、不启动服务：
 

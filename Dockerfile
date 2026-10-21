@@ -1,9 +1,32 @@
-FROM debian:latest
+FROM debian:13.7
 
 ARG TARGETARCH
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        dnsutils \
+        file \
+        iproute2 \
+        iputils-ping \
+        jq \
+        less \
+        lsof \
+        mtr-tiny \
+        net-tools \
+        netcat-openbsd \
+        node-ws \
+        openssh-client \
+        procps \
+        socat \
+        strace \
+        tcpdump \
+        traceroute \
+        unzip \
+        vim-tiny \
+        wget \
+        zip \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /etc/stk /run/stk /root/.ssh \
     && chmod 700 /root/.ssh
