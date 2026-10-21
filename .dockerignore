@@ -1,0 +1,11 @@
+**
+!Dockerfile
+!dist/
+!dist/docker/
+!dist/docker/amd64/
+!dist/docker/amd64/stk
+!dist/docker/arm64/
+!dist/docker/arm64/stk
+!LICENSE-MIT
+!LICENSE-APACHE
+!THIRD-PARTY-NOTICES.md

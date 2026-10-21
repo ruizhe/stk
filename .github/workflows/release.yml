@@ -653,3 +653,97 @@ jobs:
           prerelease: ${{ needs.validate.outputs.prerelease }}
           fail_on_unmatched_files: true
           files: dist/*
+
+  container:
+    name: Publish multi-platform CLI container
+    needs:
+      - validate
+      - linux-cli-musl
+      - publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Download static Linux CLI archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: linux-cli-*-musl
+          path: dist/container-archives
+          merge-multiple: true
+
+      - name: Prepare container binaries and metadata
+        id: container
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            case "$arch" in
+              amd64) release_arch=x86_64 ;;
+              arm64) release_arch=aarch64 ;;
+            esac
+            package="stk-v${VERSION}-linux-${release_arch}-musl"
+            tar -xzf "dist/container-archives/$package.tar.gz" -C dist/container-archives
+            mkdir -p "dist/docker/$arch"
+            install -m 755 "dist/container-archives/$package/stk" "dist/docker/$arch/stk"
+          done
+          revision=$(git rev-parse HEAD)
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU for ARM64 containers
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and test both container platforms
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            image="stk:release-$arch"
+            docker buildx build --pull --load \
+              --platform "linux/$arch" --tag "$image" .
+            ./scripts/test-container.sh "$image" "linux/$arch"
+          done
+
+      - name: Generate container tags and labels
+        id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.container.outputs.image }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ needs.validate.outputs.tag }}
+            type=raw,value=latest,enable=${{ needs.validate.outputs.prerelease == 'false' }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.container.outputs.revision }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push multi-platform container
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}

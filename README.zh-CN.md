@@ -119,6 +119,55 @@ sudo apt-get install -y \
 
 只使用 `stk` CLI 时不需要这些 GUI 包。
 
+### Docker
+
+CLI 镜像发布到 `ghcr.io/ruizhe/stk`，支持 `linux/amd64` 和 `linux/arm64`，基础镜像使用 `debian:latest`。版本标签与 GitHub Release 一致，例如 `vX.Y.Z`；`latest` 指向最近发布的正式版，预发布版本只更新对应的版本标签。
+
+```bash
+docker pull ghcr.io/ruizhe/stk:latest
+mkdir -p stk-config
+cp examples/docker/config.yaml stk-config/config.yaml
+```
+
+修改 `stk-config/config.yaml` 中的 SSH 主机、用户名和私钥路径。[容器样例](examples/docker/config.yaml) 使用 `/root/.ssh/id_ed25519`，并通过 `/root/.ssh/known_hosts` 校验服务器密钥。启动前，请在本机 `~/.ssh` 目录中准备好私钥，以及已核对服务器指纹的 `known_hosts` 条目：
+
+```bash
+docker run -d --name stk --restart unless-stopped \
+  -p 127.0.0.1:17890:17890 \
+  --mount "type=bind,src=$(pwd)/stk-config,dst=/etc/stk,readonly" \
+  --mount "type=bind,src=$HOME/.ssh,dst=/root/.ssh,readonly" \
+  ghcr.io/ruizhe/stk:latest
+
+docker logs -f stk
+docker exec stk stk status --system
+docker exec stk stk reload --system
+docker stop stk
+```
+
+默认命令为 `stk serve --system --config /etc/stk`。请挂载整个配置目录，以便宿主机替换配置文件时仍能触发自动重载。容器内的本地 listener 需要监听 `0.0.0.0`，Docker 端口映射才能访问；样例仅将代理端口发布到宿主机的 `127.0.0.1`。其他 listener 需要添加相应端口映射。对于远程转发，本地目标地址以容器网络为准。
+
+镜像默认以 root 运行，从 `/root/.ssh` 读取 SSH 文件，control socket 位于 `/run/stk/control.sock`。挂载的 SSH 配置必须使用容器内可访问的路径。使用 SSH agent 认证时，需要挂载 agent socket 并设置 `SSH_AUTH_SOCK`；使用外部 `ProxyCommand` 程序时，需要在派生镜像中安装对应程序。`docker stop` 会发送 SIGINT，使 CLI 正常退出。
+
+只校验配置、不启动服务：
+
+```bash
+docker run --rm \
+  --mount "type=bind,src=$(pwd)/stk-config,dst=/etc/stk,readonly" \
+  --mount "type=bind,src=$HOME/.ssh,dst=/root/.ssh,readonly" \
+  ghcr.io/ruizhe/stk:latest check --config /etc/stk
+```
+
+维护者说明：Release workflow 复用静态 CLI 归档，测试两种架构的容器后，通过 `GITHUB_TOKEN` 和发布 job 的 `packages: write` 权限推送，无需额外配置 registry secret。首次推送后，需要在 `stk` 的 **Package settings → Change visibility** 中设为 **Public**，才能匿名拉取；即使源码仓库公开，GitHub 新建的 Package 默认仍为 private。
+
+本地构建镜像时，将对应架构的 Linux musl `stk` 可执行文件放到 `dist/docker/amd64/stk` 或 `dist/docker/arm64/stk`，然后运行：
+
+```bash
+docker buildx build --pull --load --platform linux/arm64 -t stk:local .
+./scripts/test-container.sh stk:local linux/arm64
+```
+
+x86_64 使用 `linux/amd64`。Docker 构建直接打包这些预编译文件，无需再次编译 Rust。
+
 ### 从源码构建
 
 项目要求 Rust `1.95.0` 或更高版本。

@@ -1,0 +1,12 @@
+hosts:
+  main:
+    host: ssh.example.com
+    username: alice
+    auth:
+      method: private-key
+      path: /root/.ssh/id_ed25519
+    known-hosts-path: /root/.ssh/known_hosts
+    local-proxies:
+      - name: primary
+        listen: 0.0.0.0:17890
+        mixed: true

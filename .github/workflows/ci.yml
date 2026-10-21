@@ -92,9 +92,11 @@ jobs:
           - arch: x86_64
             target: x86_64-unknown-linux-musl
             runner: native
+            docker_arch: amd64
           - arch: aarch64
             target: aarch64-unknown-linux-musl
             runner: qemu-aarch64
+            docker_arch: arm64
 
     steps:
       - name: Check out repository
@@ -159,6 +161,29 @@ jobs:
           else
             "$RUNNER" "$binary" --help >/dev/null
           fi
+
+      - name: Set up QEMU for ARM64 containers
+        if: matrix.docker_arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and test CLI container
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          DOCKER_ARCH: ${{ matrix.docker_arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/docker/$DOCKER_ARCH"
+          install -m 755 "target/$TARGET/release/stk" "dist/docker/$DOCKER_ARCH/stk"
+          image="stk:ci-$DOCKER_ARCH"
+          docker buildx build --pull --load \
+            --platform "linux/$DOCKER_ARCH" --tag "$image" .
+          ./scripts/test-container.sh "$image" "linux/$DOCKER_ARCH"
 
   platform-build:
     name: Release build on ${{ matrix.platform }}

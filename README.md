@@ -119,6 +119,55 @@ sudo apt-get install -y \
 
 These GUI packages are not required when using only the `stk` CLI.
 
+### Docker
+
+The CLI image is published to `ghcr.io/ruizhe/stk` for `linux/amd64` and `linux/arm64`, using `debian:latest` as its base. Version tags match GitHub Releases, such as `vX.Y.Z`; `latest` tracks the most recently published stable release. Prereleases only receive their version tag.
+
+```bash
+docker pull ghcr.io/ruizhe/stk:latest
+mkdir -p stk-config
+cp examples/docker/config.yaml stk-config/config.yaml
+```
+
+Edit `stk-config/config.yaml` to set the SSH host, username, and private key path. The [container example](examples/docker/config.yaml) uses `/root/.ssh/id_ed25519` and verifies server keys against `/root/.ssh/known_hosts`. Prepare the private key and a `known_hosts` entry whose fingerprint you have verified in your local `~/.ssh` directory before starting:
+
+```bash
+docker run -d --name stk --restart unless-stopped \
+  -p 127.0.0.1:17890:17890 \
+  --mount "type=bind,src=$(pwd)/stk-config,dst=/etc/stk,readonly" \
+  --mount "type=bind,src=$HOME/.ssh,dst=/root/.ssh,readonly" \
+  ghcr.io/ruizhe/stk:latest
+
+docker logs -f stk
+docker exec stk stk status --system
+docker exec stk stk reload --system
+docker stop stk
+```
+
+The default command is `stk serve --system --config /etc/stk`. Mount the configuration directory so that host-side file replacements remain visible to automatic reload. Local listeners inside the container must bind to `0.0.0.0` for Docker port publishing to reach them; the example publishes the proxy only on the host's `127.0.0.1`. Add port mappings for any additional listeners. For remote forwards, local target addresses refer to the container's network.
+
+The image runs as root by default, reads SSH files from `/root/.ssh`, and keeps its control socket at `/run/stk/control.sock`. Mounted SSH configuration must use paths available inside the container. SSH agent authentication requires mounting the agent socket and setting `SSH_AUTH_SOCK`; external `ProxyCommand` programs must be installed in a derived image. `docker stop` sends SIGINT so the CLI can shut down gracefully.
+
+To validate configuration without starting the service:
+
+```bash
+docker run --rm \
+  --mount "type=bind,src=$(pwd)/stk-config,dst=/etc/stk,readonly" \
+  --mount "type=bind,src=$HOME/.ssh,dst=/root/.ssh,readonly" \
+  ghcr.io/ruizhe/stk:latest check --config /etc/stk
+```
+
+For maintainers: the Release workflow reuses the static CLI archives, tests both container platforms, and pushes with `GITHUB_TOKEN` and job-scoped `packages: write`; no registry secret is needed. After the first push, set the `stk` package to **Public** under **Package settings → Change visibility** to enable anonymous pulls. GitHub initially creates packages as private even when the source repository is public.
+
+For a local image build, place the corresponding Linux musl `stk` binaries at `dist/docker/amd64/stk` and/or `dist/docker/arm64/stk`, then run:
+
+```bash
+docker buildx build --pull --load --platform linux/arm64 -t stk:local .
+./scripts/test-container.sh stk:local linux/arm64
+```
+
+Use `linux/amd64` for x86_64. Docker builds package these prebuilt executables without compiling Rust.
+
 ### Build From Source
 
 STK requires Rust `1.95.0` or newer. The repository includes a pinned [`rust-toolchain.toml`](rust-toolchain.toml).
